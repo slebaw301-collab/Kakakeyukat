@@ -1,9 +1,10 @@
 import os
 import sqlite3
 import re
+import shutil
 import requests
 import qrcode
-from io import BytesIO
+from io import BytesIO, open as io_open
 from datetime import datetime, timedelta
 from telegram import Update, BotCommand, BotCommandScopeChat, BotCommandScopeDefault, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -252,6 +253,111 @@ def get_all_waiting():
     conn.close()
     return rows
 
+def get_buyer_history(user_id, limit=10):
+    """Ambil riwayat order buyer (10 terakhir)."""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(
+        "SELECT * FROM orders WHERE user_id=? ORDER BY id DESC LIMIT ?",
+        (user_id, limit)
+    )
+    rows = [dict(r) for r in c.fetchall()]
+    conn.close()
+    return rows
+
+def get_all_buyers():
+    """Ambil semua user_id buyer yang pernah order (untuk broadcast)."""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT DISTINCT user_id, user_name FROM orders ORDER BY id DESC")
+    rows = [dict(r) for r in c.fetchall()]
+    conn.close()
+    return rows
+
+def get_order_stats():
+    """Ambil statistik penjualan dari DB."""
+    conn = get_conn()
+    c = conn.cursor()
+
+    today = datetime.now().strftime("%d/%m/%Y")
+    this_month = datetime.now().strftime("%m/%Y")
+
+    c.execute("SELECT COUNT(*) as cnt FROM orders WHERE status='completed'")
+    total_orders = c.fetchone()['cnt']
+
+    c.execute("SELECT COUNT(*) as cnt FROM orders WHERE status='completed' AND waktu LIKE ?", (f"% — {today}",))
+    today_orders = c.fetchone()['cnt']
+
+    c.execute("SELECT COUNT(*) as cnt FROM orders WHERE status='completed' AND waktu LIKE ?", (f"%/{this_month}",))
+    month_orders = c.fetchone()['cnt']
+
+    c.execute("SELECT COUNT(*) as cnt FROM orders WHERE status IN ('waiting','pending')")
+    active_count = c.fetchone()['cnt']
+
+    c.execute("SELECT COUNT(*) as cnt FROM orders WHERE status='cancelled'")
+    cancelled_count = c.fetchone()['cnt']
+
+    # Produk terlaris
+    c.execute("""
+        SELECT paket_id, COUNT(*) as cnt FROM orders
+        WHERE status='completed'
+        GROUP BY paket_id ORDER BY cnt DESC LIMIT 1
+    """)
+    best_row = c.fetchone()
+    best_product = None
+    if best_row:
+        p = get_product(best_row['paket_id'])
+        best_product = f"{p['emoji']} {p['nama']} ({best_row['cnt']}x)" if p else best_row['paket_id']
+
+    # Estimasi revenue: join dengan harga produk saat ini
+    c.execute("""
+        SELECT o.paket_id, COUNT(*) as cnt FROM orders o
+        WHERE o.status='completed' GROUP BY o.paket_id
+    """)
+    revenue_rows = c.fetchall()
+    total_revenue = 0
+    today_revenue = 0
+    month_revenue = 0
+
+    for row in revenue_rows:
+        p = get_product(row['paket_id'])
+        if p:
+            total_revenue += p['harga'] * row['cnt']
+
+    c.execute("""
+        SELECT paket_id, COUNT(*) as cnt FROM orders
+        WHERE status='completed' AND waktu LIKE ?
+        GROUP BY paket_id
+    """, (f"% — {today}",))
+    for row in c.fetchall():
+        p = get_product(row['paket_id'])
+        if p:
+            today_revenue += p['harga'] * row['cnt']
+
+    c.execute("""
+        SELECT paket_id, COUNT(*) as cnt FROM orders
+        WHERE status='completed' AND waktu LIKE ?
+        GROUP BY paket_id
+    """, (f"%/{this_month}",))
+    for row in c.fetchall():
+        p = get_product(row['paket_id'])
+        if p:
+            month_revenue += p['harga'] * row['cnt']
+
+    conn.close()
+
+    return {
+        'total_orders': total_orders,
+        'today_orders': today_orders,
+        'month_orders': month_orders,
+        'active_count': active_count,
+        'cancelled_count': cancelled_count,
+        'best_product': best_product,
+        'total_revenue': total_revenue,
+        'today_revenue': today_revenue,
+        'month_revenue': month_revenue,
+    }
+
 def update_order_status(order_id, status):
     conn = get_conn()
     c = conn.cursor()
@@ -321,6 +427,23 @@ def simpan_admin_msg(context, user_id, message_id):
     context.bot_data['admin_messages'].setdefault(user_id, [])
     context.bot_data['admin_messages'][user_id].append(message_id)
 
+# =================== COOLDOWN (anti-spam order) ===================
+COOLDOWN_MENIT = 5
+
+def set_cooldown(context, user_id):
+    """Set cooldown setelah user membatalkan order."""
+    context.bot_data.setdefault('cooldowns', {})
+    context.bot_data['cooldowns'][user_id] = datetime.now() + timedelta(minutes=COOLDOWN_MENIT)
+
+def get_cooldown_sisa(context, user_id):
+    """Kembalikan sisa menit cooldown, atau 0 jika tidak ada cooldown."""
+    cooldowns = context.bot_data.get('cooldowns', {})
+    until = cooldowns.get(user_id)
+    if not until:
+        return 0
+    sisa = (until - datetime.now()).total_seconds()
+    return max(0, int(sisa / 60) + 1) if sisa > 0 else 0
+
 async def hapus_admin_msg(context, user_id):
     msg_ids = context.bot_data.get('admin_messages', {}).pop(user_id, [])
     for msg_id in msg_ids:
@@ -373,15 +496,21 @@ async def kirim_link_ke_buyer(context, user_id, paket, order_id, amount):
 
 async def post_init(application: Application):
     await application.bot.set_my_commands(
-        [BotCommand("start", "Buka toko")],
+        [
+            BotCommand("start",   "Buka toko"),
+            BotCommand("riwayat", "Lihat riwayat ordermu"),
+        ],
         scope=BotCommandScopeDefault()
     )
     await application.bot.set_my_commands(
         [
             BotCommand("start",   "Buka toko"),
             BotCommand("produk",  "Kelola produk"),
-            BotCommand("aktif",   "Lihat order aktif (menunggu bayar)"),
-            BotCommand("pending", "Lihat order pending (sudah bayar)"),
+            BotCommand("aktif",   "Order aktif (menunggu bayar)"),
+            BotCommand("pending", "Order pending (sudah bayar)"),
+            BotCommand("stats",   "Statistik penjualan"),
+            BotCommand("blast",   "Broadcast pesan ke semua buyer"),
+            BotCommand("backup",  "Backup database"),
             BotCommand("link",    "Cek link produk saat ini"),
         ],
         scope=BotCommandScopeChat(chat_id=ADMIN_ID)
@@ -416,6 +545,21 @@ async def post_init(application: Application):
                 print(f"[POST_INIT] Job re-queued untuk order {order['order_id']}")
             except Exception as e:
                 print(f"[POST_INIT] Gagal re-queue order {order['order_id']}: {e}")
+
+    # ===== Auto backup harian jam 00:00 =====
+    try:
+        now = datetime.now()
+        next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        delay = (next_midnight - now).total_seconds()
+        application.job_queue.run_repeating(
+            auto_backup_job,
+            interval=86400,
+            first=delay,
+            name="auto_backup_harian"
+        )
+        print(f"[POST_INIT] Auto backup dijadwalkan setiap hari pukul 00:00")
+    except Exception as e:
+        print(f"[POST_INIT] Gagal jadwalkan auto backup: {e}")
 
 # =================== USER HANDLERS ===================
 
@@ -548,6 +692,15 @@ async def pilih_paket(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         keyboard = [[InlineKeyboardButton("✕ Batalkan", callback_data="back_start")]]
         await query.edit_message_text(caption, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    # ===== CEK COOLDOWN anti-spam =====
+    sisa = get_cooldown_sisa(context, user_id)
+    if sisa > 0:
+        await query.answer(
+            f"⏳ Kamu baru saja membatalkan order. Coba lagi dalam {sisa} menit.",
+            show_alert=True
+        )
         return
 
     await query.answer()
@@ -705,6 +858,8 @@ async def back_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 job.schedule_removal()
             for job in context.job_queue.get_jobs_by_name(f"cancel_{user_id}"):
                 job.schedule_removal()
+        # ===== Set cooldown anti-spam setelah cancel =====
+        set_cooldown(context, user_id)
 
     context.user_data.clear()
 
@@ -1102,6 +1257,142 @@ async def admin_cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
         parse_mode="Markdown"
     )
 
+# =================== ADMIN: STATISTIK ===================
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.from_user.id != ADMIN_ID:
+        return
+
+    s = get_order_stats()
+    text = (
+        f"*📊 STATISTIK PENJUALAN*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📅 *Hari Ini*\n"
+        f"├ Order Selesai: {s['today_orders']}\n"
+        f"└ Estimasi Omzet: {format_harga(s['today_revenue'])}\n\n"
+        f"📆 *Bulan Ini*\n"
+        f"├ Order Selesai: {s['month_orders']}\n"
+        f"└ Estimasi Omzet: {format_harga(s['month_revenue'])}\n\n"
+        f"🏆 *All Time*\n"
+        f"├ Total Order Selesai: {s['total_orders']}\n"
+        f"├ Total Dibatalkan: {s['cancelled_count']}\n"
+        f"├ Order Aktif Sekarang: {s['active_count']}\n"
+        f"└ Estimasi Total Omzet: {format_harga(s['total_revenue'])}\n\n"
+    )
+    if s['best_product']:
+        text += f"🥇 *Produk Terlaris:* {esc(s['best_product'])}\n\n"
+    text += f"_Update: {datetime.now().strftime('%H:%M, %d/%m/%Y')}_"
+
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+# =================== USER: RIWAYAT ORDER ===================
+
+async def cmd_riwayat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    orders = get_buyer_history(user_id)
+
+    if not orders:
+        await update.message.reply_text(
+            "*📋 RIWAYAT ORDER*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Kamu belum pernah melakukan pembelian.\n\n"
+            "Ketik /start untuk mulai belanja.",
+            parse_mode="Markdown"
+        )
+        return
+
+    STATUS_LABEL = {
+        'completed': '✅ Selesai',
+        'waiting':   '⏳ Menunggu Bayar',
+        'pending':   '🔄 Diproses',
+        'cancelled': '❌ Dibatalkan',
+        'expired':   '⏰ Kedaluwarsa',
+        'rejected':  '🚫 Ditolak',
+    }
+
+    text = f"*📋 RIWAYAT ORDER (10 terakhir)*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    for o in orders:
+        paket = get_product(o['paket_id']) or {"emoji": "📦", "nama": o['paket_id'], "harga": 0}
+        status = STATUS_LABEL.get(o['status'], o['status'])
+        text += (
+            f"{paket['emoji']} *{esc(paket['nama'])}*\n"
+            f"├ Status: {status}\n"
+            f"├ Harga: {format_harga(paket['harga'])}\n"
+            f"└ {o['waktu']}\n\n"
+        )
+
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+# =================== ADMIN: BACKUP DATABASE ===================
+
+async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.from_user.id != ADMIN_ID:
+        return
+
+    await update.message.reply_text("⏳ Membuat backup database...")
+    await _kirim_backup(context)
+
+async def _kirim_backup(context):
+    """Buat dan kirim file backup DB ke admin."""
+    try:
+        backup_name = f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+        shutil.copy('orders.db', backup_name)
+        with open(backup_name, 'rb') as f:
+            await context.bot.send_document(
+                chat_id=ADMIN_ID,
+                document=f,
+                filename=backup_name,
+                caption=(
+                    f"📦 *Backup Database*\n"
+                    f"🕐 {datetime.now().strftime('%H:%M, %d/%m/%Y')}"
+                ),
+                parse_mode="Markdown"
+            )
+        os.remove(backup_name)
+    except Exception as e:
+        print(f"Error backup: {e}")
+        try:
+            await context.bot.send_message(chat_id=ADMIN_ID, text=f"❌ Gagal backup database: {e}")
+        except Exception:
+            pass
+
+async def auto_backup_job(context: ContextTypes.DEFAULT_TYPE):
+    """Job otomatis backup DB setiap hari."""
+    print("[AUTO_BACKUP] Menjalankan backup harian...")
+    await _kirim_backup(context)
+
+# =================== ADMIN: BROADCAST ===================
+
+async def cmd_blast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.from_user.id != ADMIN_ID:
+        return
+
+    buyers = get_all_buyers()
+    jumlah = len(buyers)
+    if jumlah == 0:
+        await update.message.reply_text("❌ Belum ada buyer yang terdaftar.")
+        return
+
+    context.user_data['blasting'] = True
+    await update.message.reply_text(
+        f"*📢 BROADCAST PESAN*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"Total penerima: *{jumlah} buyer*\n\n"
+        f"Kirim pesan yang mau di-blast sekarang.\n"
+        f"_Mendukung teks biasa, bold, italic (format Markdown)._\n\n"
+        f"⚠️ Pesan akan langsung dikirim ke semua buyer.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Batal", callback_data="blast_batal")]
+        ])
+    )
+
+async def blast_batal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data.pop('blasting', None)
+    await query.edit_message_text("✅ Broadcast dibatalkan.")
+
 # =================== ADMIN: MESSAGE HANDLER ===================
 
 async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1109,6 +1400,43 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     text = update.message.text.strip() if update.message.text else ""
+
+    # --- State: broadcast blast ---
+    if context.user_data.get('blasting'):
+        context.user_data.pop('blasting', None)
+
+        buyers = get_all_buyers()
+        jumlah = len(buyers)
+
+        status_msg = await update.message.reply_text(f"📢 Mengirim ke {jumlah} buyer...")
+
+        sent = 0
+        failed = 0
+        for b in buyers:
+            try:
+                await context.bot.send_message(
+                    chat_id=b['user_id'],
+                    text=text,
+                    parse_mode="Markdown"
+                )
+                sent += 1
+            except Exception:
+                failed += 1
+
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+
+        await update.message.reply_text(
+            f"*✅ BROADCAST SELESAI*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"✅ Terkirim: {sent}\n"
+            f"❌ Gagal: {failed}\n"
+            f"📊 Total: {jumlah}",
+            parse_mode="Markdown"
+        )
+        return
 
     # --- State: tambah produk ---
     adding = context.user_data.get('adding_product')
@@ -1441,12 +1769,16 @@ def main():
     )
 
     # User commands
-    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("start",   start))
+    app.add_handler(CommandHandler("riwayat", cmd_riwayat))
 
     # Admin commands
     app.add_handler(CommandHandler("produk",  cmd_produk))
     app.add_handler(CommandHandler("pending", admin_pending))
     app.add_handler(CommandHandler("aktif",   cmd_aktif))
+    app.add_handler(CommandHandler("stats",   cmd_stats))
+    app.add_handler(CommandHandler("blast",   cmd_blast))
+    app.add_handler(CommandHandler("backup",  cmd_backup))
     app.add_handler(CommandHandler("link",    cmd_link))
 
     # User callbacks
@@ -1468,6 +1800,9 @@ def main():
     app.add_handler(CallbackQueryHandler(admin_konfirmasi,    pattern="^(confirm|reject)_"))
     app.add_handler(CallbackQueryHandler(back_orders,         pattern="^back_orders$"))
     app.add_handler(CallbackQueryHandler(admin_cancel_order,  pattern="^adm_cancel\\|"))
+
+    # Blast callback
+    app.add_handler(CallbackQueryHandler(blast_batal, pattern="^blast_batal$"))
 
     # Admin message handler (untuk state tambah/edit produk)
     app.add_handler(MessageHandler(

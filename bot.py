@@ -1,6 +1,7 @@
 import os
 import asyncio
 import re
+import html as html_module
 import requests
 import qrcode
 import psycopg2
@@ -425,13 +426,16 @@ async def generate_group_link(bot, paket, order_id):
         return None
     try:
         chat_id = int(group_id) if str(group_id).lstrip('-').isdigit() else group_id
+        nama_link = f"Order-{order_id}"[:32]
         link = await bot.create_chat_invite_link(
             chat_id=chat_id,
-            name=f"Order-{order_id}",
+            name=nama_link,
             member_limit=1,
             expire_date=int((datetime.now(timezone.utc) + timedelta(days=3)).timestamp())
         )
         return link.invite_link
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         print(f"[LINK] Gagal bikin link grup {group_id}: {e}")
         return None
@@ -523,35 +527,35 @@ async def kirim_link_ke_buyer(context, user_id, paket, order_id, amount):
 
     if group_link:
         link_text = (
-            f"🔗 *Link Grup Private (Cuma Kamu)*\n"
+            f"🔗 <b>Link Grup Private (Cuma Kamu)</b>\n"
             f"{link}\n\n"
-            f"⏰ *Aktif sampai 3 hari ke depan*\n"
-            f"👤 *Cuma 1 orang bisa pakai link ini*\n\n"
-            f"💾 _Klik link di atas, lalu pencet 'Join Group'._\n"
-            f"⚠️ _Jangan dishare ke orang lain, nanti gak bisa dipakai!_"
+            f"⏰ <b>Aktif sampai 3 hari ke depan</b>\n"
+            f"👤 <b>Cuma 1 orang bisa pakai link ini</b>\n\n"
+            f"💾 <i>Klik link di atas, lalu pencet 'Join Group'.</i>\n"
+            f"⚠️ <i>Jangan dishare ke orang lain, nanti gak bisa dipakai!</i>"
         )
     else:
         link_text = (
-            f"🔗 *Link Produk*\n"
+            f"🔗 <b>Link Produk</b>\n"
             f"{link}\n\n"
-            f"💾 _Simpan link ini. Produk dapat diakses kapan saja._"
+            f"💾 <i>Simpan link ini. Produk dapat diakses kapan saja.</i>"
         )
 
     msg = await context.bot.send_message(
         chat_id=user_id,
         text=(
-            f"*✅ PEMBAYARAN BERHASIL*\n"
+            f"<b>✅ PEMBAYARAN BERHASIL</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📦 *Detail Pesanan*\n"
-            f"├ Paket: {paket['emoji']} {esc(paket['nama'])}\n"
-            f"├ Order ID: `{order_id}`\n"
+            f"📦 <b>Detail Pesanan</b>\n"
+            f"├ Paket: {paket['emoji']} {html_module.escape(paket['nama'])}\n"
+            f"├ Order ID: <code>{order_id}</code>\n"
             f"└ Total: {format_harga(amount)}\n\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"{link_text}\n\n"
-            f"Terima kasih telah berbelanja\! 🙏\n\n"
+            f"Terima kasih telah berbelanja! 🙏\n\n"
             f"Ada masalah dengan link? Pencet tombol di bawah:"
         ),
-        parse_mode="Markdown",
+        parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([
             [
                 InlineKeyboardButton("🔄 Link Error / Kirim Ulang", callback_data=f"resendlink|{order_id}"),
@@ -1009,54 +1013,58 @@ async def _handle_payment_success(bot, order_id: str, paket_id: str, user_id: in
 
     if group_link:
         link_section = (
-            f"🔗 *Link Grup Private (Cuma Kamu)*\n"
+            f"🔗 <b>Link Grup Private (Cuma Kamu)</b>\n"
             f"{link}\n\n"
             f"⏰ Aktif 3 hari | 👤 Cuma 1 orang\n\n"
-            f"💾 _Klik link di atas → pencet 'Join Group'._"
+            f"💾 <i>Klik link di atas → pencet 'Join Group'.</i>\n"
+            f"⚠️ <i>Jangan dishare ke orang lain!</i>"
         )
     else:
         link_section = (
-            f"🔗 *Link Produk*\n"
+            f"🔗 <b>Link Produk</b>\n"
             f"{link}\n\n"
-            f"💾 _Simpan link ini. Produk dapat diakses kapan saja._"
+            f"💾 <i>Simpan link ini. Produk dapat diakses kapan saja.</i>"
         )
 
     # Kirim link ke buyer
+    kirim_berhasil = False
     try:
         await bot.send_message(
             chat_id=user_id,
             text=(
-                f"*✅ PEMBAYARAN BERHASIL*\n"
+                f"<b>✅ PEMBAYARAN BERHASIL</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"📦 *Detail Pesanan*\n"
-                f"├ Paket: {paket['emoji']} {esc(paket['nama'])}\n"
-                f"├ Order ID: `{order_id}`\n"
+                f"📦 <b>Detail Pesanan</b>\n"
+                f"├ Paket: {paket['emoji']} {html_module.escape(paket['nama'])}\n"
+                f"├ Order ID: <code>{order_id}</code>\n"
                 f"└ Total: {format_harga(paid_amount)}\n\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"{link_section}\n\n"
-                f"Terima kasih telah berbelanja\! 🙏"
+                f"Terima kasih telah berbelanja! 🙏"
             ),
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
+        kirim_berhasil = True
     except Exception as e:
         print(f"[PAYMENT] Gagal kirim link ke buyer {user_id}: {e}")
 
     # Notif admin
+    status_kirim = "✅ Link terkirim ke buyer" if kirim_berhasil else "⚠️ GAGAL kirim link ke buyer! Cek log."
     try:
         await bot.send_message(
             chat_id=ADMIN_ID,
             text=(
-                f"*🔔 PEMBAYARAN SELESAI (AUTO)*\n"
+                f"<b>🔔 PEMBAYARAN SELESAI (AUTO)</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"👤 Pembeli: {esc(user_name)}\n"
-                f"📦 Paket: {paket['emoji']} {esc(paket['nama'])}\n"
-                f"📝 Order ID: `{order_id}`\n"
+                f"👤 Pembeli: {html_module.escape(user_name)}\n"
+                f"📦 Paket: {paket['emoji']} {html_module.escape(paket['nama'])}\n"
+                f"📝 Order ID: <code>{order_id}</code>\n"
                 f"💰 Total: {format_harga(paid_amount)}\n"
                 f"🕐 Waktu: {now_wib().strftime('%H:%M, %d %b %Y')}\n\n"
-                f"✅ Status: LUNAS — Link otomatis terkirim\n\n"
-                f"_Link: {link}_"
+                f"{status_kirim}\n\n"
+                f"<i>Link: {link}</i>"
             ),
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
     except Exception as e:
         print(f"[PAYMENT] Gagal notif admin: {e}")
@@ -1402,16 +1410,17 @@ async def admin_manual_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if group_link:
         link_section = (
-            f"🔗 *Link Grup Private (Cuma Kamu)*\n"
+            f"🔗 <b>Link Grup Private (Cuma Kamu)</b>\n"
             f"{link}\n\n"
             f"⏰ Aktif 3 hari | 👤 Cuma 1 orang\n\n"
-            f"💾 _Klik link di atas → pencet 'Join Group'._"
+            f"💾 <i>Klik link di atas → pencet 'Join Group'.</i>\n"
+            f"⚠️ <i>Jangan dishare ke orang lain!</i>"
         )
     else:
         link_section = (
-            f"🔗 *Link Produk*\n"
+            f"🔗 <b>Link Produk</b>\n"
             f"{link}\n\n"
-            f"💾 _Simpan link ini. Produk dapat diakses kapan saja._"
+            f"💾 <i>Simpan link ini. Produk dapat diakses kapan saja.</i>"
         )
 
     # Kirim link ke buyer
@@ -1419,17 +1428,17 @@ async def admin_manual_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
         await context.bot.send_message(
             chat_id=target_user_id,
             text=(
-                f"*✅ PEMBAYARAN DIKONFIRMASI*\n"
+                f"<b>✅ PEMBAYARAN DIKONFIRMASI</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"📦 *Detail Pesanan*\n"
-                f"├ Paket: {paket['emoji']} {esc(paket['nama'])}\n"
-                f"├ Order ID: `{order_id}`\n"
+                f"📦 <b>Detail Pesanan</b>\n"
+                f"├ Paket: {paket['emoji']} {html_module.escape(paket['nama'])}\n"
+                f"├ Order ID: <code>{order_id}</code>\n"
                 f"└ Total: {format_harga(harga)}\n\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"{link_section}\n\n"
-                f"Terima kasih telah berbelanja\! 🙏"
+                f"Terima kasih telah berbelanja! 🙏"
             ),
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
     except Exception as e:
         print(f"[KONFIRMASI MANUAL] Gagal kirim link ke buyer {target_user_id}: {e}")
@@ -2151,31 +2160,32 @@ async def admin_konfirmasi(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if group_link:
             link_section = (
-                f"🔗 *Link Grup Private (Cuma Kamu)*\n"
+                f"🔗 <b>Link Grup Private (Cuma Kamu)</b>\n"
                 f"{link}\n\n"
                 f"⏰ Aktif 3 hari | 👤 Cuma 1 orang\n\n"
-                f"💾 _Klik link di atas → pencet 'Join Group'._"
+                f"💾 <i>Klik link di atas → pencet 'Join Group'.</i>\n"
+                f"⚠️ <i>Jangan dishare ke orang lain!</i>"
             )
         else:
             link_section = (
-                f"🔗 *Link Produk*\n"
+                f"🔗 <b>Link Produk</b>\n"
                 f"{link}\n\n"
-                f"💾 _Simpan link ini. Produk dapat diakses kapan saja._"
+                f"💾 <i>Simpan link ini. Produk dapat diakses kapan saja.</i>"
             )
 
         msg = await context.bot.send_message(
             chat_id=user_id,
             text=(
-                f"*✅ PESANAN SELESAI*\n"
+                f"<b>✅ PESANAN SELESAI</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"📦 *Detail*\n"
-                f"├ Paket: {paket['emoji']} {esc(paket['nama'])}\n"
-                f"└ Konten: {esc(paket['deskripsi'])}\n\n"
+                f"📦 <b>Detail</b>\n"
+                f"├ Paket: {paket['emoji']} {html_module.escape(paket['nama'])}\n"
+                f"└ Konten: {html_module.escape(paket['deskripsi'])}\n\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"{link_section}\n\n"
-                f"Terima kasih telah berbelanja\! 🙏"
+                f"Terima kasih telah berbelanja! 🙏"
             ),
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
         simpan_msg_user(context, user_id, msg.message_id)
         await hapus_msg_user_lama(context, user_id, keep_last=2)

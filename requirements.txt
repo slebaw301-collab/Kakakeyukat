@@ -1,4 +1,5 @@
-python-telegram-bot==20.x
-requests
-qrcode[pil]
-psycopg2-binary
+python-telegram-bot==20.7
+psycopg2-binary==2.9.9
+requests==2.31.0
+qrcode[pil]==7.4.2
+Pillow==10.2.0

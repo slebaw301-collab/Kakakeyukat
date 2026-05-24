@@ -156,6 +156,11 @@ def init_db():
         ALTER TABLE products ADD COLUMN IF NOT EXISTS link TEXT DEFAULT 'https://t.me/Kikukkvd'
     """)
 
+    # ⭐ Migration: tambah kolom group_chat_id jika belum ada
+    c.execute("""
+        ALTER TABLE products ADD COLUMN IF NOT EXISTS group_chat_id TEXT DEFAULT NULL
+    """)
+
     c.execute("""
         CREATE TABLE IF NOT EXISTS orders (
             id SERIAL PRIMARY KEY,
@@ -202,22 +207,23 @@ def get_product(paket_id):
     conn.close()
     return dict(row) if row else None
 
-def add_product(paket_id, nama, emoji, deskripsi, harga, link=None):
+def add_product(paket_id, nama, emoji, deskripsi, harga, link=None, group_chat_id=None):
     conn = get_conn()
     c = conn.cursor()
     c.execute(
-        """INSERT INTO products (paket_id, nama, emoji, deskripsi, harga, link)
-           VALUES (%s, %s, %s, %s, %s, %s)
+        """INSERT INTO products (paket_id, nama, emoji, deskripsi, harga, link, group_chat_id)
+           VALUES (%s, %s, %s, %s, %s, %s, %s)
            ON CONFLICT (paket_id) DO UPDATE SET
                nama=EXCLUDED.nama, emoji=EXCLUDED.emoji,
-               deskripsi=EXCLUDED.deskripsi, harga=EXCLUDED.harga, link=EXCLUDED.link""",
-        (paket_id, nama, emoji, deskripsi, harga, link or DEFAULT_LINK)
+               deskripsi=EXCLUDED.deskripsi, harga=EXCLUDED.harga, 
+               link=EXCLUDED.link, group_chat_id=EXCLUDED.group_chat_id""",
+        (paket_id, nama, emoji, deskripsi, harga, link or DEFAULT_LINK, group_chat_id)
     )
     conn.commit()
     conn.close()
 
 def update_product_field(paket_id, field, value):
-    allowed = {"nama", "emoji", "deskripsi", "harga", "link"}
+    allowed = {"nama", "emoji", "deskripsi", "harga", "link", "group_chat_id"}
     if field not in allowed:
         return
     conn = get_conn()
@@ -408,6 +414,34 @@ def hitung_durasi(waktu_str):
     except Exception:
         return waktu_str
 
+# ⭐ FUNGSI BARU: Generate link grup private one-time
+async def generate_group_link(bot, paket, order_id):
+    """
+    Bikin link grup private khusus 1 orang untuk produk ini.
+    Link aktif 3 hari. Return None kalau produk gak punya group_chat_id.
+    """
+    group_id = paket.get('group_chat_id')
+    if not group_id:
+        return None
+    try:
+        chat_id = int(group_id) if str(group_id).lstrip('-').isdigit() else group_id
+        link = await bot.create_chat_invite_link(
+            chat_id=chat_id,
+            name=f"Order-{order_id}",
+            member_limit=1,
+            expire_date=int((datetime.now(timezone.utc) + timedelta(days=3)).timestamp())
+        )
+        return link.invite_link
+    except Exception as e:
+        print(f"[LINK] Gagal bikin link grup {group_id}: {e}")
+        return None
+
+# ⭐ FUNGSI BARU: Dapatkan link produk (dinamis atau statis)
+async def get_product_link(bot, paket, order_id):
+    """Dapatkan link produk: grup private (dinamis) atau link statis dari DB."""
+    group_link = await generate_group_link(bot, paket, order_id)
+    return group_link or (paket.get("link") or DEFAULT_LINK)
+
 def build_main_menu_text():
     products = get_all_products()
     text = (
@@ -483,8 +517,26 @@ async def hapus_msg_user_lama(context, user_id, keep_last=1):
                 pass
 
 async def kirim_link_ke_buyer(context, user_id, paket, order_id, amount):
-    """Kirim link produk ke buyer setelah pembayaran berhasil."""
-    link = paket.get("link") or DEFAULT_LINK
+    """Kirim link produk ke buyer setelah bayar. Bisa link grup private (dinamis) atau link biasa."""
+    group_link = await generate_group_link(context.bot, paket, order_id)
+    link = group_link or (paket.get("link") or DEFAULT_LINK)
+
+    if group_link:
+        link_text = (
+            f"🔗 *Link Grup Private (Cuma Kamu)*\n"
+            f"{link}\n\n"
+            f"⏰ *Aktif sampai 3 hari ke depan*\n"
+            f"👤 *Cuma 1 orang bisa pakai link ini*\n\n"
+            f"💾 _Klik link di atas, lalu pencet 'Join Group'._\n"
+            f"⚠️ _Jangan dishare ke orang lain, nanti gak bisa dipakai!_"
+        )
+    else:
+        link_text = (
+            f"🔗 *Link Produk*\n"
+            f"{link}\n\n"
+            f"💾 _Simpan link ini. Produk dapat diakses kapan saja._"
+        )
+
     msg = await context.bot.send_message(
         chat_id=user_id,
         text=(
@@ -495,12 +547,17 @@ async def kirim_link_ke_buyer(context, user_id, paket, order_id, amount):
             f"├ Order ID: `{order_id}`\n"
             f"└ Total: {format_harga(amount)}\n\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🔗 *Link Produk*\n"
-            f"{link}\n\n"
-            f"💾 _Simpan link ini. Produk dapat diakses kapan saja._\n\n"
-            f"Terima kasih telah berbelanja\\! 🙏"
+            f"{link_text}\n\n"
+            f"Terima kasih telah berbelanja\! 🙏\n\n"
+            f"Ada masalah dengan link? Pencet tombol di bawah:"
         ),
-        parse_mode="Markdown"
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("🔄 Link Error / Kirim Ulang", callback_data=f"resendlink|{order_id}"),
+                InlineKeyboardButton("💬 Chat Admin", url="https://t.me/Kikukkvd")
+            ]
+        ])
     )
     simpan_msg_user(context, user_id, msg.message_id)
     await hapus_msg_user_lama(context, user_id, keep_last=2)
@@ -536,8 +593,6 @@ async def post_init(application: Application):
     )
 
     # ===== Re-start asyncio tasks untuk order 'waiting' setelah bot restart =====
-    # Saat bot restart, semua task asyncio hilang dari memori.
-    # Kita scan DB untuk order yang masih 'waiting' dan buat ulang task-nya.
     waiting_orders = get_all_waiting()
     if waiting_orders:
         print(f"[POST_INIT] Ditemukan {len(waiting_orders)} order aktif, membuat ulang payment tasks...")
@@ -577,9 +632,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         trans = get_transaction_detail(active["order_id"], paket["harga"])
 
-        # ===== FIX UTAMA: Kalau sudah dibayar, langsung kirim link =====
-        # Dulu: status diubah ke 'pending' tapi link TIDAK dikirim → buyer stuck
-        # Sekarang: kirim link langsung, selesai
         if trans and trans.get("status") == "completed":
             update_order_status(active["order_id"], "completed")
             _stop_payment_task(user_id)
@@ -856,11 +908,9 @@ async def back_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await hapus_msg_user_lama(context, user_id, keep_last=1)
 
 # =================== ASYNCIO PAYMENT TASKS ===================
-# Menggantikan job_queue — tidak perlu install extra dependency apapun.
-# Satu asyncio task per user, aktif selama menunggu pembayaran.
 
-_payment_tasks: dict = {}  # user_id (int) -> asyncio.Task
-_current_bot = None        # Di-set saat post_init, dipakai oleh _auto_backup_loop
+_payment_tasks: dict = {}
+_current_bot = None
 
 def _stop_payment_task(user_id: int):
     """Batalkan task polling pembayaran untuk user ini."""
@@ -871,7 +921,7 @@ def _stop_payment_task(user_id: int):
 def _start_payment_task(bot, order_id: str, paket_id: str, user_id: int,
                          user_name: str, amount: int, timeout_seconds: int = 1800):
     """Mulai background asyncio task untuk cek pembayaran setiap 30 detik."""
-    _stop_payment_task(user_id)  # cancel task lama kalau ada
+    _stop_payment_task(user_id)
     task = asyncio.create_task(
         _payment_poll_loop(bot, order_id, paket_id, user_id, user_name, amount, timeout_seconds)
     )
@@ -889,7 +939,6 @@ async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
             await asyncio.sleep(30)
             elapsed += 30
 
-            # Cek apakah order masih aktif di DB (mungkin sudah dibatalkan user/admin)
             conn = get_conn()
             c = conn.cursor()
             c.execute("SELECT status FROM orders WHERE order_id=%s", (order_id,))
@@ -897,9 +946,8 @@ async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
             conn.close()
 
             if not row or row['status'] != 'waiting':
-                return  # Sudah selesai/dibatalkan, stop polling
+                return
 
-            # Cek ke Pakasir API
             trans = get_transaction_detail(order_id, amount)
             if not trans:
                 continue
@@ -909,7 +957,6 @@ async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
                 return
 
         # ===== TIMEOUT: auto cancel =====
-        # Cek sekali lagi sebelum expire
         conn = get_conn()
         c = conn.cursor()
         c.execute("SELECT status FROM orders WHERE order_id=%s", (order_id,))
@@ -924,7 +971,6 @@ async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
             await _handle_payment_success(bot, order_id, paket_id, user_id, user_name, amount, trans)
             return
 
-        # Benar-benar expired
         if amount:
             cancel_transaction(order_id, amount)
         update_order_status(order_id, 'expired')
@@ -945,7 +991,7 @@ async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
             pass
 
     except asyncio.CancelledError:
-        pass  # Task dibatalkan oleh _stop_payment_task(), normal
+        pass
     finally:
         _payment_tasks.pop(user_id, None)
 
@@ -956,7 +1002,24 @@ async def _handle_payment_success(bot, order_id: str, paket_id: str, user_id: in
     update_order_status(order_id, 'completed')
 
     paid_amount = trans.get('amount', amount)
-    link = paket.get("link") or DEFAULT_LINK
+
+    # ⭐ Generate link dinamis (grup private) atau pakai link statis
+    group_link = await generate_group_link(bot, paket, order_id)
+    link = group_link or (paket.get("link") or DEFAULT_LINK)
+
+    if group_link:
+        link_section = (
+            f"🔗 *Link Grup Private (Cuma Kamu)*\n"
+            f"{link}\n\n"
+            f"⏰ Aktif 3 hari | 👤 Cuma 1 orang\n\n"
+            f"💾 _Klik link di atas → pencet 'Join Group'._"
+        )
+    else:
+        link_section = (
+            f"🔗 *Link Produk*\n"
+            f"{link}\n\n"
+            f"💾 _Simpan link ini. Produk dapat diakses kapan saja._"
+        )
 
     # Kirim link ke buyer
     try:
@@ -970,10 +1033,8 @@ async def _handle_payment_success(bot, order_id: str, paket_id: str, user_id: in
                 f"├ Order ID: `{order_id}`\n"
                 f"└ Total: {format_harga(paid_amount)}\n\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🔗 *Link Produk*\n"
-                f"{link}\n\n"
-                f"💾 _Simpan link ini. Produk dapat diakses kapan saja._\n\n"
-                f"Terima kasih telah berbelanja\\! 🙏"
+                f"{link_section}\n\n"
+                f"Terima kasih telah berbelanja\! 🙏"
             ),
             parse_mode="Markdown"
         )
@@ -1050,12 +1111,15 @@ async def produk_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("⚠️ Produk tidak ditemukan.")
         return
 
+    grp_info = f"🏢 Group ID: `{esc(p.get('group_chat_id') or 'Tidak di-set')}`\n" if p.get('group_chat_id') else "🏢 Group ID: _Tidak di-set (pakai link biasa)_\n"
+
     text = (
         f"*{esc(p['emoji'])} {esc(p['nama'])}*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"💰 Harga: {format_harga(p['harga'])}\n"
         f"📝 Deskripsi: {esc(p['deskripsi'])}\n"
-        f"🔗 Link: `{esc(p['link'])}`\n\n"
+        f"🔗 Link: `{esc(p['link'])}`\n"
+        f"{grp_info}\n"
         f"Pilih field yang mau diubah:"
     )
 
@@ -1070,6 +1134,7 @@ async def produk_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ],
         [
             InlineKeyboardButton("🔗 Link",       callback_data=f"pd_edit_{paket_id}_link"),
+            InlineKeyboardButton("🏢 Group ID",   callback_data=f"pd_edit_{paket_id}_group_chat_id"),
         ],
         [
             InlineKeyboardButton("🗑️ Hapus Produk", callback_data=f"pd_hapus_{paket_id}"),
@@ -1086,7 +1151,7 @@ async def produk_edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     raw = query.data.replace("pd_edit_", "")
-    FIELDS = ["nama", "emoji", "harga", "deskripsi", "link"]
+    FIELDS = ["nama", "emoji", "harga", "deskripsi", "link", "group_chat_id"]
     field = None
     paket_id = None
     for f in FIELDS:
@@ -1110,6 +1175,7 @@ async def produk_edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "harga": "harga (angka saja, contoh: 15000)",
         "deskripsi": "deskripsi",
         "link": "link produk",
+        "group_chat_id": "ID grup private (contoh: -1001234567890, ketik 'hapus' untuk kosongkan)",
     }
 
     context.user_data['editing_product'] = {'paket_id': paket_id, 'field': field}
@@ -1247,7 +1313,6 @@ async def admin_cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     await query.answer()
 
-    # Format: adm_cancel|user_id|order_id
     parts = query.data.split("|")
     if len(parts) != 3:
         await query.answer("Format tidak valid.", show_alert=True)
@@ -1269,16 +1334,12 @@ async def admin_cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
     order = dict(order)
     paket = get_product(order['paket_id']) or {"emoji": "📦", "nama": order['paket_id'], "harga": 0}
 
-    # Cancel di Pakasir
     if paket['harga']:
         cancel_transaction(order_id, paket['harga'])
 
     update_order_status(order_id, 'cancelled')
-
-    # Stop payment task asyncio untuk user ini
     _stop_payment_task(target_user_id)
 
-    # Notif ke buyer
     try:
         await context.bot.send_message(
             chat_id=target_user_id,
@@ -1310,7 +1371,6 @@ async def admin_manual_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
     if query.from_user.id != ADMIN_ID:
         return
 
-    # Format: adm_konfirm|user_id|order_id
     parts = query.data.split("|")
     if len(parts) != 3:
         await query.answer("Format tidak valid.", show_alert=True)
@@ -1332,12 +1392,27 @@ async def admin_manual_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
     order = dict(order)
     paket = get_product(order['paket_id']) or {"emoji": "📦", "nama": order['paket_id'], "harga": 0, "link": DEFAULT_LINK}
 
-    # Stop task polling dan tandai selesai
     _stop_payment_task(target_user_id)
     update_order_status(order_id, 'completed')
 
-    link = paket.get("link") or DEFAULT_LINK
+    # ⭐ Generate link dinamis atau pakai link statis
+    group_link = await generate_group_link(context.bot, paket, order_id)
+    link = group_link or (paket.get("link") or DEFAULT_LINK)
     harga = paket.get("harga", 0)
+
+    if group_link:
+        link_section = (
+            f"🔗 *Link Grup Private (Cuma Kamu)*\n"
+            f"{link}\n\n"
+            f"⏰ Aktif 3 hari | 👤 Cuma 1 orang\n\n"
+            f"💾 _Klik link di atas → pencet 'Join Group'._"
+        )
+    else:
+        link_section = (
+            f"🔗 *Link Produk*\n"
+            f"{link}\n\n"
+            f"💾 _Simpan link ini. Produk dapat diakses kapan saja._"
+        )
 
     # Kirim link ke buyer
     try:
@@ -1351,10 +1426,8 @@ async def admin_manual_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
                 f"├ Order ID: `{order_id}`\n"
                 f"└ Total: {format_harga(harga)}\n\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🔗 *Link Produk*\n"
-                f"{link}\n\n"
-                f"💾 _Simpan link ini. Produk dapat diakses kapan saja._\n\n"
-                f"Terima kasih telah berbelanja\\! 🙏"
+                f"{link_section}\n\n"
+                f"Terima kasih telah berbelanja\! 🙏"
             ),
             parse_mode="Markdown"
         )
@@ -1466,7 +1539,8 @@ async def _kirim_backup(bot):
 
         lines.append(f"--- PRODUK ({len(products)}) ---\n")
         for p in products:
-            lines.append(f"[{p['paket_id']}] {p['emoji']} {p['nama']} — Rp {p['harga']:,} | Link: {p['link']}\n")
+            grp = p.get('group_chat_id') or '-'
+            lines.append(f"[{p['paket_id']}] {p['emoji']} {p['nama']} — Rp {p['harga']:,} | Link: {p['link']} | Group: {grp}\n")
 
         lines.append(f"\n--- ORDERS ({len(orders)}) ---\n")
         for o in orders:
@@ -1532,12 +1606,12 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return "NULL"
                 return "'" + str(v).replace("'", "''") + "'"
             lines.append(
-                f"INSERT INTO products (paket_id, nama, emoji, deskripsi, harga, link) "
+                f"INSERT INTO products (paket_id, nama, emoji, deskripsi, harga, link, group_chat_id) "
                 f"VALUES ({sql_str(p['paket_id'])}, {sql_str(p['nama'])}, {sql_str(p['emoji'])}, "
-                f"{sql_str(p['deskripsi'])}, {p['harga']}, {sql_str(p['link'])}) "
+                f"{sql_str(p['deskripsi'])}, {p['harga']}, {sql_str(p['link'])}, {sql_str(p.get('group_chat_id'))}) "
                 f"ON CONFLICT (paket_id) DO UPDATE SET "
                 f"nama=EXCLUDED.nama, emoji=EXCLUDED.emoji, deskripsi=EXCLUDED.deskripsi, "
-                f"harga=EXCLUDED.harga, link=EXCLUDED.link;\n"
+                f"harga=EXCLUDED.harga, link=EXCLUDED.link, group_chat_id=EXCLUDED.group_chat_id;\n"
             )
 
         lines.append("\n-- ORDERS\n")
@@ -1673,10 +1747,10 @@ async def _send_buyer_reminders(bot):
             await bot.send_message(
                 chat_id=buyer['user_id'],
                 text=(
-                    f"👋 Halo *{esc(buyer['user_name'])}*\\!\n\n"
+                    f"👋 Halo *{esc(buyer['user_name'])}*\!\n\n"
                     f"Sudah *{REMINDER_HARI} hari* sejak kamu belanja di *Hyper Family Store* 🛍️\n\n"
                     f"Puas dengan produknya? Mau belanja lagi?\n"
-                    f"Kami punya paket menarik yang siap dikirim langsung\\!\n\n"
+                    f"Kami punya paket menarik yang siap dikirim langsung\!\n\n"
                     f"Ketik /start untuk lihat katalog kami 😊"
                 ),
                 parse_mode="Markdown"
@@ -1890,21 +1964,26 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
             await update.message.reply_text("❌ Harga harus berupa angka. Coba lagi:")
             return
 
-        value = int(text) if field == 'harga' else text
+        if field == 'group_chat_id':
+            value = text.strip() if text.strip() and text.strip().lower() != 'hapus' else None
+        else:
+            value = int(text) if field == 'harga' else text
+
         update_product_field(paket_id, field, value)
         context.user_data.pop('editing_product', None)
 
-        p = get_product(paket_id)
         await update.message.reply_text(
-            f"✅ {field.capitalize()} berhasil diupdate!\n\nNilai baru: {value}"
-        )
+            f"✅ {field.capitalize()} berhasil diupdate!\n\nNilai baru: {value if value else '(kosong)'}")
+        p = get_product(paket_id)
         if p:
+            grp_info = f"🏢 Group ID: `{esc(p.get('group_chat_id') or 'Tidak di-set')}`\n" if p.get('group_chat_id') else "🏢 Group ID: _Tidak di-set (pakai link biasa)_\n"
             detail_text = (
                 f"*{esc(p['emoji'])} {esc(p['nama'])}*\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
                 f"💰 Harga: {format_harga(p['harga'])}\n"
                 f"📝 Deskripsi: {esc(p['deskripsi'])}\n"
-                f"🔗 Link: `{esc(p['link'])}`\n\n"
+                f"🔗 Link: `{esc(p['link'])}`\n"
+                f"{grp_info}\n"
                 f"Pilih field yang mau diubah:"
             )
             keyboard = [
@@ -1916,7 +1995,10 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
                     InlineKeyboardButton("💰 Harga",      callback_data=f"pd_edit_{paket_id}_harga"),
                     InlineKeyboardButton("📝 Deskripsi",  callback_data=f"pd_edit_{paket_id}_deskripsi"),
                 ],
-                [InlineKeyboardButton("🔗 Link",          callback_data=f"pd_edit_{paket_id}_link")],
+                [
+                    InlineKeyboardButton("🔗 Link",       callback_data=f"pd_edit_{paket_id}_link"),
+                    InlineKeyboardButton("🏢 Group ID",   callback_data=f"pd_edit_{paket_id}_group_chat_id"),
+                ],
                 [InlineKeyboardButton("🗑️ Hapus Produk",  callback_data=f"pd_hapus_{paket_id}")],
                 [InlineKeyboardButton("← Kembali",        callback_data="pd_back")],
             ]
@@ -1936,8 +2018,12 @@ async def cmd_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     products = get_all_products()
     text = "*🔗 LINK PRODUK SAAT INI*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
     for p in products:
-        text += f"{p['emoji']} *{esc(p['nama'])}*\n└ `{p['link']}`\n\n"
-    text += "_Ketik /produk untuk mengubah link._"
+        grp = p.get('group_chat_id')
+        if grp:
+            text += f"{p['emoji']} *{esc(p['nama'])}*\n├ 🏢 Group: `{grp}`\n└ 🔗 Fallback: `{p['link']}`\n\n"
+        else:
+            text += f"{p['emoji']} *{esc(p['nama'])}*\n└ `{p['link']}`\n\n"
+    text += "_Ketik /produk untuk mengubah link atau Group ID._"
     await update.message.reply_text(text, parse_mode="Markdown")
 
 # =================== ADMIN: PENDING ORDERS ===================
@@ -2037,6 +2123,7 @@ async def back_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def admin_konfirmasi(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin konfirmasi order pending — kirim link ke buyer."""
     query = update.callback_query
     await query.answer()
 
@@ -2058,7 +2145,24 @@ async def admin_konfirmasi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     paket = get_product(order["paket_id"]) or {"emoji": "📦", "nama": order["paket_id"], "harga": 0, "deskripsi": "-", "link": DEFAULT_LINK}
 
     if action == "confirm":
-        link = paket.get("link") or DEFAULT_LINK
+        # ⭐ Generate link dinamis atau pakai link statis
+        group_link = await generate_group_link(context.bot, paket, order["order_id"])
+        link = group_link or (paket.get("link") or DEFAULT_LINK)
+
+        if group_link:
+            link_section = (
+                f"🔗 *Link Grup Private (Cuma Kamu)*\n"
+                f"{link}\n\n"
+                f"⏰ Aktif 3 hari | 👤 Cuma 1 orang\n\n"
+                f"💾 _Klik link di atas → pencet 'Join Group'._"
+            )
+        else:
+            link_section = (
+                f"🔗 *Link Produk*\n"
+                f"{link}\n\n"
+                f"💾 _Simpan link ini. Produk dapat diakses kapan saja._"
+            )
+
         msg = await context.bot.send_message(
             chat_id=user_id,
             text=(
@@ -2067,10 +2171,9 @@ async def admin_konfirmasi(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"📦 *Detail*\n"
                 f"├ Paket: {paket['emoji']} {esc(paket['nama'])}\n"
                 f"└ Konten: {esc(paket['deskripsi'])}\n\n"
-                f"🔗 *Link Produk*\n"
-                f"{link}\n\n"
-                f"💾 _Simpan link ini. Produk dapat diakses kapan saja._\n\n"
-                f"Terima kasih telah berbelanja\\! 🙏"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"{link_section}\n\n"
+                f"Terima kasih telah berbelanja\! 🙏"
             ),
             parse_mode="Markdown"
         )
@@ -2114,6 +2217,55 @@ async def admin_konfirmasi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await hapus_msg_user_lama(context, user_id, keep_last=2)
         await hapus_admin_msg(context, user_id)
 
+# ⭐ FUNGSI BARU: Kirim ulang link grup (buyer pencet tombol)
+async def resend_group_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Buyer pencet tombol 'Link Error' → bot bikin link baru dan kirim ulang."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    parts = query.data.split("|")
+    order_id = parts[1] if len(parts) > 1 else None
+    if not order_id:
+        await query.edit_message_text("⚠️ Order ID tidak valid.")
+        return
+
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT * FROM orders WHERE order_id=%s AND user_id=%s AND status='completed'", (order_id, user_id))
+    order = c.fetchone()
+    conn.close()
+
+    if not order:
+        await query.edit_message_text("⚠️ Order tidak ditemukan atau belum lunas.")
+        return
+
+    order = dict(order)
+    paket = get_product(order['paket_id'])
+    if not paket:
+        await query.edit_message_text("⚠️ Produk tidak ditemukan.")
+        return
+
+    new_link = await generate_group_link(context.bot, paket, order_id)
+
+    if new_link:
+        await query.edit_message_text(
+            f"✅ *Link Baru Berhasil Dibuat!*\n\n"
+            f"🔗 {new_link}\n\n"
+            f"⏰ Aktif 3 hari | 👤 Cuma kamu yang bisa pakai\n\n"
+            f"_Segera join ya, jangan ditunda-tunda!_",
+            parse_mode="Markdown"
+        )
+    else:
+        # Fallback ke link biasa
+        fallback_link = paket.get("link") or DEFAULT_LINK
+        await query.edit_message_text(
+            f"✅ *Link Produk*\n\n"
+            f"🔗 {fallback_link}\n\n"
+            f"_Produk ini pakai link biasa (bukan grup private)._",
+            parse_mode="Markdown"
+        )
+
 # =================== MAIN ===================
 
 def main():
@@ -2146,6 +2298,9 @@ def main():
     app.add_handler(CallbackQueryHandler(pilih_paket,  pattern="^pilih_"))
     app.add_handler(CallbackQueryHandler(back_start,   pattern="^back_start$"))
 
+    # ⭐ Handler baru: kirim ulang link grup
+    app.add_handler(CallbackQueryHandler(resend_group_link, pattern="^resendlink\|"))
+
     # Produk management callbacks
     app.add_handler(CallbackQueryHandler(produk_detail,        pattern="^pd_detail_"))
     app.add_handler(CallbackQueryHandler(produk_edit_field,    pattern="^pd_edit_"))
@@ -2159,8 +2314,8 @@ def main():
     app.add_handler(CallbackQueryHandler(admin_proses_order,   pattern="^proses_"))
     app.add_handler(CallbackQueryHandler(admin_konfirmasi,     pattern="^(confirm|reject)_"))
     app.add_handler(CallbackQueryHandler(back_orders,          pattern="^back_orders$"))
-    app.add_handler(CallbackQueryHandler(admin_cancel_order,   pattern="^adm_cancel\\|"))
-    app.add_handler(CallbackQueryHandler(admin_manual_confirm, pattern="^adm_konfirm\\|"))
+    app.add_handler(CallbackQueryHandler(admin_cancel_order,   pattern="^adm_cancel\|"))
+    app.add_handler(CallbackQueryHandler(admin_manual_confirm, pattern="^adm_konfirm\|"))
 
     # Blast callback
     app.add_handler(CallbackQueryHandler(blast_batal, pattern="^blast_batal$"))

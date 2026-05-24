@@ -1562,14 +1562,13 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
             document=buf,
             filename=filename,
             caption=(
-                f"✅ *Export Berhasil*\n"
+                f"✅ Export Berhasil\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
                 f"📦 Products: {len(products)}\n"
                 f"📋 Orders: {len(orders)}\n"
                 f"🕐 {now_wib().strftime('%H:%M, %d/%m/%Y')}\n\n"
-                f"_Kirim file ini ke bot dengan /import\\_sql untuk restore._"
-            ),
-            parse_mode="Markdown"
+                f"Kirim file ini ke bot dengan /import_sql untuk restore."
+            )
         )
 
     except Exception as e:

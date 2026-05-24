@@ -1242,6 +1242,7 @@ async def _send_produk_menu(context, chat_id, message=None, query=None):
         for p in products
     ]
     keyboard.append([InlineKeyboardButton("➕ Tambah Produk Baru", callback_data="pd_tambah")])
+    keyboard.append([InlineKeyboardButton("← Kembali ke Panel", callback_data="admpanel_back")])
 
     markup = InlineKeyboardMarkup(keyboard)
 
@@ -1992,34 +1993,38 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
     if context.user_data.get('awaiting_cari'):
         context.user_data.pop('awaiting_cari', None)
         order_id = text.strip()
-        order = get_order_by_id(order_id)
+        try:
+            order = get_order_by_id(order_id)
+        except Exception as e:
+            await update.message.reply_text(f"❌ Gagal mengambil data order: {e}")
+            return
         if not order:
             await update.message.reply_text(
-                f"❌ Order `{esc(order_id)}` tidak ditemukan.",
-                parse_mode="Markdown"
+                f"❌ Order tidak ditemukan.\n\nID yang dicari: {order_id}"
             )
             return
-        paket = get_product(order['paket_id']) or {"emoji": "📦", "nama": order['paket_id'], "harga": 0}
-        STATUS_LABEL = {
-            'completed': '✅ Selesai / Lunas', 'waiting': '⏳ Menunggu Bayar',
-            'pending': '🔄 Diproses Manual', 'cancelled': '❌ Dibatalkan',
-            'expired': '⏰ Kedaluwarsa', 'rejected': '🚫 Ditolak',
-        }
-        status = STATUS_LABEL.get(order['status'], order['status'])
-        sent_link = order.get('sent_link')
-        link_info = f"🔗 Link Terkirim: {sent_link}" if sent_link else "🔗 Link: _Belum terkirim_"
-        await update.message.reply_text(
-            f"*🔍 DETAIL ORDER*\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📝 Order ID: `{order['order_id']}`\n"
-            f"👤 Buyer: {esc(order.get('user_name', '-'))} (`{order['user_id']}`)\n"
-            f"📦 Paket: {paket['emoji']} {esc(paket['nama'])}\n"
-            f"💰 Harga: {format_harga(paket['harga'])}\n"
-            f"📊 Status: {status}\n"
-            f"🕐 Dibuat: {order.get('waktu', '-')}\n"
-            f"{link_info}",
-            parse_mode="Markdown"
-        )
+        try:
+            paket = get_product(order['paket_id']) or {"emoji": "📦", "nama": order['paket_id'], "harga": 0}
+            STATUS_LABEL = {
+                'completed': '✅ Selesai / Lunas', 'waiting': '⏳ Menunggu Bayar',
+                'pending': '🔄 Diproses Manual', 'cancelled': '❌ Dibatalkan',
+                'expired': '⏰ Kedaluwarsa', 'rejected': '🚫 Ditolak',
+            }
+            status = STATUS_LABEL.get(order['status'], order['status'])
+            sent_link = order.get('sent_link') or '-'
+            await update.message.reply_text(
+                f"🔍 DETAIL ORDER\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"Order ID: {order['order_id']}\n"
+                f"Buyer: {order.get('user_name', '-')} ({order['user_id']})\n"
+                f"Paket: {paket['emoji']} {paket['nama']}\n"
+                f"Harga: {format_harga(paket['harga'])}\n"
+                f"Status: {status}\n"
+                f"Dibuat: {order.get('waktu', '-')}\n"
+                f"Link terkirim: {sent_link}"
+            )
+        except Exception as e:
+            await update.message.reply_text(f"❌ Gagal memformat detail order: {e}")
         return
 
     # --- State: awaiting ban user (dari panel) ---
@@ -2072,14 +2077,19 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
         status_msg = await update.message.reply_text(f"📢 Mengirim ke {jumlah} buyer...")
 
+        blast_text = (
+            "📢 PESAN DARI ADMIN HYPER FAMILY STORE\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            + text
+        )
+
         sent = 0
         failed = 0
         for b in buyers:
             try:
                 await context.bot.send_message(
                     chat_id=b['user_id'],
-                    text=text,
-                    parse_mode="Markdown"
+                    text=blast_text
                 )
                 sent += 1
             except Exception:
@@ -2091,12 +2101,11 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
             pass
 
         await update.message.reply_text(
-            f"*✅ BROADCAST SELESAI*\n"
+            f"✅ BROADCAST SELESAI\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"✅ Terkirim: {sent}\n"
             f"❌ Gagal: {failed}\n"
-            f"📊 Total: {jumlah}",
-            parse_mode="Markdown"
+            f"📊 Total: {jumlah}"
         )
         return
 
@@ -2203,7 +2212,11 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         context.user_data.pop('editing_product', None)
 
         await update.message.reply_text(
-            f"✅ {field.capitalize()} berhasil diupdate!\n\nNilai baru: {value if value else '(kosong)'}")
+            f"✅ {field.capitalize()} berhasil diupdate!\nNilai baru: {value if value else '(kosong)'}",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("← Kembali ke Panel", callback_data="admpanel_back")
+            ]])
+        )
         p = get_product(paket_id)
         if p:
             grp_info = f"🏢 Group ID: `{esc(p.get('group_chat_id') or 'Tidak di-set')}`\n" if p.get('group_chat_id') else "🏢 Group ID: _Tidak di-set (pakai link biasa)_\n"
@@ -2619,15 +2632,15 @@ async def admpanel_orders_pending(update: Update, context: ContextTypes.DEFAULT_
 async def admpanel_orders_cari(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    context.user_data['awaiting_cari'] = True
     await query.edit_message_text(
         "*🔍 CARI ORDER*\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n\n"
         "Ketik Order ID yang ingin dicari:\n"
-        "_Contoh: HFB-123456789-20250524143000_",
+        "Contoh: HFB-123456789-20250524143000",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("← Batal", callback_data="admpanel_orders")]])
     )
+    context.user_data['awaiting_cari'] = True
 
 async def admpanel_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -2668,17 +2681,16 @@ async def admpanel_blast(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("← Kembali", callback_data="admpanel_back")]])
         )
         return
-    context.user_data['blasting'] = True
     await query.edit_message_text(
-        f"*📢 BROADCAST PESAN*\n"
+        f"📢 BROADCAST PESAN\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"Total penerima: *{jumlah} buyer*\n\n"
-        f"Kirim pesan yang mau di-blast sekarang.\n"
-        f"_Mendukung format Markdown._\n\n"
-        f"⚠️ Pesan akan langsung dikirim ke semua buyer.",
-        parse_mode="Markdown",
+        f"Total penerima: {jumlah} buyer\n\n"
+        f"Ketik & kirim pesan yang mau di-blast sekarang.\n"
+        f"Pesan kamu akan dikirim dengan header toko secara otomatis.\n\n"
+        f"⚠️ Langsung terkirim ke semua buyer setelah kamu send.",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Batal", callback_data="blast_batal")]])
     )
+    context.user_data['blasting'] = True
 
 async def admpanel_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -2817,29 +2829,29 @@ async def admpanel_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admpanel_user_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    context.user_data['awaiting_ban'] = True
     await query.edit_message_text(
         "*🚫 BAN USER*\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n\n"
         "Ketik User ID dan alasan (opsional):\n"
-        "_Format: `<user_id> [alasan]`_\n"
-        "_Contoh: `123456789 spam`_",
+        "Format: user\\_id alasan\n"
+        "Contoh: `123456789 spam`",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("← Batal", callback_data="admpanel_user")]])
     )
+    context.user_data['awaiting_ban'] = True
 
 async def admpanel_user_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    context.user_data['awaiting_unban'] = True
     await query.edit_message_text(
         "*✅ UNBAN USER*\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n\n"
         "Ketik User ID yang mau di-unban:\n"
-        "_Contoh: `123456789`_",
+        "Contoh: `123456789`",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("← Batal", callback_data="admpanel_user")]])
     )
+    context.user_data['awaiting_unban'] = True
 
 async def admpanel_user_daftar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query

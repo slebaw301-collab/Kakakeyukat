@@ -1,17 +1,19 @@
 import os
 import asyncio
 import re
+import json
 import html as html_module
 import requests
 import qrcode
 import psycopg2
 from psycopg2.extras import RealDictCursor
+from psycopg2.pool import SimpleConnectionPool
 from io import BytesIO
 from datetime import datetime, timedelta, timezone
 from telegram import Update, BotCommand, BotCommandScopeChat, BotCommandScopeDefault, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
-    MessageHandler, filters, ContextTypes
+    MessageHandler, ChatJoinRequestHandler, filters, ContextTypes
 )
 
 def esc(text):
@@ -37,15 +39,14 @@ PAKASIR_BASE_URL = "https://app.pakasir.com"
 
 DEFAULT_LINK = "https://t.me/Kikukkvd"
 
-# Validasi env wajib
 if not TOKEN:
-    raise ValueError("BOT_TOKEN tidak di-set! Tambahkan ke environment variable.")
+    raise ValueError("BOT_TOKEN tidak di-set!")
 if not ADMIN_ID:
-    raise ValueError("ADMIN_ID tidak di-set! Tambahkan ke environment variable.")
+    raise ValueError("ADMIN_ID tidak di-set!")
 if not PAKASIR_API_KEY:
-    raise ValueError("PAKASIR_API_KEY tidak di-set! Tambahkan ke environment variable.")
+    raise ValueError("PAKASIR_API_KEY tidak di-set!")
 if not DATABASE_URL:
-    raise ValueError("DATABASE_URL tidak di-set! Tambahkan PostgreSQL di Railway lalu set variable ini.")
+    raise ValueError("DATABASE_URL tidak di-set!")
 
 # =================== PAKASIR API ===================
 
@@ -130,132 +131,170 @@ def generate_qr_image(qris_string):
     buf.seek(0)
     return buf
 
-# =================== DATABASE ===================
+# =================== DATABASE (POOL) ===================
+
+_pool: SimpleConnectionPool = None
+
+def init_pool():
+    """Inisialisasi connection pool. Dipanggil sekali saat startup."""
+    global _pool
+    _pool = SimpleConnectionPool(2, 20, DATABASE_URL, cursor_factory=RealDictCursor)
+    print("[DB] Connection pool diinisialisasi (min=2, max=20)")
 
 def get_conn():
-    """Buat koneksi PostgreSQL. Semua cursor otomatis pakai RealDictCursor."""
-    conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
-    return conn
+    """Ambil koneksi dari pool."""
+    return _pool.getconn()
+
+def release_conn(conn):
+    """Kembalikan koneksi ke pool."""
+    if _pool and conn:
+        _pool.putconn(conn)
 
 def init_db():
     conn = get_conn()
-    c = conn.cursor()
+    try:
+        c = conn.cursor()
 
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS products (
-            paket_id TEXT PRIMARY KEY,
-            nama TEXT NOT NULL,
-            emoji TEXT DEFAULT '📦',
-            deskripsi TEXT DEFAULT '',
-            harga INTEGER NOT NULL,
-            link TEXT DEFAULT 'https://t.me/Kikukkvd'
-        )
-    """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS products (
+                paket_id TEXT PRIMARY KEY,
+                nama TEXT NOT NULL,
+                emoji TEXT DEFAULT '📦',
+                deskripsi TEXT DEFAULT '',
+                harga INTEGER NOT NULL,
+                link TEXT DEFAULT 'https://t.me/Kikukkvd'
+            )
+        """)
 
-    # Migration: tambah kolom link jika belum ada
-    c.execute("""
-        ALTER TABLE products ADD COLUMN IF NOT EXISTS link TEXT DEFAULT 'https://t.me/Kikukkvd'
-    """)
+        c.execute("""
+            ALTER TABLE products ADD COLUMN IF NOT EXISTS link TEXT DEFAULT 'https://t.me/Kikukkvd'
+        """)
+        c.execute("""
+            ALTER TABLE products ADD COLUMN IF NOT EXISTS group_chat_id TEXT DEFAULT NULL
+        """)
 
-    # Migration: tambah kolom group_chat_id jika belum ada
-    c.execute("""
-        ALTER TABLE products ADD COLUMN IF NOT EXISTS group_chat_id TEXT DEFAULT NULL
-    """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS banned_users (
+                user_id BIGINT PRIMARY KEY,
+                reason TEXT DEFAULT '',
+                banned_at TEXT NOT NULL
+            )
+        """)
 
-    # Tabel banned users
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS banned_users (
-            user_id BIGINT PRIMARY KEY,
-            reason TEXT DEFAULT '',
-            banned_at TEXT NOT NULL
-        )
-    """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS orders (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT,
+                user_name TEXT,
+                paket_id TEXT,
+                order_id TEXT UNIQUE,
+                status TEXT DEFAULT 'waiting',
+                waktu TEXT
+            )
+        """)
 
-    # Migration: tambah kolom admin_msg_id dan sent_link di orders
-    c.execute("""
-        ALTER TABLE orders ADD COLUMN IF NOT EXISTS admin_msg_id BIGINT DEFAULT NULL
-    """)
-    c.execute("""
-        ALTER TABLE orders ADD COLUMN IF NOT EXISTS sent_link TEXT DEFAULT NULL
-    """)
+        c.execute("""
+            ALTER TABLE orders ADD COLUMN IF NOT EXISTS admin_msg_id BIGINT DEFAULT NULL
+        """)
+        c.execute("""
+            ALTER TABLE orders ADD COLUMN IF NOT EXISTS sent_link TEXT DEFAULT NULL
+        """)
+        # FIX: kolom harga_dibayar untuk revenue akurat
+        c.execute("""
+            ALTER TABLE orders ADD COLUMN IF NOT EXISTS harga_dibayar INTEGER DEFAULT 0
+        """)
 
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS orders (
-            id SERIAL PRIMARY KEY,
-            user_id BIGINT,
-            user_name TEXT,
-            paket_id TEXT,
-            order_id TEXT UNIQUE,
-            status TEXT DEFAULT 'waiting',
-            waktu TEXT
-        )
-    """)
+        # Tabel settings untuk konfigurasi bot (channel_id, dll)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
 
-    # Seed produk awal kalau belum ada
-    c.execute("SELECT COUNT(*) as cnt FROM products")
-    row = c.fetchone()
-    if row["cnt"] == 0:
-        c.executemany(
-            """INSERT INTO products (paket_id, nama, emoji, deskripsi, harga, link)
-               VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING""",
-            [
-                ("gb_biasa", "GB Biasa", "🔥", "160+ Video Premium", 5000, DEFAULT_LINK),
-                ("gb_vip",   "GB VIP",   "👑", "6.800+ Video Premium", 25000, DEFAULT_LINK),
-            ]
-        )
+        # Tabel cooldowns berbasis DB agar tidak hilang saat restart
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS cooldowns (
+                user_id BIGINT PRIMARY KEY,
+                expires_at TEXT NOT NULL
+            )
+        """)
 
-    conn.commit()
-    conn.close()
+        # Seed produk awal
+        c.execute("SELECT COUNT(*) as cnt FROM products")
+        row = c.fetchone()
+        if row["cnt"] == 0:
+            c.executemany(
+                """INSERT INTO products (paket_id, nama, emoji, deskripsi, harga, link)
+                   VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING""",
+                [
+                    ("gb_biasa", "GB Biasa", "🔥", "160+ Video Premium", 5000, DEFAULT_LINK),
+                    ("gb_vip",   "GB VIP",   "👑", "6.800+ Video Premium", 25000, DEFAULT_LINK),
+                ]
+            )
+
+        conn.commit()
+    finally:
+        release_conn(conn)
 
 # =================== PRODUCT DB FUNCTIONS ===================
 
 def get_all_products():
     conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT * FROM products ORDER BY harga ASC")
-    rows = [dict(r) for r in c.fetchall()]
-    conn.close()
-    return rows
+    try:
+        c = conn.cursor()
+        c.execute("SELECT * FROM products ORDER BY harga ASC")
+        return [dict(r) for r in c.fetchall()]
+    finally:
+        release_conn(conn)
 
 def get_product(paket_id):
     conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT * FROM products WHERE paket_id=%s", (paket_id,))
-    row = c.fetchone()
-    conn.close()
-    return dict(row) if row else None
+    try:
+        c = conn.cursor()
+        c.execute("SELECT * FROM products WHERE paket_id=%s", (paket_id,))
+        row = c.fetchone()
+        return dict(row) if row else None
+    finally:
+        release_conn(conn)
 
 def add_product(paket_id, nama, emoji, deskripsi, harga, link=None, group_chat_id=None):
     conn = get_conn()
-    c = conn.cursor()
-    c.execute(
-        """INSERT INTO products (paket_id, nama, emoji, deskripsi, harga, link, group_chat_id)
-           VALUES (%s, %s, %s, %s, %s, %s, %s)
-           ON CONFLICT (paket_id) DO UPDATE SET
-               nama=EXCLUDED.nama, emoji=EXCLUDED.emoji,
-               deskripsi=EXCLUDED.deskripsi, harga=EXCLUDED.harga, 
-               link=EXCLUDED.link, group_chat_id=EXCLUDED.group_chat_id""",
-        (paket_id, nama, emoji, deskripsi, harga, link or DEFAULT_LINK, group_chat_id)
-    )
-    conn.commit()
-    conn.close()
+    try:
+        c = conn.cursor()
+        c.execute(
+            """INSERT INTO products (paket_id, nama, emoji, deskripsi, harga, link, group_chat_id)
+               VALUES (%s, %s, %s, %s, %s, %s, %s)
+               ON CONFLICT (paket_id) DO UPDATE SET
+                   nama=EXCLUDED.nama, emoji=EXCLUDED.emoji,
+                   deskripsi=EXCLUDED.deskripsi, harga=EXCLUDED.harga,
+                   link=EXCLUDED.link, group_chat_id=EXCLUDED.group_chat_id""",
+            (paket_id, nama, emoji, deskripsi, harga, link or DEFAULT_LINK, group_chat_id)
+        )
+        conn.commit()
+    finally:
+        release_conn(conn)
 
 def update_product_field(paket_id, field, value):
     allowed = {"nama", "emoji", "deskripsi", "harga", "link", "group_chat_id"}
     if field not in allowed:
         return
     conn = get_conn()
-    c = conn.cursor()
-    c.execute(f"UPDATE products SET {field}=%s WHERE paket_id=%s", (value, paket_id))
-    conn.commit()
-    conn.close()
+    try:
+        c = conn.cursor()
+        c.execute(f"UPDATE products SET {field}=%s WHERE paket_id=%s", (value, paket_id))
+        conn.commit()
+    finally:
+        release_conn(conn)
 
 def delete_product(paket_id):
     conn = get_conn()
-    c = conn.cursor()
-    c.execute("DELETE FROM products WHERE paket_id=%s", (paket_id,))
-    conn.commit()
-    conn.close()
+    try:
+        c = conn.cursor()
+        c.execute("DELETE FROM products WHERE paket_id=%s", (paket_id,))
+        conn.commit()
+    finally:
+        release_conn(conn)
 
 def make_paket_id(nama):
     pid = re.sub(r'[^a-z0-9]+', '_', nama.lower().strip()).strip('_')
@@ -265,124 +304,110 @@ def make_paket_id(nama):
 
 def get_active_order(user_id):
     conn = get_conn()
-    c = conn.cursor()
-    c.execute(
-        "SELECT * FROM orders WHERE user_id=%s AND status IN ('waiting','pending') ORDER BY id DESC LIMIT 1",
-        (user_id,)
-    )
-    row = c.fetchone()
-    conn.close()
-    return dict(row) if row else None
+    try:
+        c = conn.cursor()
+        c.execute(
+            "SELECT * FROM orders WHERE user_id=%s AND status IN ('waiting','pending') ORDER BY id DESC LIMIT 1",
+            (user_id,)
+        )
+        row = c.fetchone()
+        return dict(row) if row else None
+    finally:
+        release_conn(conn)
 
 def get_all_pending():
     conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT * FROM orders WHERE status='pending' ORDER BY id ASC")
-    rows = [dict(r) for r in c.fetchall()]
-    conn.close()
-    return rows
+    try:
+        c = conn.cursor()
+        c.execute("SELECT * FROM orders WHERE status='pending' ORDER BY id ASC")
+        return [dict(r) for r in c.fetchall()]
+    finally:
+        release_conn(conn)
 
 def get_all_waiting():
-    """Ambil semua order yang masih menunggu pembayaran (status='waiting')."""
     conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT * FROM orders WHERE status='waiting' ORDER BY id ASC")
-    rows = [dict(r) for r in c.fetchall()]
-    conn.close()
-    return rows
+    try:
+        c = conn.cursor()
+        c.execute("SELECT * FROM orders WHERE status='waiting' ORDER BY id ASC")
+        return [dict(r) for r in c.fetchall()]
+    finally:
+        release_conn(conn)
 
 def get_buyer_history(user_id, limit=10):
-    """Ambil riwayat order buyer (10 terakhir)."""
     conn = get_conn()
-    c = conn.cursor()
-    c.execute(
-        "SELECT * FROM orders WHERE user_id=%s ORDER BY id DESC LIMIT %s",
-        (user_id, limit)
-    )
-    rows = [dict(r) for r in c.fetchall()]
-    conn.close()
-    return rows
+    try:
+        c = conn.cursor()
+        c.execute(
+            "SELECT * FROM orders WHERE user_id=%s ORDER BY id DESC LIMIT %s",
+            (user_id, limit)
+        )
+        return [dict(r) for r in c.fetchall()]
+    finally:
+        release_conn(conn)
 
 def get_all_buyers():
-    """Ambil semua user_id buyer yang pernah order (untuk broadcast)."""
     conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT DISTINCT user_id, user_name FROM orders ORDER BY id DESC")
-    rows = [dict(r) for r in c.fetchall()]
-    conn.close()
-    return rows
+    try:
+        c = conn.cursor()
+        c.execute("SELECT DISTINCT user_id, user_name FROM orders ORDER BY id DESC")
+        return [dict(r) for r in c.fetchall()]
+    finally:
+        release_conn(conn)
 
 def get_order_stats():
-    """Ambil statistik penjualan dari DB."""
+    """Statistik penjualan. Revenue dihitung dari harga_dibayar (akurat)."""
     conn = get_conn()
-    c = conn.cursor()
+    try:
+        c = conn.cursor()
 
-    today = now_wib().strftime("%d/%m/%Y")
-    this_month = now_wib().strftime("%m/%Y")
+        today = now_wib().strftime("%d/%m/%Y")
+        this_month = now_wib().strftime("%m/%Y")
 
-    c.execute("SELECT COUNT(*) as cnt FROM orders WHERE status='completed'")
-    total_orders = c.fetchone()['cnt']
+        c.execute("SELECT COUNT(*) as cnt FROM orders WHERE status='completed'")
+        total_orders = c.fetchone()['cnt']
 
-    c.execute("SELECT COUNT(*) as cnt FROM orders WHERE status='completed' AND waktu LIKE %s", (f"% — {today}",))
-    today_orders = c.fetchone()['cnt']
+        c.execute("SELECT COUNT(*) as cnt FROM orders WHERE status='completed' AND waktu LIKE %s", (f"% — {today}",))
+        today_orders = c.fetchone()['cnt']
 
-    c.execute("SELECT COUNT(*) as cnt FROM orders WHERE status='completed' AND waktu LIKE %s", (f"%/{this_month}",))
-    month_orders = c.fetchone()['cnt']
+        c.execute("SELECT COUNT(*) as cnt FROM orders WHERE status='completed' AND waktu LIKE %s", (f"%/{this_month}",))
+        month_orders = c.fetchone()['cnt']
 
-    c.execute("SELECT COUNT(*) as cnt FROM orders WHERE status IN ('waiting','pending')")
-    active_count = c.fetchone()['cnt']
+        c.execute("SELECT COUNT(*) as cnt FROM orders WHERE status IN ('waiting','pending')")
+        active_count = c.fetchone()['cnt']
 
-    c.execute("SELECT COUNT(*) as cnt FROM orders WHERE status='cancelled'")
-    cancelled_count = c.fetchone()['cnt']
+        c.execute("SELECT COUNT(*) as cnt FROM orders WHERE status='cancelled'")
+        cancelled_count = c.fetchone()['cnt']
 
-    # Produk terlaris
-    c.execute("""
-        SELECT paket_id, COUNT(*) as cnt FROM orders
-        WHERE status='completed'
-        GROUP BY paket_id ORDER BY cnt DESC LIMIT 1
-    """)
-    best_row = c.fetchone()
-    best_product = None
-    if best_row:
-        p = get_product(best_row['paket_id'])
-        best_product = f"{p['emoji']} {p['nama']} ({best_row['cnt']}x)" if p else best_row['paket_id']
+        # Produk terlaris
+        c.execute("""
+            SELECT paket_id, COUNT(*) as cnt FROM orders
+            WHERE status='completed'
+            GROUP BY paket_id ORDER BY cnt DESC LIMIT 1
+        """)
+        best_row = c.fetchone()
+        best_product = None
+        if best_row:
+            p = get_product(best_row['paket_id'])
+            best_product = f"{p['emoji']} {p['nama']} ({best_row['cnt']}x)" if p else best_row['paket_id']
 
-    # Estimasi revenue: join dengan harga produk saat ini
-    c.execute("""
-        SELECT o.paket_id, COUNT(*) as cnt FROM orders o
-        WHERE o.status='completed' GROUP BY o.paket_id
-    """)
-    revenue_rows = c.fetchall()
-    total_revenue = 0
-    today_revenue = 0
-    month_revenue = 0
+        # FIX: Revenue dari harga_dibayar — tidak terpengaruh perubahan harga produk
+        c.execute("SELECT COALESCE(SUM(harga_dibayar), 0) as total FROM orders WHERE status='completed'")
+        total_revenue = c.fetchone()['total']
 
-    for row in revenue_rows:
-        p = get_product(row['paket_id'])
-        if p:
-            total_revenue += p['harga'] * row['cnt']
+        c.execute(
+            "SELECT COALESCE(SUM(harga_dibayar), 0) as total FROM orders WHERE status='completed' AND waktu LIKE %s",
+            (f"% — {today}",)
+        )
+        today_revenue = c.fetchone()['total']
 
-    c.execute("""
-        SELECT paket_id, COUNT(*) as cnt FROM orders
-        WHERE status='completed' AND waktu LIKE %s
-        GROUP BY paket_id
-    """, (f"% — {today}",))
-    for row in c.fetchall():
-        p = get_product(row['paket_id'])
-        if p:
-            today_revenue += p['harga'] * row['cnt']
+        c.execute(
+            "SELECT COALESCE(SUM(harga_dibayar), 0) as total FROM orders WHERE status='completed' AND waktu LIKE %s",
+            (f"%/{this_month}",)
+        )
+        month_revenue = c.fetchone()['total']
 
-    c.execute("""
-        SELECT paket_id, COUNT(*) as cnt FROM orders
-        WHERE status='completed' AND waktu LIKE %s
-        GROUP BY paket_id
-    """, (f"%/{this_month}",))
-    for row in c.fetchall():
-        p = get_product(row['paket_id'])
-        if p:
-            month_revenue += p['harga'] * row['cnt']
-
-    conn.close()
+    finally:
+        release_conn(conn)
 
     return {
         'total_orders': total_orders,
@@ -398,84 +423,172 @@ def get_order_stats():
 
 def update_order_status(order_id, status):
     conn = get_conn()
-    c = conn.cursor()
-    c.execute("UPDATE orders SET status=%s WHERE order_id=%s", (status, order_id))
-    conn.commit()
-    conn.close()
+    try:
+        c = conn.cursor()
+        c.execute("UPDATE orders SET status=%s WHERE order_id=%s", (status, order_id))
+        conn.commit()
+    finally:
+        release_conn(conn)
 
 def get_order_by_id(order_id):
-    """Ambil detail order berdasarkan order_id."""
     conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT * FROM orders WHERE order_id=%s", (order_id,))
-    row = c.fetchone()
-    conn.close()
-    return dict(row) if row else None
+    try:
+        c = conn.cursor()
+        c.execute("SELECT * FROM orders WHERE order_id=%s", (order_id,))
+        row = c.fetchone()
+        return dict(row) if row else None
+    finally:
+        release_conn(conn)
 
 def set_admin_msg_id(order_id, msg_id):
-    """Simpan message_id pesan admin untuk order ini."""
     conn = get_conn()
-    c = conn.cursor()
-    c.execute("UPDATE orders SET admin_msg_id=%s WHERE order_id=%s", (msg_id, order_id))
-    conn.commit()
-    conn.close()
+    try:
+        c = conn.cursor()
+        c.execute("UPDATE orders SET admin_msg_id=%s WHERE order_id=%s", (msg_id, order_id))
+        conn.commit()
+    finally:
+        release_conn(conn)
 
 def set_sent_link(order_id, link):
-    """Simpan link yang dikirim ke buyer untuk order ini."""
     conn = get_conn()
-    c = conn.cursor()
-    c.execute("UPDATE orders SET sent_link=%s WHERE order_id=%s", (link, order_id))
-    conn.commit()
-    conn.close()
+    try:
+        c = conn.cursor()
+        c.execute("UPDATE orders SET sent_link=%s WHERE order_id=%s", (link, order_id))
+        conn.commit()
+    finally:
+        release_conn(conn)
 
-def save_order(user_id, user_name, paket_id, order_id):
+def save_order(user_id, user_name, paket_id, order_id, harga_dibayar=0):
+    """Simpan order baru. harga_dibayar wajib diisi untuk revenue akurat."""
     conn = get_conn()
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO orders (user_id, user_name, paket_id, order_id, status, waktu) VALUES (%s, %s, %s, %s, 'waiting', %s)",
-        (user_id, user_name, paket_id, order_id, now_wib().strftime("%H:%M — %d/%m/%Y"))
-    )
-    conn.commit()
-    conn.close()
+    try:
+        c = conn.cursor()
+        c.execute(
+            """INSERT INTO orders (user_id, user_name, paket_id, order_id, status, waktu, harga_dibayar)
+               VALUES (%s, %s, %s, %s, 'waiting', %s, %s)""",
+            (user_id, user_name, paket_id, order_id,
+             now_wib().strftime("%H:%M — %d/%m/%Y"), harga_dibayar)
+        )
+        conn.commit()
+    finally:
+        release_conn(conn)
 
 # =================== BAN DB FUNCTIONS ===================
 
 def is_banned(user_id):
-    """Cek apakah user dibanned."""
     conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT 1 FROM banned_users WHERE user_id=%s", (user_id,))
-    row = c.fetchone()
-    conn.close()
-    return row is not None
+    try:
+        c = conn.cursor()
+        c.execute("SELECT 1 FROM banned_users WHERE user_id=%s", (user_id,))
+        return c.fetchone() is not None
+    finally:
+        release_conn(conn)
 
 def ban_user(user_id, reason=""):
-    """Ban user."""
     conn = get_conn()
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO banned_users (user_id, reason, banned_at) VALUES (%s, %s, %s) ON CONFLICT (user_id) DO UPDATE SET reason=EXCLUDED.reason, banned_at=EXCLUDED.banned_at",
-        (user_id, reason, now_wib().strftime("%H:%M — %d/%m/%Y"))
-    )
-    conn.commit()
-    conn.close()
+    try:
+        c = conn.cursor()
+        c.execute(
+            """INSERT INTO banned_users (user_id, reason, banned_at)
+               VALUES (%s, %s, %s)
+               ON CONFLICT (user_id) DO UPDATE SET reason=EXCLUDED.reason, banned_at=EXCLUDED.banned_at""",
+            (user_id, reason, now_wib().strftime("%H:%M — %d/%m/%Y"))
+        )
+        conn.commit()
+    finally:
+        release_conn(conn)
 
 def unban_user(user_id):
-    """Unban user."""
     conn = get_conn()
-    c = conn.cursor()
-    c.execute("DELETE FROM banned_users WHERE user_id=%s", (user_id,))
-    conn.commit()
-    conn.close()
+    try:
+        c = conn.cursor()
+        c.execute("DELETE FROM banned_users WHERE user_id=%s", (user_id,))
+        conn.commit()
+    finally:
+        release_conn(conn)
 
 def get_all_banned():
-    """Ambil semua user yang dibanned."""
     conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT * FROM banned_users ORDER BY banned_at DESC")
-    rows = [dict(r) for r in c.fetchall()]
-    conn.close()
-    return rows
+    try:
+        c = conn.cursor()
+        c.execute("SELECT * FROM banned_users ORDER BY banned_at DESC")
+        return [dict(r) for r in c.fetchall()]
+    finally:
+        release_conn(conn)
+
+# =================== SETTINGS DB FUNCTIONS ===================
+
+def get_setting(key, default=None):
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("SELECT value FROM settings WHERE key=%s", (key,))
+        row = c.fetchone()
+        return row['value'] if row else default
+    finally:
+        release_conn(conn)
+
+def set_setting(key, value):
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        if value is None:
+            c.execute("DELETE FROM settings WHERE key=%s", (key,))
+        else:
+            c.execute(
+                """INSERT INTO settings (key, value) VALUES (%s, %s)
+                   ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value""",
+                (key, str(value))
+            )
+        conn.commit()
+    finally:
+        release_conn(conn)
+
+# =================== COOLDOWN DB (tidak hilang saat restart) ===================
+COOLDOWN_MENIT = 5
+
+def set_cooldown_db(user_id):
+    """Set cooldown ke DB — persisten meski bot restart."""
+    expires_at = (now_wib() + timedelta(minutes=COOLDOWN_MENIT)).strftime('%Y-%m-%d %H:%M:%S')
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute(
+            """INSERT INTO cooldowns (user_id, expires_at) VALUES (%s, %s)
+               ON CONFLICT (user_id) DO UPDATE SET expires_at=EXCLUDED.expires_at""",
+            (user_id, expires_at)
+        )
+        conn.commit()
+    finally:
+        release_conn(conn)
+
+def get_cooldown_sisa_db(user_id):
+    """Kembalikan sisa menit cooldown dari DB, atau 0 jika tidak ada."""
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("SELECT expires_at FROM cooldowns WHERE user_id=%s", (user_id,))
+        row = c.fetchone()
+        if not row:
+            return 0
+        try:
+            until = datetime.strptime(row['expires_at'], '%Y-%m-%d %H:%M:%S')
+            sisa = (until - now_wib()).total_seconds()
+            return max(0, int(sisa / 60) + 1) if sisa > 0 else 0
+        except Exception:
+            return 0
+    finally:
+        release_conn(conn)
+
+def clear_cooldown_db(user_id):
+    """Hapus cooldown dari DB."""
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("DELETE FROM cooldowns WHERE user_id=%s", (user_id,))
+        conn.commit()
+    finally:
+        release_conn(conn)
 
 # =================== HELPERS ===================
 
@@ -483,7 +596,6 @@ def format_harga(harga):
     return f"Rp {int(harga):,}".replace(",", ".")
 
 def hitung_durasi(waktu_str):
-    """Hitung berapa lama sejak order dibuat."""
     try:
         order_time = datetime.strptime(waktu_str, "%H:%M — %d/%m/%Y")
         delta = now_wib() - order_time
@@ -496,11 +608,19 @@ def hitung_durasi(waktu_str):
     except Exception:
         return waktu_str
 
-# ⭐ FUNGSI BARU: Generate link grup private one-time
+def _sql_str(v):
+    """Helper untuk generate SQL string literal. Aman dari quote injection."""
+    if v is None:
+        return "NULL"
+    return "'" + str(v).replace("'", "''") + "'"
+
+# =================== GENERATE GROUP LINK (AUTO-APPROVE MODE) ===================
+
 async def generate_group_link(bot, paket, order_id):
     """
-    Bikin link grup private khusus 1 orang untuk produk ini.
-    Link aktif 3 hari. Return None kalau produk gak punya group_chat_id.
+    Buat invite link dengan mode creates_join_request=True.
+    Saat buyer klik link dan kirim join request, bot langsung auto-approve
+    via handle_join_request handler.
     """
     group_id = paket.get('group_chat_id')
     if not group_id:
@@ -511,8 +631,7 @@ async def generate_group_link(bot, paket, order_id):
         link = await bot.create_chat_invite_link(
             chat_id=chat_id,
             name=nama_link,
-            member_limit=1,
-            expire_date=int((datetime.now(timezone.utc) + timedelta(days=3)).timestamp())
+            creates_join_request=True,
         )
         return link.invite_link
     except asyncio.CancelledError:
@@ -521,11 +640,31 @@ async def generate_group_link(bot, paket, order_id):
         print(f"[LINK] Gagal bikin link grup {group_id}: {e}")
         return None
 
-# ⭐ FUNGSI BARU: Dapatkan link produk (dinamis atau statis)
 async def get_product_link(bot, paket, order_id):
-    """Dapatkan link produk: grup private (dinamis) atau link statis dari DB."""
+    """Dapatkan link produk: grup (join request) atau link statis dari DB."""
     group_link = await generate_group_link(bot, paket, order_id)
     return group_link or (paket.get("link") or DEFAULT_LINK)
+
+# =================== CHANNEL NOTIFIKASI ===================
+
+async def kirim_notif_channel(bot, text: str):
+    """
+    Kirim notifikasi status order ke channel yang dikonfigurasi admin.
+    Diam saja kalau channel_id belum diset.
+    """
+    channel_id = get_setting('notif_channel_id')
+    if not channel_id:
+        return
+    try:
+        await bot.send_message(
+            chat_id=int(channel_id),
+            text=text,
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        print(f"[CHANNEL] Gagal kirim notif ke {channel_id}: {e}")
+
+# =================== MAIN MENU ===================
 
 def build_main_menu_text():
     products = get_all_products()
@@ -560,23 +699,6 @@ def simpan_admin_msg(context, user_id, message_id):
     context.bot_data['admin_messages'].setdefault(user_id, [])
     context.bot_data['admin_messages'][user_id].append(message_id)
 
-# =================== COOLDOWN (anti-spam order) ===================
-COOLDOWN_MENIT = 5
-
-def set_cooldown(context, user_id):
-    """Set cooldown setelah user membatalkan order."""
-    context.bot_data.setdefault('cooldowns', {})
-    context.bot_data['cooldowns'][user_id] = now_wib() + timedelta(minutes=COOLDOWN_MENIT)
-
-def get_cooldown_sisa(context, user_id):
-    """Kembalikan sisa menit cooldown, atau 0 jika tidak ada cooldown."""
-    cooldowns = context.bot_data.get('cooldowns', {})
-    until = cooldowns.get(user_id)
-    if not until:
-        return 0
-    sisa = (until - now_wib()).total_seconds()
-    return max(0, int(sisa / 60) + 1) if sisa > 0 else 0
-
 async def hapus_admin_msg(context, user_id):
     msg_ids = context.bot_data.get('admin_messages', {}).pop(user_id, [])
     for msg_id in msg_ids:
@@ -586,7 +708,6 @@ async def hapus_admin_msg(context, user_id):
             pass
 
 async def hapus_pesan_admin_order(bot, order_id):
-    """Hapus pesan notif admin untuk order tertentu (pakai admin_msg_id dari DB)."""
     order = get_order_by_id(order_id)
     if not order:
         return
@@ -615,18 +736,19 @@ async def hapus_msg_user_lama(context, user_id, keep_last=1):
                 pass
 
 async def kirim_link_ke_buyer(context, user_id, paket, order_id, amount):
-    """Kirim link produk ke buyer setelah bayar. Bisa link grup private (dinamis) atau link biasa."""
+    """Kirim link produk ke buyer setelah bayar."""
     group_link = await generate_group_link(context.bot, paket, order_id)
     link = group_link or (paket.get("link") or DEFAULT_LINK)
 
     if group_link:
         link_text = (
-            f"🔗 <b>Link Grup Private (Cuma Kamu)</b>\n"
+            f"🔗 <b>Link Bergabung (Khusus Kamu)</b>\n"
             f"{link}\n\n"
-            f"⏰ <b>Aktif sampai 3 hari ke depan</b>\n"
-            f"👤 <b>Cuma 1 orang bisa pakai link ini</b>\n\n"
-            f"💾 <i>Klik link di atas, lalu pencet 'Join Group'.</i>\n"
-            f"⚠️ <i>Jangan dishare ke orang lain, nanti gak bisa dipakai!</i>"
+            f"📋 <b>Cara gabung:</b>\n"
+            f"1. Klik link di atas\n"
+            f"2. Pencet <b>\"Minta Bergabung\"</b>\n"
+            f"3. Bot langsung <b>approve otomatis</b> ✅\n\n"
+            f"⚠️ <i>Jangan dishare ke orang lain!</i>"
         )
     else:
         link_text = (
@@ -682,7 +804,6 @@ async def post_init(application: Application):
         scope=BotCommandScopeChat(chat_id=ADMIN_ID)
     )
 
-    # ===== Re-start asyncio tasks untuk order 'waiting' setelah bot restart =====
     waiting_orders = get_all_waiting()
     if waiting_orders:
         print(f"[POST_INIT] Ditemukan {len(waiting_orders)} order aktif, membuat ulang payment tasks...")
@@ -701,11 +822,9 @@ async def post_init(application: Application):
             )
             print(f"[POST_INIT] Task dimulai ulang untuk order {order['order_id']}")
 
-    # ===== Auto backup harian jam 00:00 (asyncio task) =====
     asyncio.create_task(_auto_backup_loop())
     print("[POST_INIT] Auto backup harian dijadwalkan via asyncio task")
 
-    # ===== Buyer reminder harian jam 10:00 WIB =====
     asyncio.create_task(_buyer_reminder_loop(_current_bot))
     print("[POST_INIT] Buyer reminder harian dijadwalkan (jam 10:00 WIB)")
 
@@ -739,7 +858,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             paid_amount = trans.get("amount", paket["harga"])
             link = await kirim_link_ke_buyer(context, user_id, paket, active["order_id"], paid_amount)
 
-            # Simpan link + hapus notif lama + kirim notif berhasil
             set_sent_link(active['order_id'], link)
             await hapus_pesan_admin_order(context.bot, active['order_id'])
             try:
@@ -854,8 +972,8 @@ async def pilih_paket(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(caption, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
-    # ===== CEK COOLDOWN anti-spam =====
-    sisa = get_cooldown_sisa(context, user_id)
+    # FIX: Cooldown dari DB (persisten)
+    sisa = get_cooldown_sisa_db(user_id)
     if sisa > 0:
         await query.answer(
             f"⏳ Kamu baru saja membatalkan order. Coba lagi dalam {sisa} menit.",
@@ -901,15 +1019,17 @@ async def pilih_paket(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await hapus_msg_user_lama(context, user_id, keep_last=2)
         return
 
-    save_order(user_id, user_name, paket_id, order_id)
+    amount = trans_data.get('amount', paket["harga"])
+    fee = trans_data.get('fee', 0)
+    total_payment = amount + fee
+
+    # FIX: Simpan harga_dibayar saat order dibuat
+    save_order(user_id, user_name, paket_id, order_id, harga_dibayar=total_payment)
 
     context.user_data['paket_id'] = paket_id
     context.user_data['order_id'] = order_id
     context.user_data['amount'] = paket["harga"]
 
-    amount = trans_data.get('amount', paket["harga"])
-    fee = trans_data.get('fee', 0)
-    total_payment = amount + fee
     expired_at = trans_data.get('expired_at', '')
 
     try:
@@ -953,7 +1073,7 @@ async def pilih_paket(update: Update, context: ContextTypes.DEFAULT_TYPE):
     simpan_msg_user(context, user_id, msg.message_id)
     await hapus_msg_user_lama(context, user_id, keep_last=1)
 
-    # ===== NOTIFIKASI ADMIN: order baru masuk =====
+    # Notifikasi admin
     try:
         notif_msg = await context.bot.send_message(
             chat_id=ADMIN_ID,
@@ -974,13 +1094,24 @@ async def pilih_paket(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         print(f"Gagal notif admin order baru: {e}")
 
-    # Hitung sisa waktu sebelum expired untuk timeout task
+    # Notifikasi channel
+    await kirim_notif_channel(
+        context.bot,
+        f"🔔 <b>ORDER BARU</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 {html_module.escape(user_name)} (<code>{user_id}</code>)\n"
+        f"📦 {paket['emoji']} {html_module.escape(paket['nama'])}\n"
+        f"💰 {format_harga(total_payment)}\n"
+        f"📝 <code>{order_id}</code>\n"
+        f"🕐 {now_wib().strftime('%H:%M, %d/%m/%Y')}"
+    )
+
     try:
         expired_dt = datetime.fromisoformat(expired_at.replace('Z', '+00:00'))
         now_tz = datetime.now(expired_dt.tzinfo)
         timeout_secs = max(60, int((expired_dt - now_tz).total_seconds()))
     except Exception:
-        timeout_secs = 1800  # default 30 menit
+        timeout_secs = 1800
 
     _start_payment_task(
         context.bot, order_id, paket_id, user_id, user_name,
@@ -1000,11 +1131,23 @@ async def back_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cancel_transaction(active["order_id"], amount)
         update_order_status(active["order_id"], "cancelled")
         _stop_payment_task(user_id)
-        # ===== Set cooldown anti-spam setelah cancel =====
-        set_cooldown(context, user_id)
-        # ===== Hapus notif lama + kirim notif singkat cancel =====
+
+        # FIX: Cooldown ke DB
+        set_cooldown_db(user_id)
+
         cancelled_order_id = active["order_id"]
         await hapus_pesan_admin_order(context.bot, cancelled_order_id)
+
+        # Notifikasi channel
+        await kirim_notif_channel(
+            context.bot,
+            f"❌ <b>DIBATALKAN BUYER</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 {html_module.escape(query.from_user.full_name)} (<code>{user_id}</code>)\n"
+            f"📝 <code>{cancelled_order_id}</code>\n"
+            f"🕐 {now_wib().strftime('%H:%M, %d/%m/%Y')}"
+        )
+
         try:
             await context.bot.send_message(
                 chat_id=ADMIN_ID,
@@ -1042,14 +1185,12 @@ _payment_tasks: dict = {}
 _current_bot = None
 
 def _stop_payment_task(user_id: int):
-    """Batalkan task polling pembayaran untuk user ini."""
     task = _payment_tasks.pop(user_id, None)
     if task and not task.done():
         task.cancel()
 
 def _start_payment_task(bot, order_id: str, paket_id: str, user_id: int,
                          user_name: str, amount: int, timeout_seconds: int = 1800):
-    """Mulai background asyncio task untuk cek pembayaran setiap 30 detik."""
     _stop_payment_task(user_id)
     task = asyncio.create_task(
         _payment_poll_loop(bot, order_id, paket_id, user_id, user_name, amount, timeout_seconds)
@@ -1058,10 +1199,6 @@ def _start_payment_task(bot, order_id: str, paket_id: str, user_id: int,
 
 async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
                               user_name: str, amount: int, timeout_seconds: int):
-    """
-    Cek status pembayaran ke Pakasir tiap 30 detik.
-    Auto-cancel order setelah timeout_seconds.
-    """
     elapsed = 0
     try:
         while elapsed < timeout_seconds:
@@ -1069,10 +1206,12 @@ async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
             elapsed += 30
 
             conn = get_conn()
-            c = conn.cursor()
-            c.execute("SELECT status FROM orders WHERE order_id=%s", (order_id,))
-            row = c.fetchone()
-            conn.close()
+            try:
+                c = conn.cursor()
+                c.execute("SELECT status FROM orders WHERE order_id=%s", (order_id,))
+                row = c.fetchone()
+            finally:
+                release_conn(conn)
 
             if not row or row['status'] != 'waiting':
                 return
@@ -1085,12 +1224,14 @@ async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
                 await _handle_payment_success(bot, order_id, paket_id, user_id, user_name, amount, trans)
                 return
 
-        # ===== TIMEOUT: auto cancel =====
+        # TIMEOUT: cek sekali lagi sebelum expire
         conn = get_conn()
-        c = conn.cursor()
-        c.execute("SELECT status FROM orders WHERE order_id=%s", (order_id,))
-        row = c.fetchone()
-        conn.close()
+        try:
+            c = conn.cursor()
+            c.execute("SELECT status FROM orders WHERE order_id=%s", (order_id,))
+            row = c.fetchone()
+        finally:
+            release_conn(conn)
 
         if not row or row['status'] != 'waiting':
             return
@@ -1119,8 +1260,18 @@ async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
         except Exception:
             pass
 
-        # Hapus notif lama + kirim notif expired singkat ke admin
         await hapus_pesan_admin_order(bot, order_id)
+
+        # Notifikasi channel
+        await kirim_notif_channel(
+            bot,
+            f"⏰ <b>ORDER EXPIRED</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 {html_module.escape(user_name)} (<code>{user_id}</code>)\n"
+            f"📝 <code>{order_id}</code>\n"
+            f"🕐 {now_wib().strftime('%H:%M, %d/%m/%Y')}"
+        )
+
         try:
             await bot.send_message(
                 chat_id=ADMIN_ID,
@@ -1144,22 +1295,22 @@ async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
 
 async def _handle_payment_success(bot, order_id: str, paket_id: str, user_id: int,
                                    user_name: str, amount: int, trans: dict):
-    """Proses pembayaran sukses: kirim link ke buyer + notif admin."""
     paket = get_product(paket_id) or {"emoji": "📦", "nama": "Produk", "harga": amount, "link": DEFAULT_LINK}
     update_order_status(order_id, 'completed')
 
     paid_amount = trans.get('amount', amount)
 
-    # ⭐ Generate link dinamis (grup private) atau pakai link statis
     group_link = await generate_group_link(bot, paket, order_id)
     link = group_link or (paket.get("link") or DEFAULT_LINK)
 
     if group_link:
         link_section = (
-            f"🔗 <b>Link Grup Private (Cuma Kamu)</b>\n"
+            f"🔗 <b>Link Bergabung (Khusus Kamu)</b>\n"
             f"{link}\n\n"
-            f"⏰ Aktif 3 hari | 👤 Cuma 1 orang\n\n"
-            f"💾 <i>Klik link di atas → pencet 'Join Group'.</i>\n"
+            f"📋 <b>Cara gabung:</b>\n"
+            f"1. Klik link di atas\n"
+            f"2. Pencet <b>\"Minta Bergabung\"</b>\n"
+            f"3. Bot langsung <b>approve otomatis</b> ✅\n\n"
             f"⚠️ <i>Jangan dishare ke orang lain!</i>"
         )
     else:
@@ -1169,7 +1320,6 @@ async def _handle_payment_success(bot, order_id: str, paket_id: str, user_id: in
             f"💾 <i>Simpan link ini. Produk dapat diakses kapan saja.</i>"
         )
 
-    # Kirim link ke buyer
     kirim_berhasil = False
     try:
         await bot.send_message(
@@ -1191,11 +1341,22 @@ async def _handle_payment_success(bot, order_id: str, paket_id: str, user_id: in
     except Exception as e:
         print(f"[PAYMENT] Gagal kirim link ke buyer {user_id}: {e}")
 
-    # Simpan link yang dikirim ke buyer
     set_sent_link(order_id, link)
 
-    # Notif admin: hapus pesan lama + kirim pesan berhasil baru
     await hapus_pesan_admin_order(bot, order_id)
+
+    # Notifikasi channel
+    await kirim_notif_channel(
+        bot,
+        f"✅ <b>PEMBAYARAN BERHASIL</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 {html_module.escape(user_name)} (<code>{user_id}</code>)\n"
+        f"📦 {paket['emoji']} {html_module.escape(paket['nama'])}\n"
+        f"💰 {format_harga(paid_amount)}\n"
+        f"📝 <code>{order_id}</code>\n"
+        f"🕐 {now_wib().strftime('%H:%M, %d/%m/%Y')}"
+    )
+
     status_kirim = "✅ Link terkirim ke buyer" if kirim_berhasil else "⚠️ GAGAL kirim link ke buyer!"
     try:
         await bot.send_message(
@@ -1214,6 +1375,47 @@ async def _handle_payment_success(bot, order_id: str, paket_id: str, user_id: in
         )
     except Exception as e:
         print(f"[PAYMENT] Gagal notif admin: {e}")
+
+# =================== AUTO-APPROVE JOIN REQUEST ===================
+
+async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Auto-approve join request ke grup private setelah buyer bayar.
+    Bot cek apakah user punya completed order untuk produk yang terhubung ke grup ini.
+    """
+    join_req = update.chat_join_request
+    if not join_req:
+        return
+
+    user_id = join_req.from_user.id
+    chat_id = str(join_req.chat.id)
+
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("""
+            SELECT o.id FROM orders o
+            JOIN products p ON o.paket_id = p.paket_id
+            WHERE o.user_id = %s AND o.status = 'completed'
+            AND p.group_chat_id = %s
+            ORDER BY o.id DESC LIMIT 1
+        """, (user_id, chat_id))
+        row = c.fetchone()
+    finally:
+        release_conn(conn)
+
+    if row:
+        try:
+            await join_req.approve()
+            print(f"[JOIN] ✅ Approved {user_id} ke chat {chat_id}")
+        except Exception as e:
+            print(f"[JOIN] Gagal approve {user_id} ke {chat_id}: {e}")
+    else:
+        try:
+            await join_req.decline()
+            print(f"[JOIN] ❌ Declined {user_id} ke chat {chat_id} (tidak ada order)")
+        except Exception as e:
+            print(f"[JOIN] Gagal decline {user_id} ke {chat_id}: {e}")
 
 # =================== ADMIN: KELOLA PRODUK ===================
 
@@ -1266,7 +1468,11 @@ async def produk_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("⚠️ Produk tidak ditemukan.")
         return
 
-    grp_info = f"🏢 Group ID: `{esc(p.get('group_chat_id') or 'Tidak di-set')}`\n" if p.get('group_chat_id') else "🏢 Group ID: _Tidak di-set (pakai link biasa)_\n"
+    grp_info = (
+        f"🏢 Group ID: `{esc(p.get('group_chat_id') or 'Tidak di-set')}`\n"
+        if p.get('group_chat_id') else
+        "🏢 Group ID: _Tidak di-set (pakai link biasa)_\n"
+    )
 
     text = (
         f"*{esc(p['emoji'])} {esc(p['nama'])}*\n"
@@ -1291,12 +1497,8 @@ async def produk_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("🔗 Link",       callback_data=f"pd_edit_{paket_id}_link"),
             InlineKeyboardButton("🏢 Group ID",   callback_data=f"pd_edit_{paket_id}_group_chat_id"),
         ],
-        [
-            InlineKeyboardButton("🗑️ Hapus Produk", callback_data=f"pd_hapus_{paket_id}"),
-        ],
-        [
-            InlineKeyboardButton("← Kembali",    callback_data="pd_back"),
-        ],
+        [InlineKeyboardButton("🗑️ Hapus Produk", callback_data=f"pd_hapus_{paket_id}")],
+        [InlineKeyboardButton("← Kembali",       callback_data="pd_back")],
     ]
 
     await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
@@ -1421,7 +1623,6 @@ async def pd_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =================== ADMIN: ORDER AKTIF ===================
 
 async def cmd_aktif(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Tampilkan semua order yang sedang menunggu pembayaran."""
     if update.message.from_user.id != ADMIN_ID:
         return
 
@@ -1464,7 +1665,6 @@ async def cmd_aktif(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def admin_cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin membatalkan order buyer yang masih menunggu bayar."""
     query = update.callback_query
     await query.answer()
 
@@ -1477,10 +1677,12 @@ async def admin_cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
     order_id = parts[2]
 
     conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT * FROM orders WHERE order_id=%s AND status='waiting'", (order_id,))
-    order = c.fetchone()
-    conn.close()
+    try:
+        c = conn.cursor()
+        c.execute("SELECT * FROM orders WHERE order_id=%s AND status='waiting'", (order_id,))
+        order = c.fetchone()
+    finally:
+        release_conn(conn)
 
     if not order:
         await query.edit_message_text("⚠️ Order tidak ditemukan atau sudah selesai/dibatalkan.")
@@ -1494,6 +1696,17 @@ async def admin_cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     update_order_status(order_id, 'cancelled')
     _stop_payment_task(target_user_id)
+
+    # Notifikasi channel
+    await kirim_notif_channel(
+        context.bot,
+        f"❌ <b>DIBATALKAN ADMIN</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 {html_module.escape(order.get('user_name', '-'))} (<code>{target_user_id}</code>)\n"
+        f"📦 {paket['emoji']} {html_module.escape(paket['nama'])}\n"
+        f"📝 <code>{order_id}</code>\n"
+        f"🕐 {now_wib().strftime('%H:%M, %d/%m/%Y')}"
+    )
 
     try:
         await context.bot.send_message(
@@ -1519,7 +1732,6 @@ async def admin_cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 async def admin_manual_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin konfirmasi pembayaran secara manual — kirim link langsung ke buyer."""
     query = update.callback_query
     await query.answer()
 
@@ -1535,10 +1747,12 @@ async def admin_manual_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
     order_id = parts[2]
 
     conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT * FROM orders WHERE order_id=%s AND status='waiting'", (order_id,))
-    order = c.fetchone()
-    conn.close()
+    try:
+        c = conn.cursor()
+        c.execute("SELECT * FROM orders WHERE order_id=%s AND status='waiting'", (order_id,))
+        order = c.fetchone()
+    finally:
+        release_conn(conn)
 
     if not order:
         await query.edit_message_text("⚠️ Order tidak ditemukan atau sudah selesai/dibatalkan.")
@@ -1550,17 +1764,18 @@ async def admin_manual_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
     _stop_payment_task(target_user_id)
     update_order_status(order_id, 'completed')
 
-    # ⭐ Generate link dinamis atau pakai link statis
     group_link = await generate_group_link(context.bot, paket, order_id)
     link = group_link or (paket.get("link") or DEFAULT_LINK)
     harga = paket.get("harga", 0)
 
     if group_link:
         link_section = (
-            f"🔗 <b>Link Grup Private (Cuma Kamu)</b>\n"
+            f"🔗 <b>Link Bergabung (Khusus Kamu)</b>\n"
             f"{link}\n\n"
-            f"⏰ Aktif 3 hari | 👤 Cuma 1 orang\n\n"
-            f"💾 <i>Klik link di atas → pencet 'Join Group'.</i>\n"
+            f"📋 <b>Cara gabung:</b>\n"
+            f"1. Klik link di atas\n"
+            f"2. Pencet <b>\"Minta Bergabung\"</b>\n"
+            f"3. Bot langsung <b>approve otomatis</b> ✅\n\n"
             f"⚠️ <i>Jangan dishare ke orang lain!</i>"
         )
     else:
@@ -1570,7 +1785,6 @@ async def admin_manual_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
             f"💾 <i>Simpan link ini. Produk dapat diakses kapan saja.</i>"
         )
 
-    # Kirim link ke buyer
     try:
         await context.bot.send_message(
             chat_id=target_user_id,
@@ -1590,7 +1804,20 @@ async def admin_manual_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception as e:
         print(f"[KONFIRMASI MANUAL] Gagal kirim link ke buyer {target_user_id}: {e}")
 
-    # Update pesan admin
+    set_sent_link(order_id, link)
+
+    # Notifikasi channel
+    await kirim_notif_channel(
+        context.bot,
+        f"✅ <b>DIKONFIRMASI MANUAL</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 {html_module.escape(order.get('user_name', '-'))} (<code>{target_user_id}</code>)\n"
+        f"📦 {paket['emoji']} {html_module.escape(paket['nama'])}\n"
+        f"💰 {format_harga(harga)}\n"
+        f"📝 <code>{order_id}</code>\n"
+        f"🕐 {now_wib().strftime('%H:%M, %d/%m/%Y')}"
+    )
+
     await query.edit_message_text(
         f"✅ *Pembayaran dikonfirmasi manual*\n\n"
         f"👤 Buyer: {esc(order.get('user_name', '-'))}\n"
@@ -1612,15 +1839,15 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"📅 *Hari Ini*\n"
         f"├ Order Selesai: {s['today_orders']}\n"
-        f"└ Estimasi Omzet: {format_harga(s['today_revenue'])}\n\n"
+        f"└ Omzet: {format_harga(s['today_revenue'])}\n\n"
         f"📆 *Bulan Ini*\n"
         f"├ Order Selesai: {s['month_orders']}\n"
-        f"└ Estimasi Omzet: {format_harga(s['month_revenue'])}\n\n"
+        f"└ Omzet: {format_harga(s['month_revenue'])}\n\n"
         f"🏆 *All Time*\n"
         f"├ Total Order Selesai: {s['total_orders']}\n"
         f"├ Total Dibatalkan: {s['cancelled_count']}\n"
         f"├ Order Aktif Sekarang: {s['active_count']}\n"
-        f"└ Estimasi Total Omzet: {format_harga(s['total_revenue'])}\n\n"
+        f"└ Total Omzet: {format_harga(s['total_revenue'])}\n\n"
     )
     if s['best_product']:
         text += f"🥇 *Produk Terlaris:* {esc(s['best_product'])}\n\n"
@@ -1657,37 +1884,75 @@ async def cmd_riwayat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for o in orders:
         paket = get_product(o['paket_id']) or {"emoji": "📦", "nama": o['paket_id'], "harga": 0}
         status = STATUS_LABEL.get(o['status'], o['status'])
+        harga = o.get('harga_dibayar') or paket['harga']
         text += (
             f"{paket['emoji']} *{esc(paket['nama'])}*\n"
             f"├ Status: {status}\n"
-            f"├ Harga: {format_harga(paket['harga'])}\n"
+            f"├ Harga: {format_harga(harga)}\n"
             f"└ {o['waktu']}\n\n"
         )
 
     await update.message.reply_text(text, parse_mode="Markdown")
 
-# =================== ADMIN: BACKUP DATABASE ===================
+# =================== BACKUP & EXPORT ===================
+
+def _generate_json_export():
+    """
+    Export seluruh data ke format JSON.
+    Mencakup semua tabel: products, orders (semua kolom), banned_users.
+    Lebih portable dan mudah dibaca daripada SQL.
+    """
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("SELECT * FROM products ORDER BY harga ASC")
+        products = [dict(r) for r in c.fetchall()]
+        c.execute("SELECT * FROM orders ORDER BY id ASC")
+        orders = [dict(r) for r in c.fetchall()]
+        c.execute("SELECT * FROM banned_users ORDER BY banned_at DESC")
+        banned = [dict(r) for r in c.fetchall()]
+    finally:
+        release_conn(conn)
+
+    payload = {
+        "meta": {
+            "app": "Hyper Family Store",
+            "exported_at": now_wib().strftime("%H:%M, %d/%m/%Y"),
+            "version": "2.0",
+            "counts": {
+                "products": len(products),
+                "orders": len(orders),
+                "banned_users": len(banned),
+            }
+        },
+        "products": products,
+        "orders": orders,
+        "banned_users": banned,
+    }
+
+    return json.dumps(payload, ensure_ascii=False, indent=2, default=str), len(products), len(orders), len(banned)
 
 async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id != ADMIN_ID:
         return
-
     await update.message.reply_text("⏳ Membuat backup database...")
     await _kirim_backup(context.bot)
 
 async def _kirim_backup(bot):
-    """Export data orders & products dari PostgreSQL ke file teks, lalu kirim ke admin."""
+    """Backup seluruh data ke file .txt — mencakup products, orders, dan banned_users."""
     backup_name = f"backup_{now_wib().strftime('%Y%m%d_%H%M%S')}.txt"
     try:
         conn = get_conn()
-        c = conn.cursor()
-
-        c.execute("SELECT * FROM orders ORDER BY id DESC")
-        orders = c.fetchall()
-
-        c.execute("SELECT * FROM products ORDER BY harga ASC")
-        products = c.fetchall()
-        conn.close()
+        try:
+            c = conn.cursor()
+            c.execute("SELECT * FROM orders ORDER BY id DESC")
+            orders = c.fetchall()
+            c.execute("SELECT * FROM products ORDER BY harga ASC")
+            products = c.fetchall()
+            c.execute("SELECT * FROM banned_users ORDER BY banned_at DESC")
+            banned = c.fetchall()
+        finally:
+            release_conn(conn)
 
         lines = []
         lines.append(f"=== BACKUP HYPER FAMILY STORE ===\n")
@@ -1696,14 +1961,25 @@ async def _kirim_backup(bot):
         lines.append(f"--- PRODUK ({len(products)}) ---\n")
         for p in products:
             grp = p.get('group_chat_id') or '-'
-            lines.append(f"[{p['paket_id']}] {p['emoji']} {p['nama']} — Rp {p['harga']:,} | Link: {p['link']} | Group: {grp}\n")
+            lines.append(
+                f"[{p['paket_id']}] {p['emoji']} {p['nama']} — Rp {p['harga']:,} "
+                f"| Link: {p['link']} | Group: {grp}\n"
+            )
 
         lines.append(f"\n--- ORDERS ({len(orders)}) ---\n")
         for o in orders:
             lines.append(
                 f"[{o['id']}] {o['order_id']}\n"
                 f"  User: {o['user_name']} ({o['user_id']})\n"
-                f"  Paket: {o['paket_id']} | Status: {o['status']} | Waktu: {o['waktu']}\n\n"
+                f"  Paket: {o['paket_id']} | Status: {o['status']} | "
+                f"Harga: Rp {o.get('harga_dibayar') or 0:,} | Waktu: {o['waktu']}\n\n"
+            )
+
+        # FIX: Tambah banned_users ke backup
+        lines.append(f"\n--- BANNED USERS ({len(banned)}) ---\n")
+        for b in banned:
+            lines.append(
+                f"User ID: {b['user_id']} | Alasan: {b['reason'] or '-'} | Sejak: {b['banned_at']}\n"
             )
 
         content = "".join(lines).encode("utf-8")
@@ -1717,7 +1993,7 @@ async def _kirim_backup(bot):
             caption=(
                 f"📦 *Backup Database*\n"
                 f"🕐 {now_wib().strftime('%H:%M, %d/%m/%Y')}\n"
-                f"📋 {len(orders)} orders | {len(products)} produk"
+                f"📋 {len(orders)} orders | {len(products)} produk | {len(banned)} banned"
             ),
             parse_mode="Markdown"
         )
@@ -1728,172 +2004,234 @@ async def _kirim_backup(bot):
         except Exception:
             pass
 
-# =================== ADMIN: EXPORT & IMPORT SQL ===================
-
 async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Export seluruh data (products + orders) sebagai file .sql — bisa di-import ke DB manapun."""
     if update.message.from_user.id != ADMIN_ID:
         return
-
-    await update.message.reply_text("⏳ Menyiapkan export SQL...")
-
+    await update.message.reply_text("⏳ Menyiapkan export JSON...")
     try:
-        conn = get_conn()
-        c = conn.cursor()
-        c.execute("SELECT * FROM products ORDER BY harga ASC")
-        products = c.fetchall()
-        c.execute("SELECT * FROM orders ORDER BY id ASC")
-        orders = c.fetchall()
-        conn.close()
-
-        lines = []
-        lines.append("-- ================================================\n")
-        lines.append("-- HYPER FAMILY STORE — Full Data Export\n")
-        lines.append(f"-- Tanggal: {now_wib().strftime('%H:%M, %d/%m/%Y')}\n")
-        lines.append(f"-- Products: {len(products)} | Orders: {len(orders)}\n")
-        lines.append("-- Cara pakai: kirim file ini ke bot via /import_sql\n")
-        lines.append("-- ================================================\n\n")
-
-        # Products
-        lines.append("-- PRODUCTS\n")
-        for p in products:
-            def sql_str(v):
-                if v is None:
-                    return "NULL"
-                return "'" + str(v).replace("'", "''") + "'"
-            lines.append(
-                f"INSERT INTO products (paket_id, nama, emoji, deskripsi, harga, link, group_chat_id) "
-                f"VALUES ({sql_str(p['paket_id'])}, {sql_str(p['nama'])}, {sql_str(p['emoji'])}, "
-                f"{sql_str(p['deskripsi'])}, {p['harga']}, {sql_str(p['link'])}, {sql_str(p.get('group_chat_id'))}) "
-                f"ON CONFLICT (paket_id) DO UPDATE SET "
-                f"nama=EXCLUDED.nama, emoji=EXCLUDED.emoji, deskripsi=EXCLUDED.deskripsi, "
-                f"harga=EXCLUDED.harga, link=EXCLUDED.link, group_chat_id=EXCLUDED.group_chat_id;\n"
-            )
-
-        lines.append("\n-- ORDERS\n")
-        for o in orders:
-            def sql_str(v):
-                if v is None:
-                    return "NULL"
-                return "'" + str(v).replace("'", "''") + "'"
-            lines.append(
-                f"INSERT INTO orders (user_id, user_name, paket_id, order_id, status, waktu) "
-                f"VALUES ({o['user_id']}, {sql_str(o['user_name'])}, {sql_str(o['paket_id'])}, "
-                f"{sql_str(o['order_id'])}, {sql_str(o['status'])}, {sql_str(o['waktu'])}) "
-                f"ON CONFLICT (order_id) DO NOTHING;\n"
-            )
-
-        filename = f"export_{now_wib().strftime('%Y%m%d_%H%M%S')}.sql"
-        content = "".join(lines).encode("utf-8")
-        buf = BytesIO(content)
+        json_content, n_products, n_orders, n_banned = _generate_json_export()
+        filename = f"export_{now_wib().strftime('%Y%m%d_%H%M%S')}.json"
+        buf = BytesIO(json_content.encode("utf-8"))
         buf.name = filename
-
         await update.message.reply_document(
             document=buf,
             filename=filename,
             caption=(
-                f"✅ Export Berhasil\n"
+                f"✅ *Export Berhasil*\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"📦 Products: {len(products)}\n"
-                f"📋 Orders: {len(orders)}\n"
+                f"📦 Products: {n_products}\n"
+                f"📋 Orders: {n_orders}\n"
+                f"🚫 Banned users: {n_banned}\n"
                 f"🕐 {now_wib().strftime('%H:%M, %d/%m/%Y')}\n\n"
-                f"Kirim file ini ke bot dengan /import_sql untuk restore."
-            )
+                f"Kirim file ini ke bot dengan /import\\_json untuk restore."
+            ),
+            parse_mode="Markdown"
         )
-
     except Exception as e:
         await update.message.reply_text(f"❌ Gagal export: {e}")
 
-
-async def cmd_import_sql(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Perintah /import_sql — minta admin kirim file .sql."""
+async def cmd_import_json(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id != ADMIN_ID:
         return
-
-    context.user_data['awaiting_sql_import'] = True
+    context.user_data['awaiting_json_import'] = True
     await update.message.reply_text(
-        "*📥 IMPORT DATA SQL*\n"
+        "*📥 IMPORT DATA JSON*\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "Kirim file `.sql` yang didapat dari `/export`.\n\n"
+        "Kirim file `.json` yang didapat dari `/export`.\n\n"
         "⚠️ Data yang sudah ada *tidak akan dihapus* — hanya ditambah/diperbarui.\n"
         "_Kirim file sekarang..._",
         parse_mode="Markdown"
     )
 
-
-async def handle_sql_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Terima file .sql dari admin dan jalankan isinya ke database."""
+async def handle_json_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id != ADMIN_ID:
         return
-    if not context.user_data.get('awaiting_sql_import'):
+    if not context.user_data.get('awaiting_json_import'):
         return
 
     doc = update.message.document
-    if not doc or not doc.file_name.endswith('.sql'):
-        await update.message.reply_text("❌ File harus berformat `.sql`. Coba lagi dengan /import_sql.")
+    if not doc or not doc.file_name.endswith('.json'):
+        await update.message.reply_text("❌ File harus berformat `.json`. Coba lagi dengan /import_json.")
         return
 
-    context.user_data.pop('awaiting_sql_import', None)
-    status_msg = await update.message.reply_text("⏳ Membaca file SQL...")
+    context.user_data.pop('awaiting_json_import', None)
+    status_msg = await update.message.reply_text("⏳ Membaca file JSON...")
 
     try:
         file = await context.bot.get_file(doc.file_id)
-        sql_bytes = await file.download_as_bytearray()
-        sql_text = sql_bytes.decode("utf-8")
+        raw = await file.download_as_bytearray()
+        data = json.loads(raw.decode("utf-8"))
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Gagal membaca file JSON: {e}")
+        return
 
-        # Pisah per statement (berakhir dengan ;)
-        statements = [s.strip() for s in sql_text.split(";") if s.strip() and not s.strip().startswith("--")]
+    if "products" not in data and "orders" not in data:
+        await status_msg.edit_text("❌ Format JSON tidak valid. Pastikan file berasal dari /export.")
+        return
 
-        conn = get_conn()
+    products  = data.get("products",   [])
+    orders    = data.get("orders",     [])
+    banned    = data.get("banned_users", [])
+
+    ok_p = ok_o = ok_b = 0
+    fail_p = fail_o = fail_b = 0
+
+    conn = get_conn()
+    try:
         c = conn.cursor()
-        ok = 0
-        gagal = 0
-        for stmt in statements:
-            # Hanya izinkan INSERT (keamanan — tidak ada DROP/DELETE/etc.)
-            if not stmt.upper().lstrip().startswith("INSERT"):
-                continue
+
+        for p in products:
             try:
-                c.execute(stmt)
-                ok += 1
+                c.execute(
+                    """INSERT INTO products (paket_id, nama, emoji, deskripsi, harga, link, group_chat_id)
+                       VALUES (%(paket_id)s, %(nama)s, %(emoji)s, %(deskripsi)s, %(harga)s, %(link)s, %(group_chat_id)s)
+                       ON CONFLICT (paket_id) DO UPDATE SET
+                           nama=EXCLUDED.nama, emoji=EXCLUDED.emoji,
+                           deskripsi=EXCLUDED.deskripsi, harga=EXCLUDED.harga,
+                           link=EXCLUDED.link, group_chat_id=EXCLUDED.group_chat_id""",
+                    {
+                        "paket_id":     p.get("paket_id"),
+                        "nama":         p.get("nama"),
+                        "emoji":        p.get("emoji", "📦"),
+                        "deskripsi":    p.get("deskripsi", ""),
+                        "harga":        int(p.get("harga", 0)),
+                        "link":         p.get("link", DEFAULT_LINK),
+                        "group_chat_id": p.get("group_chat_id"),
+                    }
+                )
+                ok_p += 1
             except Exception as e:
-                print(f"[IMPORT] Gagal eksekusi statement: {e}\n{stmt[:80]}")
-                gagal += 1
+                print(f"[IMPORT] produk gagal: {e}")
+                fail_p += 1
+
+        for o in orders:
+            try:
+                c.execute(
+                    """INSERT INTO orders
+                       (user_id, user_name, paket_id, order_id, status, waktu, harga_dibayar, sent_link)
+                       VALUES (%(user_id)s, %(user_name)s, %(paket_id)s, %(order_id)s,
+                               %(status)s, %(waktu)s, %(harga_dibayar)s, %(sent_link)s)
+                       ON CONFLICT (order_id) DO NOTHING""",
+                    {
+                        "user_id":       o.get("user_id"),
+                        "user_name":     o.get("user_name"),
+                        "paket_id":      o.get("paket_id"),
+                        "order_id":      o.get("order_id"),
+                        "status":        o.get("status", "completed"),
+                        "waktu":         o.get("waktu", ""),
+                        "harga_dibayar": int(o.get("harga_dibayar") or 0),
+                        "sent_link":     o.get("sent_link"),
+                    }
+                )
+                ok_o += 1
+            except Exception as e:
+                print(f"[IMPORT] order gagal: {e}")
+                fail_o += 1
+
+        for b in banned:
+            try:
+                c.execute(
+                    """INSERT INTO banned_users (user_id, reason, banned_at)
+                       VALUES (%(user_id)s, %(reason)s, %(banned_at)s)
+                       ON CONFLICT (user_id) DO NOTHING""",
+                    {
+                        "user_id":   b.get("user_id"),
+                        "reason":    b.get("reason", ""),
+                        "banned_at": b.get("banned_at", now_wib().strftime("%H:%M — %d/%m/%Y")),
+                    }
+                )
+                ok_b += 1
+            except Exception as e:
+                print(f"[IMPORT] banned user gagal: {e}")
+                fail_b += 1
 
         conn.commit()
-        conn.close()
+    finally:
+        release_conn(conn)
 
-        await status_msg.edit_text(
-            f"✅ *Import Selesai*\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"✔️ Berhasil: {ok} statement\n"
-            f"❌ Gagal: {gagal} statement\n\n"
-            f"_Semua produk dan riwayat order sudah ter-restore._",
+    await status_msg.edit_text(
+        f"✅ *Import JSON Selesai*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📦 Products: {ok_p} berhasil, {fail_p} gagal\n"
+        f"📋 Orders: {ok_o} berhasil, {fail_o} gagal\n"
+        f"🚫 Banned: {ok_b} berhasil, {fail_b} gagal\n\n"
+        f"_Semua data sudah ter-restore._",
+        parse_mode="Markdown"
+    )
+
+# =================== KIRIM ULANG LINK ===================
+
+async def resend_group_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    parts = query.data.split("|")
+    order_id = parts[1] if len(parts) > 1 else None
+    if not order_id:
+        await query.edit_message_text("⚠️ Order ID tidak valid.")
+        return
+
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute(
+            "SELECT * FROM orders WHERE order_id=%s AND user_id=%s AND status='completed'",
+            (order_id, user_id)
+        )
+        order = c.fetchone()
+    finally:
+        release_conn(conn)
+
+    if not order:
+        await query.edit_message_text("⚠️ Order tidak ditemukan atau belum lunas.")
+        return
+
+    order = dict(order)
+    paket = get_product(order['paket_id'])
+    if not paket:
+        await query.edit_message_text("⚠️ Produk tidak ditemukan.")
+        return
+
+    new_link = await generate_group_link(context.bot, paket, order_id)
+
+    if new_link:
+        await query.edit_message_text(
+            f"✅ *Link Baru Berhasil Dibuat!*\n\n"
+            f"🔗 {new_link}\n\n"
+            f"📋 *Cara gabung:*\n"
+            f"1. Klik link di atas\n"
+            f"2. Pencet *\"Minta Bergabung\"*\n"
+            f"3. Bot langsung approve otomatis ✅\n\n"
+            f"_Segera join ya\\!_",
+            parse_mode="Markdown"
+        )
+    else:
+        fallback_link = paket.get("link") or DEFAULT_LINK
+        await query.edit_message_text(
+            f"✅ *Link Produk*\n\n"
+            f"🔗 {fallback_link}\n\n"
+            f"_Produk ini pakai link biasa._",
             parse_mode="Markdown"
         )
 
-    except Exception as e:
-        await status_msg.edit_text(f"❌ Gagal import: {e}")
-
-
 # =================== BUYER REMINDER ===================
-REMINDER_HARI = 3  # Kirim reminder X hari setelah buyer terakhir beli
+REMINDER_HARI = 3
 
 def get_buyers_for_reminder(hari: int):
-    """Ambil buyer yang terakhir beli tepat X hari lalu (untuk reminder harian)."""
     target_date = (now_wib() - timedelta(days=hari)).strftime("%d/%m/%Y")
     conn = get_conn()
-    c = conn.cursor()
-    # Buyer yang punya completed order di tanggal target
-    c.execute(
-        "SELECT DISTINCT user_id, user_name FROM orders WHERE status='completed' AND waktu LIKE %s",
-        (f"% — {target_date}",)
-    )
-    rows = [dict(r) for r in c.fetchall()]
-    conn.close()
-    return rows
+    try:
+        c = conn.cursor()
+        c.execute(
+            "SELECT DISTINCT user_id, user_name FROM orders WHERE status='completed' AND waktu LIKE %s",
+            (f"% — {target_date}",)
+        )
+        return [dict(r) for r in c.fetchall()]
+    finally:
+        release_conn(conn)
 
 async def _send_buyer_reminders(bot):
-    """Kirim pesan pengingat ke buyer yang membeli tepat REMINDER_HARI hari lalu."""
     buyers = get_buyers_for_reminder(REMINDER_HARI)
     if not buyers:
         return
@@ -1911,16 +2249,14 @@ async def _send_buyer_reminders(bot):
                 ),
                 parse_mode="Markdown"
             )
-            await asyncio.sleep(0.5)  # Delay antar pesan agar tidak kena flood limit
+            await asyncio.sleep(0.5)
         except Exception as e:
             print(f"[REMINDER] Gagal kirim ke {buyer['user_id']}: {e}")
 
 async def _buyer_reminder_loop(bot):
-    """Asyncio loop: cek dan kirim reminder setiap hari jam 10:00 WIB."""
     while True:
         try:
             now = now_wib()
-            # Hitung waktu ke jam 10:00 hari ini atau besok
             target = now.replace(hour=10, minute=0, second=0, microsecond=0)
             if now >= target:
                 target += timedelta(days=1)
@@ -1934,7 +2270,6 @@ async def _buyer_reminder_loop(bot):
             await asyncio.sleep(3600)
 
 async def _auto_backup_loop():
-    """Asyncio loop: backup DB otomatis setiap hari jam 00:00."""
     while True:
         try:
             now = now_wib()
@@ -1947,7 +2282,23 @@ async def _auto_backup_loop():
             break
         except Exception as e:
             print(f"[AUTO_BACKUP] Error: {e}")
-            await asyncio.sleep(3600)  # Retry sejam kemudian jika error
+            # FIX: Notifikasi ke Telegram kalau auto backup gagal
+            try:
+                if _current_bot:
+                    await _current_bot.send_message(
+                        chat_id=ADMIN_ID,
+                        text=(
+                            f"⚠️ *AUTO BACKUP GAGAL*\n"
+                            f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                            f"Error: `{esc(str(e))}`\n"
+                            f"🕐 {now_wib().strftime('%H:%M, %d/%m/%Y')}\n\n"
+                            f"_Jalankan /backup secara manual._"
+                        ),
+                        parse_mode="Markdown"
+                    )
+            except Exception:
+                pass
+            await asyncio.sleep(3600)
 
 # =================== ADMIN: BROADCAST ===================
 
@@ -1989,7 +2340,7 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
     text = update.message.text.strip() if update.message.text else ""
 
-    # --- State: awaiting cari order (dari panel) ---
+    # --- State: awaiting cari order ---
     if context.user_data.get('awaiting_cari'):
         context.user_data.pop('awaiting_cari', None)
         order_id = text.strip()
@@ -1999,35 +2350,31 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
             await update.message.reply_text(f"❌ Gagal mengambil data order: {e}")
             return
         if not order:
-            await update.message.reply_text(
-                f"❌ Order tidak ditemukan.\n\nID yang dicari: {order_id}"
-            )
+            await update.message.reply_text(f"❌ Order tidak ditemukan.\n\nID yang dicari: {order_id}")
             return
-        try:
-            paket = get_product(order['paket_id']) or {"emoji": "📦", "nama": order['paket_id'], "harga": 0}
-            STATUS_LABEL = {
-                'completed': '✅ Selesai / Lunas', 'waiting': '⏳ Menunggu Bayar',
-                'pending': '🔄 Diproses Manual', 'cancelled': '❌ Dibatalkan',
-                'expired': '⏰ Kedaluwarsa', 'rejected': '🚫 Ditolak',
-            }
-            status = STATUS_LABEL.get(order['status'], order['status'])
-            sent_link = order.get('sent_link') or '-'
-            await update.message.reply_text(
-                f"🔍 DETAIL ORDER\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"Order ID: {order['order_id']}\n"
-                f"Buyer: {order.get('user_name', '-')} ({order['user_id']})\n"
-                f"Paket: {paket['emoji']} {paket['nama']}\n"
-                f"Harga: {format_harga(paket['harga'])}\n"
-                f"Status: {status}\n"
-                f"Dibuat: {order.get('waktu', '-')}\n"
-                f"Link terkirim: {sent_link}"
-            )
-        except Exception as e:
-            await update.message.reply_text(f"❌ Gagal memformat detail order: {e}")
+        paket = get_product(order['paket_id']) or {"emoji": "📦", "nama": order['paket_id'], "harga": 0}
+        STATUS_LABEL = {
+            'completed': '✅ Selesai / Lunas', 'waiting': '⏳ Menunggu Bayar',
+            'pending': '🔄 Diproses Manual', 'cancelled': '❌ Dibatalkan',
+            'expired': '⏰ Kedaluwarsa', 'rejected': '🚫 Ditolak',
+        }
+        status = STATUS_LABEL.get(order['status'], order['status'])
+        sent_link = order.get('sent_link') or '-'
+        await update.message.reply_text(
+            f"🔍 *DETAIL ORDER*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"Order ID: `{order['order_id']}`\n"
+            f"Buyer: {esc(order.get('user_name', '-'))} (`{order['user_id']}`)\n"
+            f"Paket: {paket['emoji']} {esc(paket['nama'])}\n"
+            f"Harga Dibayar: {format_harga(order.get('harga_dibayar') or paket['harga'])}\n"
+            f"Status: {status}\n"
+            f"Dibuat: {order.get('waktu', '-')}\n"
+            f"Link terkirim: {sent_link}",
+            parse_mode="Markdown"
+        )
         return
 
-    # --- State: awaiting ban user (dari panel) ---
+    # --- State: awaiting ban user ---
     if context.user_data.get('awaiting_ban'):
         context.user_data.pop('awaiting_ban', None)
         parts = text.split(None, 1)
@@ -2049,7 +2396,7 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return
 
-    # --- State: awaiting unban user (dari panel) ---
+    # --- State: awaiting unban user ---
     if context.user_data.get('awaiting_unban'):
         context.user_data.pop('awaiting_unban', None)
         try:
@@ -2062,16 +2409,60 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
             return
         unban_user(target_id)
         await update.message.reply_text(
-            f"✅ *User Berhasil Di-unban*\n\n"
-            f"👤 User ID: `{target_id}`",
+            f"✅ *User Berhasil Di-unban*\n\n👤 User ID: `{target_id}`",
             parse_mode="Markdown"
         )
+        return
+
+    # --- State: awaiting channel ID ---
+    if context.user_data.get('awaiting_channel_id'):
+        context.user_data.pop('awaiting_channel_id', None)
+        val = text.strip()
+        if val.lower() == 'hapus':
+            set_setting('notif_channel_id', None)
+            await update.message.reply_text(
+                "✅ Channel notifikasi berhasil *dinonaktifkan*.",
+                parse_mode="Markdown"
+            )
+        else:
+            if not val.lstrip('-').isdigit():
+                await update.message.reply_text(
+                    "❌ Format channel ID tidak valid.\n"
+                    "Contoh: `-1001234567890`\n"
+                    "Ketik `hapus` untuk menonaktifkan.",
+                    parse_mode="Markdown"
+                )
+                return
+            set_setting('notif_channel_id', val)
+            # Test kirim pesan ke channel
+            try:
+                await context.bot.send_message(
+                    chat_id=int(val),
+                    text=(
+                        f"✅ <b>Channel notifikasi aktif!</b>\n\n"
+                        f"Bot Hyper Family Store akan mengirim update status order ke channel ini.\n"
+                        f"🕐 {now_wib().strftime('%H:%M, %d/%m/%Y')}"
+                    ),
+                    parse_mode="HTML"
+                )
+                await update.message.reply_text(
+                    f"✅ *Channel ID berhasil disimpan!*\n\n"
+                    f"ID: `{val}`\n\n"
+                    f"Pesan test sudah dikirim ke channel.",
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                await update.message.reply_text(
+                    f"⚠️ *Channel ID disimpan, tapi gagal kirim pesan test.*\n\n"
+                    f"Error: `{esc(str(e))}`\n\n"
+                    f"Pastikan bot sudah dijadikan *admin* di channel tersebut.",
+                    parse_mode="Markdown"
+                )
         return
 
     # --- State: broadcast blast ---
     if context.user_data.get('blasting'):
         context.user_data.pop('blasting', None)
-
         buyers = get_all_buyers()
         jumlah = len(buyers)
 
@@ -2087,13 +2478,12 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         failed = 0
         for b in buyers:
             try:
-                await context.bot.send_message(
-                    chat_id=b['user_id'],
-                    text=blast_text
-                )
+                await context.bot.send_message(chat_id=b['user_id'], text=blast_text)
                 sent += 1
             except Exception:
                 failed += 1
+            # FIX: Rate limiting agar tidak kena flood ban Telegram
+            await asyncio.sleep(0.05)
 
         try:
             await status_msg.delete()
@@ -2101,11 +2491,12 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
             pass
 
         await update.message.reply_text(
-            f"✅ BROADCAST SELESAI\n"
+            f"✅ *BROADCAST SELESAI*\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"✅ Terkirim: {sent}\n"
             f"❌ Gagal: {failed}\n"
-            f"📊 Total: {jumlah}"
+            f"📊 Total: {jumlah}",
+            parse_mode="Markdown"
         )
         return
 
@@ -2219,7 +2610,11 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         )
         p = get_product(paket_id)
         if p:
-            grp_info = f"🏢 Group ID: `{esc(p.get('group_chat_id') or 'Tidak di-set')}`\n" if p.get('group_chat_id') else "🏢 Group ID: _Tidak di-set (pakai link biasa)_\n"
+            grp_info = (
+                f"🏢 Group ID: `{esc(p.get('group_chat_id') or 'Tidak di-set')}`\n"
+                if p.get('group_chat_id') else
+                "🏢 Group ID: _Tidak di-set (pakai link biasa)_\n"
+            )
             detail_text = (
                 f"*{esc(p['emoji'])} {esc(p['nama'])}*\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -2300,10 +2695,12 @@ async def admin_proses_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user_id = int(query.data.replace("proses_", ""))
 
     conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT * FROM orders WHERE user_id=%s AND status='pending' ORDER BY id DESC LIMIT 1", (user_id,))
-    order = c.fetchone()
-    conn.close()
+    try:
+        c = conn.cursor()
+        c.execute("SELECT * FROM orders WHERE user_id=%s AND status='pending' ORDER BY id DESC LIMIT 1", (user_id,))
+        order = c.fetchone()
+    finally:
+        release_conn(conn)
 
     if not order:
         await query.edit_message_text("⚠️ Order tidak ditemukan atau sudah diproses.")
@@ -2340,7 +2737,10 @@ async def admin_proses_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.message.delete()
     except Exception:
         pass
-    await context.bot.send_message(chat_id=ADMIN_ID, text=caption, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+    await context.bot.send_message(
+        chat_id=ADMIN_ID, text=caption, parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
 async def back_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -2363,10 +2763,12 @@ async def back_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += f"• {paket['emoji']} {esc(o['user_name'])} — {esc(paket['nama'])} — {durasi}\n"
         keyboard.append([InlineKeyboardButton(f"👤 Proses: {o['user_name']}", callback_data=f"proses_{o['user_id']}")])
 
-    await context.bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+    await context.bot.send_message(
+        chat_id=ADMIN_ID, text=text, parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
 async def admin_konfirmasi(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin konfirmasi order pending — kirim link ke buyer."""
     query = update.callback_query
     await query.answer()
 
@@ -2375,29 +2777,35 @@ async def admin_konfirmasi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = int(parts[1])
 
     conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT * FROM orders WHERE user_id=%s AND status='pending' ORDER BY id DESC LIMIT 1", (user_id,))
-    order = c.fetchone()
-    conn.close()
+    try:
+        c = conn.cursor()
+        c.execute(
+            "SELECT * FROM orders WHERE user_id=%s AND status='pending' ORDER BY id DESC LIMIT 1",
+            (user_id,)
+        )
+        order = c.fetchone()
+    finally:
+        release_conn(conn)
 
     if not order:
         await query.edit_message_text("⚠️ Order tidak ditemukan atau sudah diproses.")
         return
 
     order = dict(order)
-    paket = get_product(order["paket_id"]) or {"emoji": "📦", "nama": order["paket_id"], "harga": 0, "deskripsi": "-", "link": DEFAULT_LINK}
+    paket = get_product(order["paket_id"]) or {"emoji": "📦", "nama": order["paket_id"], "harga": 0, "link": DEFAULT_LINK}
 
     if action == "confirm":
-        # ⭐ Generate link dinamis atau pakai link statis
         group_link = await generate_group_link(context.bot, paket, order["order_id"])
         link = group_link or (paket.get("link") or DEFAULT_LINK)
 
         if group_link:
             link_section = (
-                f"🔗 <b>Link Grup Private (Cuma Kamu)</b>\n"
+                f"🔗 <b>Link Bergabung (Khusus Kamu)</b>\n"
                 f"{link}\n\n"
-                f"⏰ Aktif 3 hari | 👤 Cuma 1 orang\n\n"
-                f"💾 <i>Klik link di atas → pencet 'Join Group'.</i>\n"
+                f"📋 <b>Cara gabung:</b>\n"
+                f"1. Klik link di atas\n"
+                f"2. Pencet <b>\"Minta Bergabung\"</b>\n"
+                f"3. Bot langsung <b>approve otomatis</b> ✅\n\n"
                 f"⚠️ <i>Jangan dishare ke orang lain!</i>"
             )
         else:
@@ -2424,6 +2832,18 @@ async def admin_konfirmasi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         simpan_msg_user(context, user_id, msg.message_id)
         await hapus_msg_user_lama(context, user_id, keep_last=2)
         update_order_status(order["order_id"], 'completed')
+        set_sent_link(order["order_id"], link)
+
+        # Notifikasi channel
+        await kirim_notif_channel(
+            context.bot,
+            f"✅ <b>ORDER SELESAI (MANUAL)</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 {html_module.escape(order['user_name'])} (<code>{user_id}</code>)\n"
+            f"📦 {paket['emoji']} {html_module.escape(paket['nama'])}\n"
+            f"📝 <code>{order['order_id']}</code>\n"
+            f"🕐 {now_wib().strftime('%H:%M, %d/%m/%Y')}"
+        )
 
         await query.edit_message_text(
             f"*✅ DIKONFIRMASI*\n"
@@ -2461,55 +2881,6 @@ async def admin_konfirmasi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await hapus_msg_user_lama(context, user_id, keep_last=2)
         await hapus_admin_msg(context, user_id)
 
-# ⭐ FUNGSI BARU: Kirim ulang link grup (buyer pencet tombol)
-async def resend_group_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Buyer pencet tombol 'Link Error' → bot bikin link baru dan kirim ulang."""
-    query = update.callback_query
-    await query.answer()
-
-    user_id = query.from_user.id
-    parts = query.data.split("|")
-    order_id = parts[1] if len(parts) > 1 else None
-    if not order_id:
-        await query.edit_message_text("⚠️ Order ID tidak valid.")
-        return
-
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT * FROM orders WHERE order_id=%s AND user_id=%s AND status='completed'", (order_id, user_id))
-    order = c.fetchone()
-    conn.close()
-
-    if not order:
-        await query.edit_message_text("⚠️ Order tidak ditemukan atau belum lunas.")
-        return
-
-    order = dict(order)
-    paket = get_product(order['paket_id'])
-    if not paket:
-        await query.edit_message_text("⚠️ Produk tidak ditemukan.")
-        return
-
-    new_link = await generate_group_link(context.bot, paket, order_id)
-
-    if new_link:
-        await query.edit_message_text(
-            f"✅ *Link Baru Berhasil Dibuat!*\n\n"
-            f"🔗 {new_link}\n\n"
-            f"⏰ Aktif 3 hari | 👤 Cuma kamu yang bisa pakai\n\n"
-            f"_Segera join ya, jangan ditunda-tunda!_",
-            parse_mode="Markdown"
-        )
-    else:
-        # Fallback ke link biasa
-        fallback_link = paket.get("link") or DEFAULT_LINK
-        await query.edit_message_text(
-            f"✅ *Link Produk*\n\n"
-            f"🔗 {fallback_link}\n\n"
-            f"_Produk ini pakai link biasa (bukan grup private)._",
-            parse_mode="Markdown"
-        )
-
 # =================== ADMIN: PANEL UTAMA ===================
 
 def build_admin_panel_keyboard():
@@ -2526,6 +2897,9 @@ def build_admin_panel_keyboard():
             InlineKeyboardButton("💾 Data & Backup",  callback_data="admpanel_data"),
             InlineKeyboardButton("🚫 Kelola User",    callback_data="admpanel_user"),
         ],
+        [
+            InlineKeyboardButton("⚙️ Pengaturan",     callback_data="admpanel_setting"),
+        ],
     ])
 
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2540,7 +2914,6 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def admpanel_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Kembali ke panel utama admin."""
     query = update.callback_query
     await query.answer()
     await query.edit_message_text(
@@ -2564,9 +2937,7 @@ async def admpanel_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("⏳ Order Aktif",   callback_data="admpanel_orders_aktif"),
             InlineKeyboardButton("🔄 Order Pending", callback_data="admpanel_orders_pending"),
         ],
-        [
-            InlineKeyboardButton("🔍 Cari Order",    callback_data="admpanel_orders_cari"),
-        ],
+        [InlineKeyboardButton("🔍 Cari Order",    callback_data="admpanel_orders_cari")],
         [InlineKeyboardButton("← Kembali", callback_data="admpanel_back")],
     ])
     await query.edit_message_text(
@@ -2651,15 +3022,15 @@ async def admpanel_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"📅 *Hari Ini*\n"
         f"├ Order Selesai: {s['today_orders']}\n"
-        f"└ Estimasi Omzet: {format_harga(s['today_revenue'])}\n\n"
+        f"└ Omzet: {format_harga(s['today_revenue'])}\n\n"
         f"📆 *Bulan Ini*\n"
         f"├ Order Selesai: {s['month_orders']}\n"
-        f"└ Estimasi Omzet: {format_harga(s['month_revenue'])}\n\n"
+        f"└ Omzet: {format_harga(s['month_revenue'])}\n\n"
         f"🏆 *All Time*\n"
         f"├ Total Order Selesai: {s['total_orders']}\n"
         f"├ Total Dibatalkan: {s['cancelled_count']}\n"
         f"├ Order Aktif Sekarang: {s['active_count']}\n"
-        f"└ Estimasi Total Omzet: {format_harga(s['total_revenue'])}\n\n"
+        f"└ Total Omzet: {format_harga(s['total_revenue'])}\n\n"
     )
     if s['best_product']:
         text += f"🥇 *Produk Terlaris:* {esc(s['best_product'])}\n\n"
@@ -2682,12 +3053,13 @@ async def admpanel_blast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     await query.edit_message_text(
-        f"📢 BROADCAST PESAN\n"
+        f"📢 *BROADCAST PESAN*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"Total penerima: {jumlah} buyer\n\n"
+        f"Total penerima: *{jumlah} buyer*\n\n"
         f"Ketik & kirim pesan yang mau di-blast sekarang.\n"
         f"Pesan kamu akan dikirim dengan header toko secara otomatis.\n\n"
         f"⚠️ Langsung terkirim ke semua buyer setelah kamu send.",
+        parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Batal", callback_data="blast_batal")]])
     )
     context.user_data['blasting'] = True
@@ -2727,48 +3099,21 @@ async def admpanel_data_backup(update: Update, context: ContextTypes.DEFAULT_TYP
 async def admpanel_data_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    await query.edit_message_text("⏳ Menyiapkan export SQL...")
+    await query.edit_message_text("⏳ Menyiapkan export JSON...")
     try:
-        conn = get_conn()
-        c = conn.cursor()
-        c.execute("SELECT * FROM products ORDER BY harga ASC")
-        products = c.fetchall()
-        c.execute("SELECT * FROM orders ORDER BY id ASC")
-        orders = c.fetchall()
-        conn.close()
-
-        lines = []
-        lines.append("-- HYPER FAMILY STORE — Full Data Export\n")
-        lines.append(f"-- Tanggal: {now_wib().strftime('%H:%M, %d/%m/%Y')}\n\n")
-        lines.append("-- PRODUCTS\n")
-        for p in products:
-            def sql_str(v):
-                return "NULL" if v is None else "'" + str(v).replace("'", "''") + "'"
-            lines.append(
-                f"INSERT INTO products (paket_id, nama, emoji, deskripsi, harga, link, group_chat_id) "
-                f"VALUES ({sql_str(p['paket_id'])}, {sql_str(p['nama'])}, {sql_str(p['emoji'])}, "
-                f"{sql_str(p['deskripsi'])}, {p['harga']}, {sql_str(p['link'])}, {sql_str(p.get('group_chat_id'))}) "
-                f"ON CONFLICT (paket_id) DO UPDATE SET nama=EXCLUDED.nama, emoji=EXCLUDED.emoji, "
-                f"deskripsi=EXCLUDED.deskripsi, harga=EXCLUDED.harga, link=EXCLUDED.link, group_chat_id=EXCLUDED.group_chat_id;\n"
-            )
-        lines.append("\n-- ORDERS\n")
-        for o in orders:
-            def sql_str(v):
-                return "NULL" if v is None else "'" + str(v).replace("'", "''") + "'"
-            lines.append(
-                f"INSERT INTO orders (user_id, user_name, paket_id, order_id, status, waktu) "
-                f"VALUES ({o['user_id']}, {sql_str(o['user_name'])}, {sql_str(o['paket_id'])}, "
-                f"{sql_str(o['order_id'])}, {sql_str(o['status'])}, {sql_str(o['waktu'])}) "
-                f"ON CONFLICT (order_id) DO NOTHING;\n"
-            )
-        filename = f"export_{now_wib().strftime('%Y%m%d_%H%M%S')}.sql"
-        buf = BytesIO("".join(lines).encode("utf-8"))
+        json_content, n_products, n_orders, n_banned = _generate_json_export()
+        filename = f"export_{now_wib().strftime('%Y%m%d_%H%M%S')}.json"
+        buf = BytesIO(json_content.encode("utf-8"))
         buf.name = filename
         await context.bot.send_document(
             chat_id=ADMIN_ID,
             document=buf,
             filename=filename,
-            caption=f"✅ Export Berhasil — {len(products)} produk, {len(orders)} orders"
+            caption=(
+                f"✅ Export Berhasil\n"
+                f"📦 {n_products} produk | 📋 {n_orders} orders | 🚫 {n_banned} banned\n"
+                f"Kirim file ini ke bot via /import_json untuk restore."
+            )
         )
     except Exception as e:
         await context.bot.send_message(chat_id=ADMIN_ID, text=f"❌ Gagal export: {e}")
@@ -2776,11 +3121,11 @@ async def admpanel_data_export(update: Update, context: ContextTypes.DEFAULT_TYP
 async def admpanel_data_import(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    context.user_data['awaiting_sql_import'] = True
+    context.user_data['awaiting_json_import'] = True
     await query.edit_message_text(
-        "*📥 IMPORT DATA SQL*\n"
+        "*📥 IMPORT DATA JSON*\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "Kirim file `.sql` yang didapat dari Export.\n\n"
+        "Kirim file `.json` yang didapat dari Export.\n\n"
         "⚠️ Data yang sudah ada *tidak akan dihapus*.\n"
         "_Kirim file sekarang..._",
         parse_mode="Markdown",
@@ -2813,9 +3158,7 @@ async def admpanel_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("🚫 Ban User",      callback_data="admpanel_user_ban"),
             InlineKeyboardButton("✅ Unban User",    callback_data="admpanel_user_unban"),
         ],
-        [
-            InlineKeyboardButton("📋 Daftar Ban",    callback_data="admpanel_user_daftar"),
-        ],
+        [InlineKeyboardButton("📋 Daftar Ban",    callback_data="admpanel_user_daftar")],
         [InlineKeyboardButton("← Kembali", callback_data="admpanel_back")],
     ])
     await query.edit_message_text(
@@ -2879,12 +3222,103 @@ async def admpanel_user_daftar(update: Update, context: ContextTypes.DEFAULT_TYP
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("← Kembali", callback_data="admpanel_user")]])
     )
 
+# =================== ADMIN: PENGATURAN (BARU) ===================
+
+async def admpanel_setting(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Menu pengaturan bot — konfigurasi channel notifikasi."""
+    query = update.callback_query
+    await query.answer()
+
+    channel_id = get_setting('notif_channel_id')
+    if channel_id:
+        status_text = f"✅ Aktif\nChannel ID: `{channel_id}`"
+    else:
+        status_text = "🔕 Nonaktif\n_Channel ID belum diset_"
+
+    text = (
+        "*⚙️ PENGATURAN*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "*📢 Channel Notifikasi Order*\n"
+        f"{status_text}\n\n"
+        "_Semua update status order (baru, lunas, batal, expired) akan dikirim ke channel ini._\n\n"
+        "Pastikan bot sudah dijadikan *admin* di channel sebelum set ID\\."
+    )
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✏️ Set Channel ID", callback_data="admpanel_setting_channel_set"),
+            InlineKeyboardButton("🔕 Nonaktifkan",    callback_data="admpanel_setting_channel_off"),
+        ],
+        [InlineKeyboardButton("📨 Test Notifikasi",   callback_data="admpanel_setting_channel_test")],
+        [InlineKeyboardButton("← Kembali",            callback_data="admpanel_back")],
+    ])
+    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+async def admpanel_setting_channel_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin mau ubah channel ID."""
+    query = update.callback_query
+    await query.answer()
+    context.user_data['awaiting_channel_id'] = True
+    await query.edit_message_text(
+        "*✏️ SET CHANNEL ID*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Ketik Channel ID tujuan notifikasi:\n"
+        "Contoh: `-1001234567890`\n\n"
+        "Cara dapat channel ID:\n"
+        "1\\. Forward pesan dari channel ke @userinfobot\n"
+        "2\\. Atau tambahkan @getidsbot ke channel\n\n"
+        "_Ketik `hapus` untuk menonaktifkan channel\\._",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("← Batal", callback_data="admpanel_setting")
+        ]])
+    )
+
+async def admpanel_setting_channel_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Nonaktifkan channel notifikasi."""
+    query = update.callback_query
+    await query.answer()
+    set_setting('notif_channel_id', None)
+    await query.edit_message_text(
+        "🔕 *Channel notifikasi dinonaktifkan.*\n\n"
+        "Notifikasi order tidak akan dikirim ke channel manapun.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("← Kembali ke Pengaturan", callback_data="admpanel_setting")
+        ]])
+    )
+
+async def admpanel_setting_channel_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Kirim pesan test ke channel."""
+    query = update.callback_query
+    await query.answer()
+
+    channel_id = get_setting('notif_channel_id')
+    if not channel_id:
+        await query.answer("❌ Channel ID belum diset!", show_alert=True)
+        return
+
+    try:
+        await context.bot.send_message(
+            chat_id=int(channel_id),
+            text=(
+                f"📨 <b>Test Notifikasi</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"✅ Bot berhasil mengirim pesan ke channel ini.\n"
+                f"Semua update status order akan muncul di sini.\n\n"
+                f"🕐 {now_wib().strftime('%H:%M, %d/%m/%Y')}"
+            ),
+            parse_mode="HTML"
+        )
+        await query.answer("✅ Pesan test berhasil dikirim!", show_alert=True)
+    except Exception as e:
+        await query.answer(f"❌ Gagal: {str(e)[:100]}", show_alert=True)
+
 # =================== ADMIN: BAN / UNBAN ===================
 
 async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id != ADMIN_ID:
         return
-
     args = context.args
     if not args:
         await update.message.reply_text(
@@ -2892,20 +3326,16 @@ async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
         return
-
     try:
         target_id = int(args[0])
     except ValueError:
         await update.message.reply_text("❌ User ID harus berupa angka.")
         return
-
     if target_id == ADMIN_ID:
         await update.message.reply_text("❌ Tidak bisa ban diri sendiri.")
         return
-
     reason = " ".join(args[1:]) if len(args) > 1 else "Tidak ada alasan"
     ban_user(target_id, reason)
-
     await update.message.reply_text(
         f"🚫 *User Berhasil Dibanned*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -2919,7 +3349,6 @@ async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id != ADMIN_ID:
         return
-
     args = context.args
     if not args:
         await update.message.reply_text(
@@ -2927,31 +3356,26 @@ async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
         return
-
     try:
         target_id = int(args[0])
     except ValueError:
         await update.message.reply_text("❌ User ID harus berupa angka.")
         return
-
     if not is_banned(target_id):
         await update.message.reply_text(f"⚠️ User `{target_id}` tidak ada dalam daftar ban.", parse_mode="Markdown")
         return
-
     unban_user(target_id)
     await update.message.reply_text(
         f"✅ *User Berhasil Di-unban*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"👤 User ID: `{target_id}`\n"
-        f"🕐 Waktu: {now_wib().strftime('%H:%M, %d %b %Y')}\n\n"
-        f"_User sudah bisa menggunakan bot kembali._",
+        f"🕐 Waktu: {now_wib().strftime('%H:%M, %d %b %Y')}",
         parse_mode="Markdown"
     )
 
 async def cmd_daftar_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id != ADMIN_ID:
         return
-
     banned = get_all_banned()
     if not banned:
         await update.message.reply_text(
@@ -2961,7 +3385,6 @@ async def cmd_daftar_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
         return
-
     text = f"*🚫 DAFTAR BAN ({len(banned)} user)*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
     for b in banned:
         text += (
@@ -2977,7 +3400,6 @@ async def cmd_daftar_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_cari(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id != ADMIN_ID:
         return
-
     args = context.args
     if not args:
         await update.message.reply_text(
@@ -2997,7 +3419,6 @@ async def cmd_cari(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     paket = get_product(order['paket_id']) or {"emoji": "📦", "nama": order['paket_id'], "harga": 0}
-
     STATUS_LABEL = {
         'completed': '✅ Selesai / Lunas',
         'waiting':   '⏳ Menunggu Bayar',
@@ -3007,7 +3428,6 @@ async def cmd_cari(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'rejected':  '🚫 Ditolak',
     }
     status = STATUS_LABEL.get(order['status'], order['status'])
-
     sent_link = order.get('sent_link')
     link_info = f"🔗 Link Terkirim: {sent_link}" if sent_link else "🔗 Link: _Belum terkirim_"
 
@@ -3017,7 +3437,7 @@ async def cmd_cari(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📝 Order ID: `{order['order_id']}`\n"
         f"👤 Buyer: {esc(order.get('user_name', '-'))} (`{order['user_id']}`)\n"
         f"📦 Paket: {paket['emoji']} {esc(paket['nama'])}\n"
-        f"💰 Harga: {format_harga(paket['harga'])}\n"
+        f"💰 Harga Dibayar: {format_harga(order.get('harga_dibayar') or paket['harga'])}\n"
         f"📊 Status: {status}\n"
         f"🕐 Dibuat: {order.get('waktu', '-')}\n"
         f"{link_info}"
@@ -3028,6 +3448,7 @@ async def cmd_cari(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =================== MAIN ===================
 
 def main():
+    init_pool()
     init_db()
 
     app = (
@@ -3050,7 +3471,7 @@ def main():
     app.add_handler(CommandHandler("blast",      cmd_blast))
     app.add_handler(CommandHandler("backup",     cmd_backup))
     app.add_handler(CommandHandler("export",     cmd_export))
-    app.add_handler(CommandHandler("import_sql", cmd_import_sql))
+    app.add_handler(CommandHandler("import_json", cmd_import_json))
     app.add_handler(CommandHandler("link",       cmd_link))
     app.add_handler(CommandHandler("ban",        cmd_ban))
     app.add_handler(CommandHandler("unban",      cmd_unban))
@@ -3062,8 +3483,8 @@ def main():
     app.add_handler(CallbackQueryHandler(pilih_paket,  pattern="^pilih_"))
     app.add_handler(CallbackQueryHandler(back_start,   pattern="^back_start$"))
 
-    # ⭐ Handler baru: kirim ulang link grup
-    app.add_handler(CallbackQueryHandler(resend_group_link, pattern="^resendlink\|"))
+    # Kirim ulang link
+    app.add_handler(CallbackQueryHandler(resend_group_link, pattern="^resendlink\\|"))
 
     # Produk management callbacks
     app.add_handler(CallbackQueryHandler(produk_detail,        pattern="^pd_detail_"))
@@ -3078,8 +3499,8 @@ def main():
     app.add_handler(CallbackQueryHandler(admin_proses_order,   pattern="^proses_"))
     app.add_handler(CallbackQueryHandler(admin_konfirmasi,     pattern="^(confirm|reject)_"))
     app.add_handler(CallbackQueryHandler(back_orders,          pattern="^back_orders$"))
-    app.add_handler(CallbackQueryHandler(admin_cancel_order,   pattern="^adm_cancel\|"))
-    app.add_handler(CallbackQueryHandler(admin_manual_confirm, pattern="^adm_konfirm\|"))
+    app.add_handler(CallbackQueryHandler(admin_cancel_order,   pattern="^adm_cancel\\|"))
+    app.add_handler(CallbackQueryHandler(admin_manual_confirm, pattern="^adm_konfirm\\|"))
 
     # Admin panel callbacks
     app.add_handler(CallbackQueryHandler(admpanel_back,            pattern="^admpanel_back$"))
@@ -3100,16 +3521,25 @@ def main():
     app.add_handler(CallbackQueryHandler(admpanel_user_unban,      pattern="^admpanel_user_unban$"))
     app.add_handler(CallbackQueryHandler(admpanel_user_daftar,     pattern="^admpanel_user_daftar$"))
 
+    # Pengaturan callbacks (BARU)
+    app.add_handler(CallbackQueryHandler(admpanel_setting,              pattern="^admpanel_setting$"))
+    app.add_handler(CallbackQueryHandler(admpanel_setting_channel_set,  pattern="^admpanel_setting_channel_set$"))
+    app.add_handler(CallbackQueryHandler(admpanel_setting_channel_off,  pattern="^admpanel_setting_channel_off$"))
+    app.add_handler(CallbackQueryHandler(admpanel_setting_channel_test, pattern="^admpanel_setting_channel_test$"))
+
     # Blast callback
     app.add_handler(CallbackQueryHandler(blast_batal, pattern="^blast_batal$"))
 
-    # Admin: terima file .sql untuk import
+    # Auto-approve join request (BARU)
+    app.add_handler(ChatJoinRequestHandler(handle_join_request))
+
+    # Admin: terima file .json untuk import
     app.add_handler(MessageHandler(
         filters.Document.ALL & filters.Chat(ADMIN_ID),
-        handle_sql_document
+        handle_json_document
     ))
 
-    # Admin message handler (untuk state tambah/edit produk)
+    # Admin message handler
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.Chat(ADMIN_ID),
         admin_message_handler

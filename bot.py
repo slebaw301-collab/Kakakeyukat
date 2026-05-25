@@ -645,24 +645,58 @@ async def get_product_link(bot, paket, order_id):
     group_link = await generate_group_link(bot, paket, order_id)
     return group_link or (paket.get("link") or DEFAULT_LINK)
 
-# =================== CHANNEL NOTIFIKASI ===================
+# =================== STATE ADMIN (modul-level, lebih andal dari context.user_data) ===================
 
-async def kirim_notif_channel(bot, text: str):
+# Dipakai untuk state broadcast dan state lain yang perlu persist antar handler
+_admin_awaiting: dict = {}
+
+# =================== MAINTENANCE ===================
+
+def is_maintenance() -> bool:
+    """Cek apakah bot sedang mode maintenance."""
+    return get_setting('maintenance') == '1'
+
+# =================== NOTIFIKASI ORDER (TERPUSAT) ===================
+
+def _format_order_notif(judul: str, user_name: str, user_id: int,
+                         paket: dict, order_id: str,
+                         amount: int = None, extra: str = None) -> str:
     """
-    Kirim notifikasi status order ke channel yang dikonfigurasi admin.
-    Diam saja kalau channel_id belum diset.
+    Satu template seragam untuk semua notifikasi status order.
+    Dipakai di channel maupun admin chat — format identik.
+    """
+    lines = [
+        judul,
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        f"👤 Pembeli  : {html_module.escape(str(user_name))} (<code>{user_id}</code>)",
+        f"📦 Paket    : {paket['emoji']} {html_module.escape(paket['nama'])}",
+    ]
+    if amount is not None:
+        lines.append(f"💰 Total    : {format_harga(amount)}")
+    lines.append(f"📝 Order ID : <code>{order_id}</code>")
+    lines.append(f"🕐 Waktu    : {now_wib().strftime('%H:%M, %d/%m/%Y')}")
+    if extra:
+        lines.append(f"\nℹ️ {extra}")
+    return "\n".join(lines)
+
+async def kirim_notif(bot, text: str):
+    """
+    Kirim notifikasi order:
+    - Channel sudah di-set → kirim ke channel (admin chat bersih)
+    - Channel belum di-set → fallback ke admin chat
+    Kalau channel gagal, otomatis fallback ke admin.
     """
     channel_id = get_setting('notif_channel_id')
-    if not channel_id:
-        return
+    target = int(channel_id) if channel_id else ADMIN_ID
     try:
-        await bot.send_message(
-            chat_id=int(channel_id),
-            text=text,
-            parse_mode="HTML"
-        )
+        await bot.send_message(chat_id=target, text=text, parse_mode="HTML")
     except Exception as e:
-        print(f"[CHANNEL] Gagal kirim notif ke {channel_id}: {e}")
+        print(f"[NOTIF] Gagal kirim ke {target}: {e}")
+        if target != ADMIN_ID:
+            try:
+                await bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="HTML")
+            except Exception:
+                pass
 
 # =================== MAIN MENU ===================
 
@@ -833,6 +867,17 @@ async def post_init(application: Application):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
+    if user_id != ADMIN_ID and is_maintenance():
+        await update.message.reply_text(
+            "🔧 <b>BOT SEDANG MAINTENANCE</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Bot sedang dalam perbaikan sementara.\n"
+            "Silakan coba lagi nanti.\n\n"
+            "Hubungi admin: @Kikukkvd",
+            parse_mode="HTML"
+        )
+        return
+
     if is_banned(user_id):
         await update.message.reply_text(
             "🚫 *Akun kamu diblokir*\n"
@@ -907,6 +952,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
+
+    if user_id != ADMIN_ID and is_maintenance():
+        await query.answer("🔧 Bot sedang maintenance. Coba lagi nanti.", show_alert=True)
+        return
 
     if is_banned(user_id):
         await query.answer("🚫 Akun kamu diblokir. Hubungi admin.", show_alert=True)
@@ -1073,37 +1122,15 @@ async def pilih_paket(update: Update, context: ContextTypes.DEFAULT_TYPE):
     simpan_msg_user(context, user_id, msg.message_id)
     await hapus_msg_user_lama(context, user_id, keep_last=1)
 
-    # Notifikasi admin
-    try:
-        notif_msg = await context.bot.send_message(
-            chat_id=ADMIN_ID,
-            text=(
-                f"🔔 *ORDER BARU MASUK*\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"👤 Pembeli: {esc(user_name)} (`{user_id}`)\n"
-                f"📦 Paket: {paket['emoji']} {esc(paket['nama'])}\n"
-                f"💰 Total: {format_harga(total_payment)}\n"
-                f"📝 Order ID: `{order_id}`\n"
-                f"⏰ Berlaku: {expire} WIB\n"
-                f"🕐 Dibuat: {now_wib().strftime('%H:%M, %d %b %Y')}\n\n"
-                f"⏳ Menunggu pembayaran buyer..."
-            ),
-            parse_mode="Markdown"
-        )
-        set_admin_msg_id(order_id, notif_msg.message_id)
-    except Exception as e:
-        print(f"Gagal notif admin order baru: {e}")
-
-    # Notifikasi channel
-    await kirim_notif_channel(
+    # Notifikasi order baru (ke channel atau admin)
+    await kirim_notif(
         context.bot,
-        f"🔔 <b>ORDER BARU</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"👤 {html_module.escape(user_name)} (<code>{user_id}</code>)\n"
-        f"📦 {paket['emoji']} {html_module.escape(paket['nama'])}\n"
-        f"💰 {format_harga(total_payment)}\n"
-        f"📝 <code>{order_id}</code>\n"
-        f"🕐 {now_wib().strftime('%H:%M, %d/%m/%Y')}"
+        _format_order_notif(
+            "🔔 <b>ORDER BARU MASUK</b>",
+            user_name, user_id, paket, order_id,
+            amount=total_payment,
+            extra=f"⏰ Berlaku: {expire} WIB · ⏳ Menunggu pembayaran"
+        )
     )
 
     try:
@@ -1138,30 +1165,15 @@ async def back_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cancelled_order_id = active["order_id"]
         await hapus_pesan_admin_order(context.bot, cancelled_order_id)
 
-        # Notifikasi channel
-        await kirim_notif_channel(
+        # Notifikasi dibatalkan buyer
+        paket_notif = get_product(active["paket_id"]) or {"emoji": "📦", "nama": active["paket_id"]}
+        await kirim_notif(
             context.bot,
-            f"❌ <b>DIBATALKAN BUYER</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"👤 {html_module.escape(query.from_user.full_name)} (<code>{user_id}</code>)\n"
-            f"📝 <code>{cancelled_order_id}</code>\n"
-            f"🕐 {now_wib().strftime('%H:%M, %d/%m/%Y')}"
-        )
-
-        try:
-            await context.bot.send_message(
-                chat_id=ADMIN_ID,
-                text=(
-                    f"❌ *ORDER DIBATALKAN BUYER*\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    f"👤 {esc(query.from_user.full_name)} (`{user_id}`)\n"
-                    f"📝 Order ID: `{cancelled_order_id}`\n"
-                    f"🕐 {now_wib().strftime('%H:%M, %d %b %Y')}"
-                ),
-                parse_mode="Markdown"
+            _format_order_notif(
+                "❌ <b>DIBATALKAN BUYER</b>",
+                query.from_user.full_name, user_id, paket_notif, cancelled_order_id
             )
-        except Exception:
-            pass
+        )
 
     context.user_data.clear()
 
@@ -1262,31 +1274,15 @@ async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
 
         await hapus_pesan_admin_order(bot, order_id)
 
-        # Notifikasi channel
-        await kirim_notif_channel(
+        paket_exp = get_product(paket_id) or {"emoji": "📦", "nama": paket_id}
+        await kirim_notif(
             bot,
-            f"⏰ <b>ORDER EXPIRED</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"👤 {html_module.escape(user_name)} (<code>{user_id}</code>)\n"
-            f"📝 <code>{order_id}</code>\n"
-            f"🕐 {now_wib().strftime('%H:%M, %d/%m/%Y')}"
-        )
-
-        try:
-            await bot.send_message(
-                chat_id=ADMIN_ID,
-                text=(
-                    f"⏰ *ORDER EXPIRED*\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    f"👤 {esc(user_name)} (`{user_id}`)\n"
-                    f"📝 Order ID: `{order_id}`\n"
-                    f"🕐 {now_wib().strftime('%H:%M, %d %b %Y')}\n\n"
-                    f"_Buyer tidak bayar sampai waktu habis._"
-                ),
-                parse_mode="Markdown"
+            _format_order_notif(
+                "⏰ <b>ORDER EXPIRED</b>",
+                user_name, user_id, paket_exp, order_id,
+                extra="Buyer tidak bayar sampai waktu habis"
             )
-        except Exception:
-            pass
+        )
 
     except asyncio.CancelledError:
         pass
@@ -1345,36 +1341,32 @@ async def _handle_payment_success(bot, order_id: str, paket_id: str, user_id: in
 
     await hapus_pesan_admin_order(bot, order_id)
 
-    # Notifikasi channel
-    await kirim_notif_channel(
+    # Notifikasi pembayaran berhasil
+    extra_paid = "✅ Link produk sudah terkirim ke buyer" if kirim_berhasil else "⚠️ GAGAL kirim link ke buyer — cek manual!"
+    await kirim_notif(
         bot,
-        f"✅ <b>PEMBAYARAN BERHASIL</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"👤 {html_module.escape(user_name)} (<code>{user_id}</code>)\n"
-        f"📦 {paket['emoji']} {html_module.escape(paket['nama'])}\n"
-        f"💰 {format_harga(paid_amount)}\n"
-        f"📝 <code>{order_id}</code>\n"
-        f"🕐 {now_wib().strftime('%H:%M, %d/%m/%Y')}"
+        _format_order_notif(
+            "✅ <b>PEMBAYARAN BERHASIL</b>",
+            user_name, user_id, paket, order_id,
+            amount=paid_amount,
+            extra=extra_paid
+        )
     )
 
-    status_kirim = "✅ Link terkirim ke buyer" if kirim_berhasil else "⚠️ GAGAL kirim link ke buyer!"
-    try:
-        await bot.send_message(
-            chat_id=ADMIN_ID,
-            text=(
-                f"✅ <b>ORDER BERHASIL</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"👤 Pembeli: {html_module.escape(user_name)} (<code>{user_id}</code>)\n"
-                f"📦 Paket: {paket['emoji']} {html_module.escape(paket['nama'])}\n"
-                f"📝 Order ID: <code>{order_id}</code>\n"
-                f"💰 Total: {format_harga(paid_amount)}\n"
-                f"🕐 Lunas: {now_wib().strftime('%H:%M, %d %b %Y')}\n\n"
-                f"{status_kirim}"
-            ),
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        print(f"[PAYMENT] Gagal notif admin: {e}")
+    # Kalau link GAGAL terkirim ke buyer, admin juga dapat alert tambahan
+    if not kirim_berhasil:
+        try:
+            await bot.send_message(
+                chat_id=ADMIN_ID,
+                text=(
+                    f"🚨 <b>ALERT: GAGAL KIRIM LINK</b>\n"
+                    f"Order <code>{order_id}</code> sudah lunas tapi link tidak bisa dikirim ke buyer!\n"
+                    f"Buyer ID: <code>{user_id}</code> — kirim manual segera!"
+                ),
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
 
 # =================== AUTO-APPROVE JOIN REQUEST ===================
 
@@ -1697,15 +1689,13 @@ async def admin_cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
     update_order_status(order_id, 'cancelled')
     _stop_payment_task(target_user_id)
 
-    # Notifikasi channel
-    await kirim_notif_channel(
+    # Notifikasi dibatalkan admin
+    await kirim_notif(
         context.bot,
-        f"❌ <b>DIBATALKAN ADMIN</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"👤 {html_module.escape(order.get('user_name', '-'))} (<code>{target_user_id}</code>)\n"
-        f"📦 {paket['emoji']} {html_module.escape(paket['nama'])}\n"
-        f"📝 <code>{order_id}</code>\n"
-        f"🕐 {now_wib().strftime('%H:%M, %d/%m/%Y')}"
+        _format_order_notif(
+            "❌ <b>DIBATALKAN ADMIN</b>",
+            order.get('user_name', '-'), target_user_id, paket, order_id
+        )
     )
 
     try:
@@ -1806,16 +1796,14 @@ async def admin_manual_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
 
     set_sent_link(order_id, link)
 
-    # Notifikasi channel
-    await kirim_notif_channel(
+    # Notifikasi dikonfirmasi manual
+    await kirim_notif(
         context.bot,
-        f"✅ <b>DIKONFIRMASI MANUAL</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"👤 {html_module.escape(order.get('user_name', '-'))} (<code>{target_user_id}</code>)\n"
-        f"📦 {paket['emoji']} {html_module.escape(paket['nama'])}\n"
-        f"💰 {format_harga(harga)}\n"
-        f"📝 <code>{order_id}</code>\n"
-        f"🕐 {now_wib().strftime('%H:%M, %d/%m/%Y')}"
+        _format_order_notif(
+            "✅ <b>DIKONFIRMASI MANUAL</b>",
+            order.get('user_name', '-'), target_user_id, paket, order_id,
+            amount=harga
+        )
     )
 
     await query.edit_message_text(
@@ -2312,7 +2300,7 @@ async def cmd_blast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Belum ada buyer yang terdaftar.")
         return
 
-    context.user_data['blasting'] = True
+    _admin_awaiting[ADMIN_ID] = 'blasting'
     await update.message.reply_text(
         f"*📢 BROADCAST PESAN*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -2329,7 +2317,7 @@ async def cmd_blast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def blast_batal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    context.user_data.pop('blasting', None)
+    _admin_awaiting.pop(ADMIN_ID, None)
     await query.edit_message_text("✅ Broadcast dibatalkan.")
 
 # =================== ADMIN: MESSAGE HANDLER ===================
@@ -2461,8 +2449,8 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     # --- State: broadcast blast ---
-    if context.user_data.get('blasting'):
-        context.user_data.pop('blasting', None)
+    if _admin_awaiting.get(ADMIN_ID) == 'blasting':
+        _admin_awaiting.pop(ADMIN_ID, None)
         buyers = get_all_buyers()
         jumlah = len(buyers)
 
@@ -2834,15 +2822,13 @@ async def admin_konfirmasi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update_order_status(order["order_id"], 'completed')
         set_sent_link(order["order_id"], link)
 
-        # Notifikasi channel
-        await kirim_notif_channel(
+        # Notifikasi order selesai (konfirmasi manual)
+        await kirim_notif(
             context.bot,
-            f"✅ <b>ORDER SELESAI (MANUAL)</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"👤 {html_module.escape(order['user_name'])} (<code>{user_id}</code>)\n"
-            f"📦 {paket['emoji']} {html_module.escape(paket['nama'])}\n"
-            f"📝 <code>{order['order_id']}</code>\n"
-            f"🕐 {now_wib().strftime('%H:%M, %d/%m/%Y')}"
+            _format_order_notif(
+                "✅ <b>ORDER SELESAI (KONFIRMASI MANUAL)</b>",
+                order['user_name'], user_id, paket, order['order_id']
+            )
         )
 
         await query.edit_message_text(
@@ -3062,7 +3048,7 @@ async def admpanel_blast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Batal", callback_data="blast_batal")]])
     )
-    context.user_data['blasting'] = True
+    _admin_awaiting[ADMIN_ID] = 'blasting'
 
 async def admpanel_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -3225,23 +3211,29 @@ async def admpanel_user_daftar(update: Update, context: ContextTypes.DEFAULT_TYP
 # =================== ADMIN: PENGATURAN (BARU) ===================
 
 async def admpanel_setting(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Menu pengaturan bot — konfigurasi channel notifikasi."""
+    """Menu pengaturan bot — channel notifikasi + maintenance mode."""
     query = update.callback_query
     await query.answer()
 
     channel_id = get_setting('notif_channel_id')
     if channel_id:
-        status_text = f"✅ Aktif\nChannel ID: `{channel_id}`"
+        ch_status = f"✅ Aktif — ID: <code>{html_module.escape(channel_id)}</code>"
     else:
-        status_text = "🔕 Nonaktif\n_Channel ID belum diset_"
+        ch_status = "🔕 Nonaktif — belum diset"
+
+    maint_on = is_maintenance()
+    maint_status = "🔧 ON — bot maintenance" if maint_on else "✅ OFF — bot normal"
+    maint_btn_label = "🟢 Matikan Maintenance" if maint_on else "🔧 Aktifkan Maintenance"
 
     text = (
-        "*⚙️ PENGATURAN*\n"
+        "<b>⚙️ PENGATURAN</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "*📢 Channel Notifikasi Order*\n"
-        f"{status_text}\n\n"
-        "_Semua update status order (baru, lunas, batal, expired) akan dikirim ke channel ini._\n\n"
-        "Pastikan bot sudah dijadikan *admin* di channel sebelum set ID\\."
+        "<b>📢 Channel Notifikasi Order</b>\n"
+        f"{ch_status}\n"
+        "<i>Semua update status order dikirim ke channel. Jika tidak diset, notif ke admin chat.</i>\n\n"
+        "<b>🔧 Maintenance Mode</b>\n"
+        f"{maint_status}\n"
+        "<i>Saat ON, buyer tidak bisa akses bot (kecuali admin).</i>"
     )
 
     keyboard = InlineKeyboardMarkup([
@@ -3250,9 +3242,31 @@ async def admpanel_setting(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("🔕 Nonaktifkan",    callback_data="admpanel_setting_channel_off"),
         ],
         [InlineKeyboardButton("📨 Test Notifikasi",   callback_data="admpanel_setting_channel_test")],
+        [InlineKeyboardButton(maint_btn_label,         callback_data="admpanel_setting_maintenance")],
         [InlineKeyboardButton("← Kembali",            callback_data="admpanel_back")],
     ])
-    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+    await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+async def admpanel_setting_maintenance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggle maintenance mode on/off."""
+    query = update.callback_query
+    await query.answer()
+
+    was_on = is_maintenance()
+    set_setting('maintenance', '0' if was_on else '1')
+
+    if was_on:
+        msg = "✅ <b>Maintenance mode dinonaktifkan.</b>\n\nBot kembali normal — buyer bisa akses."
+    else:
+        msg = "🔧 <b>Maintenance mode diaktifkan.</b>\n\nBuyer tidak bisa akses bot sampai maintenance dimatikan."
+
+    await query.edit_message_text(
+        msg,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("← Kembali ke Pengaturan", callback_data="admpanel_setting")
+        ]])
+    )
 
 async def admpanel_setting_channel_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin mau ubah channel ID."""
@@ -3521,11 +3535,12 @@ def main():
     app.add_handler(CallbackQueryHandler(admpanel_user_unban,      pattern="^admpanel_user_unban$"))
     app.add_handler(CallbackQueryHandler(admpanel_user_daftar,     pattern="^admpanel_user_daftar$"))
 
-    # Pengaturan callbacks (BARU)
+    # Pengaturan callbacks
     app.add_handler(CallbackQueryHandler(admpanel_setting,              pattern="^admpanel_setting$"))
     app.add_handler(CallbackQueryHandler(admpanel_setting_channel_set,  pattern="^admpanel_setting_channel_set$"))
     app.add_handler(CallbackQueryHandler(admpanel_setting_channel_off,  pattern="^admpanel_setting_channel_off$"))
     app.add_handler(CallbackQueryHandler(admpanel_setting_channel_test, pattern="^admpanel_setting_channel_test$"))
+    app.add_handler(CallbackQueryHandler(admpanel_setting_maintenance,  pattern="^admpanel_setting_maintenance$"))
 
     # Blast callback
     app.add_handler(CallbackQueryHandler(blast_batal, pattern="^blast_batal$"))

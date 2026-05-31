@@ -230,7 +230,7 @@ def init_db():
                 ALTER TABLE orders ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
             """)
 
-            # SPESIFIKASI FITUR BARU: Menambahkan skema tabel testimonials untuk sistem ulasan moderasi
+            # REVISI DATABASE: Menambahkan skema tabel testimonials untuk sistem ulasan moderasi
             c.execute("""
                 CREATE TABLE IF NOT EXISTS testimonials (
                     id SERIAL PRIMARY KEY,
@@ -809,76 +809,26 @@ _admin_awaiting: dict = {}
 def is_maintenance() -> bool:
     return get_setting('maintenance') == '1'
 
-# =================== NOTIFIKASI ORDER (HAPUS & KIRIM) ===================
+# =================== NOTIFIKASI ORDER (MUTASI NOTIFIKASI) ===================
 
-def _format_order_notif(judul: str, user_name: str, user_id: int,
-                         paket: dict, order_id: str,
-                         amount: int = None, extra: str = None) -> str:
-    lines = [
-        judul,
-        "━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"👤 Pembeli  : {html_module.escape(str(user_name))} (<code>{user_id}</code>)",
-        f"📦 Paket    : {paket['emoji']} {html_module.escape(paket['nama'])}",
-    ]
-    if amount is not None:
-        lines.append(f"💰 Total    : {format_harga(amount)}")
-    lines.append(f"📝 Order ID : <code>{order_id}</code>")
-    lines.append(f"🕒 Waktu    : {now_wib().strftime('%H:%M, %d/%m/%Y')}")
-    if extra:
-        lines.append(f"\nℹ️ {extra}")
-    return "\n".join(lines)
-
-async def kirim_notif(bot, text: str):
-    """Kirim notifikasi order baru dan kembalikan message_id-nya."""
+async def edit_notif_lama(bot, order_id, new_text, new_reply_markup=None):
+    """REVISI ADMIN CLUTTER: Mengedit pesan notifikasi lama di channel admin untuk mencegah penumpukan chat."""
+    order = get_order_by_id(order_id)
+    if not order or not order.get('admin_msg_id'):
+        return
+    msg_id = order['admin_msg_id']
     channel_id = get_setting('notif_channel_id')
     target = int(channel_id) if channel_id else ADMIN_ID
     try:
-        msg = await bot.send_message(chat_id=target, text=text, parse_mode="HTML")
-        return msg.message_id
+        await bot.edit_message_text(
+            chat_id=target,
+            message_id=int(msg_id),
+            text=new_text,
+            parse_mode="HTML",
+            reply_markup=new_reply_markup
+        )
     except Exception as e:
-        print(f"[NOTIF] Gagal kirim ke {target}: {e}")
-        if target != ADMIN_ID:
-            try:
-                msg = await bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="HTML")
-                return msg.message_id
-            except Exception:
-                pass
-    return None
-
-async def hapus_notif_lama(bot, order_id):
-    """Menghapus pesan notifikasi lama di channel atau chat admin."""
-    order = get_order_by_id(order_id)
-    if not order:
-        return
-    msg_id = order.get('admin_msg_id')
-    if not msg_id:
-        return
-    
-    channel_id = get_setting('notif_channel_id')
-    target = int(channel_id) if channel_id else ADMIN_ID
-    
-    try:
-        await bot.delete_message(chat_id=target, message_id=int(msg_id))
-    except Exception:
-        # Fallback jika target channel berubah, coba hapus di admin chat
-        if target != ADMIN_ID:
-            try:
-                await bot.delete_message(chat_id=ADMIN_ID, message_id=int(msg_id))
-            except Exception:
-                pass
-
-async def hapus_pesan_admin_order(bot, order_id):
-    """Dibungkus menggunakan helper hapus_notif_lama demi kestabilan terpusat."""
-    await hapus_notif_lama(bot, order_id)
-
-async def hapus_qris_buyer_lama(bot, order_id, user_id):
-    """Menghapus gambar QRIS yang sudah tidak digunakan di chat buyer."""
-    order = get_order_by_id(order_id)
-    if order and order.get('buyer_msg_id'):
-        try:
-            await bot.delete_message(chat_id=int(user_id), message_id=int(order['buyer_msg_id']))
-        except Exception:
-            pass
+        print(f"[EDIT_NOTIF] Gagal mengedit pesan lama {msg_id}: {e}")
 
 # =================== MAIN MENU ===================
 
@@ -1042,411 +992,12 @@ async def pakasir_webhook_handler(request: aio_web.Request) -> aio_web.Response:
     print(f"[WEBHOOK] ✅ Webhook sukses diverifikasi & diproses: {order_id}")
     return aio_web.Response(text='ok')
 
-
-# =================== TMA WEB DASHBOARD BACKEND & FRONTEND ===================
-
-async def api_get_stats(request: aio_web.Request) -> aio_web.Response:
-    """Mengembalikan data statistik penjualan, status, dan data grafik lengkap untuk Dashboard."""
-    conn = get_conn()
-    try:
-        with conn.cursor() as c:
-            # 1. Total Semua Waktu (WIB)
-            c.execute("SELECT COALESCE(SUM(harga_dibayar), 0) as total, COUNT(*) as count FROM orders WHERE status='completed'")
-            row_all = c.fetchone()
-            total_revenue = row_all['total']
-            total_orders = row_all['count']
-
-            # 2. Hari Ini (Zone WIB)
-            c.execute("""
-                SELECT COALESCE(SUM(harga_dibayar), 0) as total, COUNT(*) as count 
-                FROM orders 
-                WHERE status='completed' 
-                AND created_at AT TIME ZONE 'Asia/Jakarta' >= CURRENT_DATE
-            """)
-            row_today = c.fetchone()
-            today_revenue = row_today['total']
-            today_orders = row_today['count']
-
-            # 3. Bulan Ini (Zone WIB)
-            c.execute("""
-                SELECT COALESCE(SUM(harga_dibayar), 0) as total, COUNT(*) as count 
-                FROM orders 
-                WHERE status='completed' 
-                AND created_at AT TIME ZONE 'Asia/Jakarta' >= DATE_TRUNC('month', CURRENT_DATE)
-            """)
-            row_month = c.fetchone()
-            month_revenue = row_month['total']
-            month_orders = row_month['count']
-
-            # 4. Status Penghitungan Transaksi
-            c.execute("SELECT COUNT(*) as count FROM orders WHERE status='waiting'")
-            active_waiting = c.fetchone()['count']
-            c.execute("SELECT COUNT(*) as count FROM orders WHERE status='pending'")
-            active_pending = c.fetchone()['count']
-            c.execute("SELECT COUNT(*) as count FROM orders WHERE status='cancelled'")
-            cancelled_count = c.fetchone()['count']
-            c.execute("SELECT COUNT(*) as count FROM orders WHERE status='expired'")
-            expired_count = c.fetchone()['count']
-
-            # 5. Detail Produk Terlaris
-            c.execute("""
-                SELECT o.paket_id, p.nama, p.emoji, COUNT(*) as count, COALESCE(SUM(o.harga_dibayar), 0) as total
-                FROM orders o
-                LEFT JOIN products p ON o.paket_id = p.paket_id
-                WHERE o.status='completed'
-                GROUP BY o.paket_id, p.nama, p.emoji
-                ORDER BY count DESC
-            """)
-            products_breakdown = [dict(r) for r in c.fetchall()]
-
-            # 6. Rata-rata Rating Testimoni yang Disetujui (Approved)
-            c.execute("SELECT COALESCE(AVG(rating), 0) as avg_rating, COUNT(*) as count FROM testimonials WHERE status='approved'")
-            row_testi = c.fetchone()
-            avg_rating = round(float(row_testi['avg_rating']), 1)
-            total_testi = row_testi['count']
-
-            # 7. Mengambil 5 Testimoni Approved Terbaru
-            c.execute("""
-                SELECT user_name, paket_id, rating, review, created_at AT TIME ZONE 'Asia/Jakarta' as created_at
-                FROM testimonials 
-                WHERE status='approved' 
-                ORDER BY id DESC LIMIT 5
-            """)
-            recent_testimonials = []
-            for r in c.fetchall():
-                recent_testimonials.append({
-                    "user_name": samarkan_nama(r['user_name']),
-                    "rating": r['rating'],
-                    "review": r['review'],
-                    "time": r['created_at'].strftime("%H:%M, %d %b")
-                })
-
-            # 8. Grafik Tren Penjualan 7 Hari Terakhir
-            c.execute("""
-                SELECT 
-                    dates.date::date as date, 
-                    COALESCE(SUM(o.harga_dibayar), 0) as total
-                FROM (
-                    SELECT GENERATE_SERIES(CURRENT_DATE - INTERVAL '6 days', CURRENT_DATE, '1 day'::interval)::date as date
-                ) dates
-                LEFT JOIN orders o ON DATE(o.created_at AT TIME ZONE 'Asia/Jakarta') = dates.date AND o.status='completed'
-                GROUP BY dates.date
-                ORDER BY dates.date ASC
-            """)
-            trend_data = [{"date": r['date'].strftime("%d %b"), "total": int(r['total'])} for r in c.fetchall()]
-
-    finally:
-        release_conn(conn)
-
-    return aio_web.json_response({
-        "total_revenue": total_revenue,
-        "total_orders": total_orders,
-        "today_revenue": today_revenue,
-        "today_orders": today_orders,
-        "month_revenue": month_revenue,
-        "month_orders": month_orders,
-        "active_waiting": active_waiting,
-        "active_pending": active_pending,
-        "cancelled_count": cancelled_count,
-        "expired_count": expired_count,
-        "avg_rating": avg_rating,
-        "total_testi": total_testi,
-        "recent_testimonials": recent_testimonials,
-        "trend_data": trend_data,
-        "products_breakdown": products_breakdown
-    })
-
-
-async def dashboard_html_handler(request: aio_web.Request) -> aio_web.Response:
-    """Menyajikan halaman frontend dashboard premium asinkron untuk Telegram Mini App."""
-    html_content = """
-    <!DOCTYPE html>
-    <html lang="id">
-    <head>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-        <title>Dashboard Admin - Hyper Family</title>
-        <!-- Tailwind CSS v4 & ApexCharts untuk visualisasi data interaktif -->
-        <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
-        <script src="https://cdn.jsdelivr.net/npm/apexcharts"></script>
-        <!-- Telegram WebApp SDK -->
-        <script src="https://telegram.org/js/telegram-web-app.js"></script>
-        <style>
-            body {
-                background-color: #0b1426; /* Dark Navy Theme */
-                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-            }
-        </style>
-    </head>
-    <body class="text-slate-100 min-h-screen pb-10">
-        <div class="max-w-md mx-auto px-4 py-4">
-            
-            <!-- Header -->
-            <div class="flex items-center justify-between mb-6">
-                <div>
-                    <h1 class="text-lg font-bold tracking-tight">HYPER FAMILY STORE</h1>
-                    <p class="text-xs text-slate-400">Live Dashboard & Analytics</p>
-                </div>
-                <span class="inline-flex items-center rounded-md bg-emerald-500/10 px-2 py-1 text-xs font-medium text-emerald-400 ring-1 ring-inset ring-emerald-500/20 animate-pulse">
-                    Live Sync
-                </span>
-            </div>
-
-            <!-- METRIK UTAMA GRID -->
-            <div class="grid grid-cols-2 gap-3 mb-4">
-                <div class="bg-slate-900 border border-slate-800/80 rounded-2xl p-4 shadow-md backdrop-blur-md">
-                    <p class="text-[10px] text-slate-400 font-semibold tracking-wider uppercase">Hari Ini</p>
-                    <p id="today_revenue" class="text-base font-extrabold text-white mt-1">Rp 0</p>
-                    <p id="today_orders" class="text-[10px] text-emerald-400 mt-1">0 Transaksi</p>
-                </div>
-                <div class="bg-slate-900 border border-slate-800/80 rounded-2xl p-4 shadow-md backdrop-blur-md">
-                    <p class="text-[10px] text-slate-400 font-semibold tracking-wider uppercase">Bulan Ini</p>
-                    <p id="month_revenue" class="text-base font-extrabold text-white mt-1">Rp 0</p>
-                    <p id="month_orders" class="text-[10px] text-emerald-400 mt-1">0 Transaksi</p>
-                </div>
-            </div>
-
-            <!-- ALL TIME VALUE & RATING -->
-            <div class="bg-slate-900 border border-slate-800/80 rounded-2xl p-4 mb-4 shadow-md backdrop-blur-md flex items-center justify-between">
-                <div>
-                    <p class="text-[10px] text-slate-400 font-semibold tracking-wider uppercase">Total Omset Penjualan</p>
-                    <p id="total_revenue" class="text-lg font-black text-indigo-400 mt-1">Rp 0</p>
-                </div>
-                <div class="text-right">
-                    <p class="text-[10px] text-slate-400 font-semibold tracking-wider uppercase">Kepuasan Pembeli</p>
-                    <p id="rating_box" class="text-base font-bold text-yellow-400 mt-1">⭐ 0.0 (0)</p>
-                </div>
-            </div>
-
-            <!-- GRAFIK TREN PENJUALAN 7 HARI (AREA CHART) -->
-            <div class="bg-slate-900 border border-slate-800/80 rounded-2xl p-4 mb-4 shadow-md">
-                <h3 class="text-xs font-bold text-slate-400 tracking-wider uppercase mb-3">Tren Penjualan 7 Hari Terakhir</h3>
-                <div id="chart_trend"></div>
-            </div>
-
-            <!-- GRAFIK STATUS ORDER (DONUT CHART) -->
-            <div class="bg-slate-900 border border-slate-800/80 rounded-2xl p-4 mb-4 shadow-md">
-                <h3 class="text-xs font-bold text-slate-400 tracking-wider uppercase mb-3">Distribusi Status Transaksi</h3>
-                <div id="chart_status"></div>
-            </div>
-
-            <!-- GRAFIK OMSET PER PRODUK (BAR CHART) -->
-            <div class="bg-slate-900 border border-slate-800/80 rounded-2xl p-4 mb-4 shadow-md">
-                <h3 class="text-xs font-bold text-slate-400 tracking-wider uppercase mb-3">Grafik Omset Produk</h3>
-                <div id="chart_products"></div>
-            </div>
-
-            <!-- DETAIL PRODUK TERLARIS -->
-            <div class="bg-slate-900 border border-slate-800/80 rounded-2xl p-4 mb-4">
-                <h3 class="text-xs font-bold text-slate-400 tracking-wider uppercase mb-3">Detail Produk Terlaris</h3>
-                <div id="products_list" class="space-y-3">
-                    <!-- Dinamis via JS -->
-                </div>
-            </div>
-
-            <!-- TESTIMONI TERBARU FEED -->
-            <div class="bg-slate-900 border border-slate-800/80 rounded-2xl p-4">
-                <h3 class="text-xs font-bold text-slate-400 tracking-wider uppercase mb-3">Ulasan Pembeli Terbaru</h3>
-                <div id="testimonials_list" class="space-y-3 max-h-60 overflow-y-auto">
-                    <!-- Dinamis via JS -->
-                </div>
-            </div>
-
-        </div>
-
-        <script>
-            // Integrasi Telegram WebApp SDK
-            const tg = window.Telegram.WebApp;
-            tg.expand();
-
-            const formatRupiah = (val) => {
-                return "Rp " + parseInt(val).toLocaleString('id-ID');
-            };
-
-            // Fetch Data dari API
-            fetch('/api/stats')
-                .then(res => res.json())
-                .then(data => {
-                    // Update Text Card
-                    document.getElementById('today_revenue').innerText = formatRupiah(data.today_revenue);
-                    document.getElementById('today_orders').innerText = data.today_orders + " Transaksi";
-                    document.getElementById('month_revenue').innerText = formatRupiah(data.month_revenue);
-                    document.getElementById('month_orders').innerText = data.month_orders + " Transaksi";
-                    document.getElementById('total_revenue').innerText = formatRupiah(data.total_revenue);
-                    document.getElementById('total_orders').innerText = data.total_orders;
-                    document.getElementById('rating_box').innerText = "⭐ " + data.avg_rating + " (" + data.total_testi + ")";
-
-                    // 1. render area chart tren penjualan 7 hari
-                    const optionsTrend = {
-                        series: [{
-                            name: 'Omset',
-                            data: data.trend_data.map(t => t.total)
-                        }],
-                        chart: {
-                            type: 'area',
-                            height: 180,
-                            toolbar: { show: false },
-                            foreColor: '#94a3b8'
-                        },
-                        colors: ['#6366f1'],
-                        stroke: { curve: 'smooth', width: 2 },
-                        fill: {
-                            type: 'gradient',
-                            gradient: {
-                                shadeIntensity: 1,
-                                opacityFrom: 0.45,
-                                opacityTo: 0.05,
-                                stops: [0, 100]
-                            }
-                        },
-                        dataLabels: { enabled: false },
-                        xaxis: {
-                            categories: data.trend_data.map(t => t.date)
-                        },
-                        yaxis: {
-                            labels: {
-                                formatter: function(val) {
-                                    return "Rp " + parseInt(val).toLocaleString('id-ID');
-                                }
-                            }
-                        },
-                        tooltip: {
-                            theme: 'dark',
-                            y: {
-                                formatter: function(val) {
-                                    return formatRupiah(val);
-                                }
-                            }
-                        }
-                    };
-                    const chartTrend = new ApexCharts(document.querySelector("#chart_trend"), optionsTrend);
-                    chartTrend.render();
-
-                    // 2. render donut chart status transaksi
-                    const optionsStatus = {
-                        series: [data.total_orders, data.active_waiting, data.active_pending, data.cancelled_count, data.expired_count],
-                        chart: {
-                            type: 'donut',
-                            height: 220,
-                            foreColor: '#94a3b8'
-                        },
-                        labels: ['Lunas', 'Menunggu', 'Diproses', 'Batal', 'Expired'],
-                        colors: ['#10b981', '#f59e0b', '#3b82f6', '#ef4444', '#64748b'],
-                        legend: { position: 'bottom' },
-                        dataLabels: { enabled: false },
-                        stroke: { show: false }
-                    };
-                    const chartStatus = new ApexCharts(document.querySelector("#chart_status"), optionsStatus);
-                    chartStatus.render();
-
-                    // 3. render products breakdown bar chart
-                    const productLabels = data.products_breakdown.map(p => (p.emoji || '📦') + " " + (p.nama || p.paket_id));
-                    const productSales = data.products_breakdown.map(p => p.total);
-                    
-                    if (productSales.length > 0) {
-                        const optionsProducts = {
-                            series: [{
-                                name: 'Omset',
-                                data: productSales
-                            }],
-                            chart: {
-                                type: 'bar',
-                                height: 220,
-                                toolbar: { show: false },
-                                foreColor: '#94a3b8'
-                            },
-                            plotOptions: {
-                                bar: {
-                                    horizontal: true,
-                                    borderRadius: 4,
-                                }
-                            },
-                            colors: ['#6366f1'],
-                            dataLabels: { enabled: false },
-                            xaxis: {
-                                categories: productLabels,
-                                labels: {
-                                    formatter: function(val) {
-                                        return "Rp " + parseInt(val).toLocaleString('id-ID');
-                                    }
-                                }
-                            },
-                            tooltip: {
-                                theme: 'dark',
-                                y: {
-                                    formatter: function(val) {
-                                        return formatRupiah(val);
-                                    }
-                                }
-                            }
-                        };
-                        const chartProducts = new ApexCharts(document.querySelector("#chart_products"), optionsProducts);
-                        chartProducts.render();
-                    } else {
-                        document.querySelector("#chart_products").innerHTML = '<p class="text-xs text-slate-500 italic text-center py-10">Belum ada penjualan produk.</p>';
-                    }
-
-                    // 4. render list produk terlaris
-                    const listContainer = document.getElementById('products_list');
-                    if (data.products_breakdown.length === 0) {
-                        listContainer.innerHTML = '<p class="text-xs text-slate-500 italic text-center py-4">Belum ada penjualan produk.</p>';
-                    } else {
-                        data.products_breakdown.forEach((p) => {
-                            const row = document.createElement('div');
-                            row.className = "flex items-center justify-between border-b border-slate-800/50 pb-2 last:border-none last:pb-0";
-                            row.innerHTML = `
-                                <div class="flex items-center gap-3">
-                                    <span class="text-lg">${p.emoji || '📦'}</span>
-                                    <div>
-                                        <p class="text-xs font-semibold text-white">${p.nama || p.paket_id}</p>
-                                        <p class="text-[9px] text-slate-400">${p.count}x Terjual</p>
-                                    </div>
-                                </div>
-                                <span class="text-xs font-bold text-indigo-400">${formatRupiah(p.total)}</span>
-                            `;
-                            listContainer.appendChild(row);
-                        });
-                    }
-
-                    // 5. render list testimoni terbaru
-                    const testiContainer = document.getElementById('testimonials_list');
-                    if (data.recent_testimonials.length === 0) {
-                        testiContainer.innerHTML = '<p class="text-xs text-slate-500 italic text-center py-4">Belum ada ulasan pembeli.</p>';
-                    } else {
-                        data.recent_testimonials.forEach((t) => {
-                            const row = document.createElement('div');
-                            row.className = "bg-slate-950/60 p-3 rounded-xl border border-slate-800/40";
-                            row.innerHTML = `
-                                <div class="flex items-center justify-between mb-1">
-                                    <p class="text-[10px] font-bold text-white">${t.user_name}</p>
-                                    <span class="text-[9px] text-slate-500">${t.time}</span>
-                                </div>
-                                <div class="text-yellow-400 text-[10px] mb-1">${"★".repeat(t.rating)}</div>
-                                <p class="text-[11px] text-slate-300 italic">"${t.review}"</p>
-                            `;
-                            testiContainer.appendChild(row);
-                        });
-                    }
-                })
-                .catch(err => console.error("Gagal mengambil data statistik:", err));
-        </script>
-    </body>
-    </html>
-    """
-    return aio_web.Response(text=html_content, content_type='text/html')
-
-# ============================================================================
-
+# =================== SERVER KONEKSI WEB (HEALTH CHECK ONLY) ===================
 
 async def _start_webhook_server():
-    """Jalankan aiohttp server untuk menerima webhook Pakasir dan health check Railway."""
+    """Jalankan aiohttp server minimal untuk menerima webhook Pakasir dan port binding Railway."""
     webhook_app = aio_web.Application()
     webhook_app.router.add_post('/webhook/pakasir', pakasir_webhook_handler)
-    
-    # REVISI ROUTING WEB: Mendaftarkan halaman dashboard dan endpoint statistik
-    webhook_app.router.add_get('/dashboard', dashboard_html_handler)
-    webhook_app.router.add_get('/api/stats', api_get_stats)
-
     webhook_app.router.add_get('/health', lambda r: aio_web.Response(text='ok'))
     webhook_app.router.add_get('/', lambda r: aio_web.Response(text='Hyper Family Store Bot — OK'))
 
@@ -1455,7 +1006,7 @@ async def _start_webhook_server():
     port = int(os.environ.get('PORT', 8080))
     site = aio_web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
-    print(f"[WEBHOOK] Server berjalan di port {port} — siap terima webhook & TMA Dashboard")
+    print(f"[WEBHOOK] Server berjalan di port {port} — siap terima webhook Pakasir")
 
 
 # =================== POST INIT ===================
@@ -1551,23 +1102,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             link = await kirim_link_ke_buyer(context, user_id, paket, active["order_id"], paid_amount)
 
             set_sent_link(active['order_id'], link)
-            await hapus_pesan_admin_order(context.bot, active['order_id'])
             
-            # Notifikasi Lunas (Hapus notifikasi masuk, kirim notifikasi berhasil baru)
-            await hapus_notif_lama(context.bot, active['order_id'])
-            msg_id = await kirim_notif(
-                context.bot,
-                f"✅ <b>ORDER BERHASIL</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"👤 Pembeli: {html_module.escape(active.get('user_name', 'User'))} (<code>{user_id}</code>)\n"
-                f"📦 Paket: {paket['emoji']} {html_module.escape(paket['nama'])}\n"
-                f"📝 Order ID: <code>{active['order_id']}</code>\n"
-                f"💰 Total: {format_harga(paid_amount)}\n"
-                f"🕒 Lunas: {now_wib().strftime('%H:%M, %d %b %Y')}\n\n"
-                f"✅ Link terkirim ke buyer"
+            # REVISI CLUTTER ADMIN CHAT: Edit notifikasi order baru lama
+            await edit_notif_lama(
+                context.bot, active['order_id'],
+                _format_order_notif(
+                    "✅ <b>PEMBAYARAN BERHASIL</b>",
+                    active.get('user_name', 'User'), user_id, paket, active['order_id'],
+                    amount=paid_amount,
+                    extra="✅ Link produk otomatis terkirim ke buyer"
+                )
             )
-            if msg_id:
-                set_admin_msg_id(active['order_id'], msg_id)
             return
 
         total = (trans.get("amount", paket["harga"]) + trans.get("fee", 0)) if trans else paket["harga"]
@@ -1813,24 +1358,17 @@ async def back_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # REVISI CHAT CLEANUP: Hapus foto QRIS lama jika dibatalkan pembeli
         await hapus_qris_buyer_lama(context.bot, active["order_id"], user_id)
 
-        set_cooldown_db(user_id)
-
-        cancelled_order_id = active["order_id"]
-        
-        # Hapus pesan notifikasi lama di channel/admin
-        await hapus_notif_lama(context.bot, cancelled_order_id)
-
-        # Kirim notifikasi dibatalkan oleh buyer
+        # REVISI CLUTTER ADMIN CHAT: Edit notifikasi menjadi Dibatalkan Buyer
         paket_notif = get_product(active["paket_id"]) or {"emoji": "📦", "nama": active["paket_id"]}
-        msg_id = await kirim_notif(
-            context.bot,
+        await edit_notif_lama(
+            context.bot, active["order_id"],
             _format_order_notif(
                 "❌ <b>DIBATALKAN BUYER</b>",
-                query.from_user.full_name, user_id, paket_notif, cancelled_order_id
+                query.from_user.full_name, user_id, paket_notif, active["order_id"]
             )
         )
-        if msg_id:
-            set_admin_msg_id(cancelled_order_id, msg_id)
+
+        set_cooldown_db(user_id)
 
     context.user_data.clear()
 
@@ -1917,6 +1455,17 @@ async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
         # REVISI CHAT CLEANUP: Hapus QRIS di buyer jika kedaluwarsa (expired)
         await hapus_qris_buyer_lama(bot, order_id, user_id)
 
+        # REVISI CLUTTER ADMIN CHAT: Edit notifikasi lama menjadi Expired
+        paket_exp = get_product(paket_id) or {"emoji": "📦", "nama": paket_id}
+        await edit_notif_lama(
+            bot, order_id,
+            _format_order_notif(
+                "⏰ <b>ORDER EXPIRED</b>",
+                user_name, user_id, paket_exp, order_id,
+                extra="Buyer tidak bayar sampai waktu habis"
+            )
+        )
+
         try:
             await bot.send_message(
                 chat_id=user_id,
@@ -1931,21 +1480,6 @@ async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
             )
         except Exception:
             pass
-
-        # Hapus pesan notifikasi lama di channel/admin
-        await hapus_notif_lama(bot, order_id)
-
-        paket_exp = get_product(paket_id) or {"emoji": "📦", "nama": paket_id}
-        msg_id = await kirim_notif(
-            bot,
-            _format_order_notif(
-                "⏰ <b>ORDER EXPIRED</b>",
-                user_name, user_id, paket_exp, order_id,
-                extra="Buyer tidak bayar sampai waktu habis"
-            )
-        )
-        if msg_id:
-            set_admin_msg_id(order_id, msg_id)
 
     except asyncio.CancelledError:
         pass
@@ -2009,13 +1543,10 @@ async def _handle_payment_success(bot, order_id: str, paket_id: str, user_id: in
 
     set_sent_link(order_id, link)
 
-    # Hapus pesan notifikasi lama di channel/admin sebelum kirim yang baru
-    await hapus_notif_lama(bot, order_id)
-
-    # Notifikasi pembayaran berhasil
+    # REVISI CLUTTER ADMIN CHAT: Edit notifikasi lama menjadi Sukses Lunas
     extra_paid = "✅ Link produk sudah terkirim ke buyer" if kirim_berhasil else "⚠️ GAGAL kirim link ke buyer — cek manual!"
-    msg_id = await kirim_notif(
-        bot,
+    await edit_notif_lama(
+        bot, order_id,
         _format_order_notif(
             "✅ <b>PEMBAYARAN BERHASIL</b>",
             user_name, user_id, paket, order_id,
@@ -2023,8 +1554,6 @@ async def _handle_payment_success(bot, order_id: str, paket_id: str, user_id: in
             extra=extra_paid
         )
     )
-    if msg_id:
-        set_admin_msg_id(order_id, msg_id)
 
     if not kirim_berhasil:
         try:
@@ -2086,7 +1615,6 @@ async def handle_rate_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     order_id = query.data.split("|")[1]
     
-    # 5 Pilihan Bintang
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("⭐ 1", callback_data=f"rate_val|1|{order_id}"),
@@ -2108,7 +1636,7 @@ async def handle_rate_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def handle_rate_val(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Menyimpan nilai rating bintang sementara dan meminta teks ulasan."""
+    """Menyimpan nilai rating bintang sementara dan meminta ulasan teks."""
     query = update.callback_query
     await query.answer()
     
@@ -2129,7 +1657,7 @@ async def handle_rate_val(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(
         f"Anda memilih rating: {'⭐' * rating}\n\n"
         "Silakan ketik dan kirimkan ulasan singkat Anda (teks biasa).\n"
-        "Atau tekan tombol di bawah jika tidak ingin menulis teks:",
+        "Atau tekan tombol di bawah jika tidak ingin menulis ulasan:",
         reply_markup=keyboard
     )
 
@@ -2157,7 +1685,6 @@ async def handle_rate_text_skip(update: Update, context: ContextTypes.DEFAULT_TY
     paket_nama = paket['nama'] if paket else "Produk"
     paket_emoji = paket['emoji'] if paket else "📦"
     
-    # Kirim ke admin untuk moderasi
     moderation_text = (
         f"📩 <b>MODERASI TESTIMONI BARU</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -2184,7 +1711,6 @@ async def handle_rate_text_skip(update: Update, context: ContextTypes.DEFAULT_TY
     await query.edit_message_text("🙏 Terima kasih banyak! Penilaian Anda telah dikirim dan menunggu peninjauan admin.")
 
 async def handle_rate_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Menangani jika pembeli menolak mengisi ulasan."""
     query = update.callback_query
     await query.answer()
     context.user_data.pop('temp_rating', None)
@@ -2216,23 +1742,23 @@ async def admin_testi_approve(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
         
-    # Sensor/Samarkan Nama Buyer sebelum dipublish
+    # REVISI PRIVASI: Sensor/Samarkan Nama Buyer sebelum dipublish
     nama_sensor = samarkan_nama(testi['user_name'])
     order = get_order_by_id(order_id)
     paket = get_product(order['paket_id']) if order else None
     paket_nama = paket['nama'] if paket else "Produk"
     paket_emoji = paket['emoji'] if paket else "📦"
     
-    # Format pesan publikasi channel testimoni
+    # REVISI ESTETIKA: Menggunakan format modern Opsi A dengan header "TESTIMONI PELANGGAN"
     channel_msg = (
-        f"<b>💬 TESTIMONI TERVERIFIKASI</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📦 Paket: <b>{paket_emoji} {html_module.escape(paket_nama)}</b>\n"
-        f"👤 Buyer: {html_module.escape(nama_sensor)}\n"
-        f"📊 Rating: {'⭐' * testi['rating']}\n\n"
-        f"📝 <i>\"{html_module.escape(testi['review'])}\"</i>\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🛒 Belanja aman otomatis 24 jam di: @{context.bot.username}"
+        f"✨ <b>TESTIMONI PELANGGAN</b>\n"
+        f"───────────────────\n"
+        f"📦 <b>Paket:</b> {paket_emoji} {html_module.escape(paket_nama)}\n"
+        f"👤 <b>Buyer:</b> {html_module.escape(nama_sensor)}\n"
+        f"⭐ <b>Rating:</b> {'⭐' * testi['rating']}\n\n"
+        f"💬 <i>\"{html_module.escape(testi['review'])}\"</i>\n"
+        f"───────────────────\n"
+        f"⚡ Transaksi otomatis 24 jam: @{context.bot.username}"
     )
     
     try:
@@ -2247,7 +1773,6 @@ async def admin_testi_approve(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
 
 async def admin_testi_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin menolak ulasan pembeli."""
     query = update.callback_query
     await query.answer()
     
@@ -2538,19 +2063,14 @@ async def admin_cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # REVISI CHAT CLEANUP: Hapus pesan QRIS lama yang dicancel oleh admin
     await hapus_qris_buyer_lama(context.bot, order_id, target_user_id)
 
-    # Hapus pesan notifikasi lama di channel/admin
-    await hapus_notif_lama(context.bot, order_id)
-
-    # Kirim notifikasi dibatalkan oleh admin baru
-    msg_id = await kirim_notif(
-        context.bot,
+    # REVISI CLUTTER ADMIN CHAT: Edit notifikasi lama menjadi Dibatalkan Admin
+    await edit_notif_lama(
+        context.bot, order_id,
         _format_order_notif(
             "❌ <b>DIBATALKAN ADMIN</b>",
             order.get('user_name', '-'), target_user_id, paket, order_id
         )
     )
-    if msg_id:
-        set_admin_msg_id(order_id, msg_id)
 
     try:
         await context.bot.send_message(
@@ -2644,29 +2164,28 @@ async def admin_manual_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
                 f"└ Total: {format_harga(harga)}\n\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"{link_section}\n\n"
-                f"Terima kasih telah berbelanja! 🙏"
+                f"Terima kasih telah berbelanja! 🙏\n\n"
+                f"Bantu kami berkembang dengan memberikan ulasan di bawah ini:"
             ),
-            parse_mode="HTML"
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⭐ Beri Ulasan / Testimoni", callback_data=f"rate_start|{order_id}")]
+            ])
         )
     except Exception as e:
         print(f"[KONFIRMASI MANUAL] Gagal kirim link ke buyer {target_user_id}: {e}")
 
     set_sent_link(order_id, link)
 
-    # Hapus pesan notifikasi lama di channel/admin
-    await hapus_notif_lama(context.bot, order_id)
-
-    # Kirim notifikasi baru lunas (dikonfirmasi manual)
-    msg_id = await kirim_notif(
-        context.bot,
+    # REVISI CLUTTER ADMIN CHAT: Edit notifikasi lama menjadi Dikonfirmasi Manual
+    await edit_notif_lama(
+        context.bot, order_id,
         _format_order_notif(
             "✅ <b>DIKONFIRMASI MANUAL</b>",
             order.get('user_name', '-'), target_user_id, paket, order_id,
             amount=harga
         )
     )
-    if msg_id:
-        set_admin_msg_id(order_id, msg_id)
 
     await query.edit_message_text(
         f"✅ *Pembayaran dikonfirmasi manual*\n\n"
@@ -2677,33 +2196,84 @@ async def admin_manual_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
         parse_mode="Markdown"
     )
 
-# =================== ADMIN: STATISTIK ===================
+# =================== ADMIN: STATISTIK TOKO ===================
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Menampilkan pesan laporan statistik keuangan & ulasan paling lengkap di Telegram."""
     if not is_admin(update.message.from_user.id):
         return
 
     s = get_order_stats()
+    
+    # Ambil data performa & ulasan tambahan dari database
+    conn = get_conn()
+    try:
+        with conn.cursor() as c:
+            # 1. Kepuasan Pembeli (Bintang Testimoni Approved)
+            c.execute("SELECT COALESCE(AVG(rating), 0) as avg_rating, COUNT(*) as count FROM testimonials WHERE status='approved'")
+            row_testi = c.fetchone()
+            avg_rating = round(float(row_testi['avg_rating']), 1)
+            total_testi = row_testi['count']
+            
+            # 2. Ambil 3 Testimoni Approved Terbaru
+            c.execute("""
+                SELECT user_name, paket_id, rating, review 
+                FROM testimonials 
+                WHERE status='approved' 
+                ORDER BY id DESC LIMIT 3
+            """)
+            testi_rows = c.fetchall()
+            
+            # 3. Omset Detail per Paket Produk
+            c.execute("""
+                SELECT o.paket_id, p.nama, p.emoji, COUNT(*) as count, COALESCE(SUM(o.harga_dibayar), 0) as total
+                FROM orders o
+                LEFT JOIN products p ON o.paket_id = p.paket_id
+                WHERE o.status='completed'
+                GROUP BY o.paket_id, p.nama, p.emoji
+                ORDER BY count DESC
+            """)
+            products_breakdown = c.fetchall()
+    finally:
+        release_conn(conn)
+    
+    # Format pesan ringkasan teks statistik lengkap
     text = (
-        f"*📊 STATISTIK PENJUALAN*\n"
+        f"<b>📊 LIVE STATISTIK TOKO</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📅 *Hari Ini*\n"
-        f"├ Order Selesai: {s['today_orders']}\n"
-        f"└ Omzet: {format_harga(s['today_revenue'])}\n\n"
-        f"📅 *Bulan Ini*\n"
-        f"├ Order Selesai: {s['month_orders']}\n"
-        f"└ Omzet: {format_harga(s['month_revenue'])}\n\n"
-        f"🏆 *All Time*\n"
-        f"├ Total Order Selesai: {s['total_orders']}\n"
-        f"├ Total Dibatalkan: {s['cancelled_count']}\n"
-        f"├ Order Selesai Sekarang: {s['active_count']}\n"
-        f"└ Total Omzet: {format_harga(s['total_revenue'])}\n\n"
+        f"<b>📅 HARI INI</b>\n"
+        f"├ Omset: <b>{format_harga(s['today_revenue'])}</b>\n"
+        f"└ Selesai: {s['today_orders']} transaksi\n\n"
+        f"<b>📅 BULAN INI</b>\n"
+        f"├ Omset: <b>{format_harga(s['month_revenue'])}</b>\n"
+        f"└ Selesai: {s['month_orders']} transaksi\n\n"
+        f"<b>🏆 SEMUA WAKTU (ALL-TIME)</b>\n"
+        f"├ Total Omset: <b>{format_harga(s['total_revenue'])}</b>\n"
+        f"├ Total Selesai: {s['total_orders']} order\n"
+        f"├ Sedang Menunggu: {s['active_count']} order\n"
+        f"└ Total Batal/Expired: {s['cancelled_count']} order\n\n"
+        f"<b>⭐ KEPUASAN BUYER (TESTIMONI)</b>\n"
+        f"├ Rating Toko: <b>⭐ {avg_rating} / 5.0</b>\n"
+        f"└ Total Testimoni: {total_testi} ulasan approved\n\n"
     )
-    if s['best_product']:
-        text += f"🥇 *Produk Terlaris:* {esc(s['best_product'])}\n\n"
-    text += f"_Update: {now_wib().strftime('%H:%M, %d/%m/%Y')}_"
-
-    await update.message.reply_text(text, parse_mode="Markdown")
+    
+    if products_breakdown:
+        text += "<b>📦 PERFORMA PRODUK:</b>\n"
+        for p in products_breakdown:
+            text += f"├ {p['emoji']} {p['nama'] or p['paket_id']}: {p['count']}x terjual ({format_harga(p['total'])})\n"
+        text += "\n"
+        
+    if testi_rows:
+        text += "<b>💬 3 TESTIMONI TERBARU:</b>\n"
+        for t in testi_rows:
+            masked = samarkan_nama(t['user_name'])
+            stars = "⭐" * t['rating']
+            text += f"├ 👤 {masked} - {stars}\n└ <i>\"{t['review']}\"</i>\n"
+        text += "\n"
+        
+    text += f"<i>Last Update: {now_wib().strftime('%H:%M — %d/%m/%Y')} WIB</i>"
+    
+    await update.message.reply_text(text, parse_mode="HTML")
 
 # =================== USER: RIWAYAT ORDER ===================
 
@@ -3156,15 +2726,14 @@ async def cmd_blast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     _admin_awaiting[_requester_id] = 'blasting'
     await update.message.reply_text(
-        f"*📢 BROADCAST PESAN*\n"
+        f"📢 *BROADCAST PESAN BARU*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"Total penerima: *{jumlah} buyer*\n\n"
-        f"Kirim pesan yang mau di-blast sekarang.\n"
-        f"_Mendukung teks biasa, bold, italic (format Markdown)._\n\n"
-        f"⚠️ Pesan akan langsung dikirim ke semua buyer.",
+        f"Total Penerima: *{jumlah} buyer*\n\n"
+        f"Kirimkan pesan broadcast Anda (Mendukung teks terformat HTML, gambar, video, dan dokumen).\n\n"
+        f"⚠️ Pesan yang Anda kirim akan langsung disebarkan otomatis ke seluruh buyer.",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("❌ Batal", callback_data="blast_batal")]
+            [InlineKeyboardButton("❌ Batalkan", callback_data="blast_batal")]
         ])
     )
 
@@ -3184,6 +2753,21 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     user_id = update.message.from_user.id
     text = update.message.text.strip() if update.message.text else ""
+
+    # REVISI BUG BROADCAST: Cegah perangkap perintah (command escape) jika admin tidak sengaja mengetik command saat mode blasting/state aktif
+    if text.startswith("/"):
+        _admin_awaiting.pop(user_id, None)
+        context.user_data.pop('awaiting_cari', None)
+        context.user_data.pop('awaiting_ban', None)
+        context.user_data.pop('awaiting_unban', None)
+        context.user_data.pop('awaiting_channel_id', None)
+        context.user_data.pop('awaiting_testi_channel_id', None)
+        context.user_data.pop('awaiting_add_admin', None)
+        context.user_data.pop('awaiting_link_testi', None)
+        context.user_data.pop('awaiting_link_admin', None)
+        context.user_data.pop('adding_product', None)
+        context.user_data.pop('editing_product', None)
+        return
 
     # --- STATE: BUYER MENGETIK TESTIMONI ---
     if context.user_data.get('awaiting_review_text'):
@@ -3230,6 +2814,62 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             print(f"Gagal mengirim notif moderasi ke admin: {e}")
             
         await update.message.reply_text("🙏 Terima kasih banyak! Ulasan Anda telah berhasil dikirim dan saat ini sedang ditinjau oleh admin.")
+        return
+
+    # --- STATE: BROADCAST BLAST (SUPPORT AUDIO, GAMBAR, DOKUMEN & COPY MESSAGE DENGAN TOMBOL PRESTISIUS) ---
+    if _admin_awaiting.get(user_id) == 'blasting':
+        _admin_awaiting.pop(user_id, None)
+        buyers = get_all_buyers()
+        jumlah = len(buyers)
+
+        status_msg = await update.message.reply_text(f"📢 Memproses pengiriman broadcast ke {jumlah} target...")
+
+        # Membuat tombol ajakan bertransaksi di bagian bawah broadcast
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🛒 Mulai Belanja Sekarang", url=f"https://t.me/{context.bot.username}?start=buy")]
+        ])
+
+        sent = 0
+        failed = 0
+        for b in buyers:
+            try:
+                # Menggunakan copy_message untuk menduplikasi pesan dari admin beserta caption/file-nya secara utuh
+                await context.bot.copy_message(
+                    chat_id=b['user_id'],
+                    from_chat_id=update.message.chat_id,
+                    message_id=update.message.message_id,
+                    reply_markup=keyboard
+                )
+                sent += 1
+            except telegram.error.RetryAfter as e:
+                await asyncio.sleep(e.retry_after)
+                try:
+                    await context.bot.copy_message(
+                        chat_id=b['user_id'],
+                        from_chat_id=update.message.chat_id,
+                        message_id=update.message.message_id,
+                        reply_markup=keyboard
+                    )
+                    sent += 1
+                except Exception:
+                    failed += 1
+            except Exception:
+                failed += 1
+            await asyncio.sleep(0.1) # Jeda pengiriman yang aman dari rate limit
+
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+
+        await update.message.reply_text(
+            f"📢 <b>BROADCAST SELESAI</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"✅ Sukses Terkirim: {sent}\n"
+            f"❌ Gagal (Block/Inaktif): {failed}\n"
+            f"📊 Total Target: {jumlah}",
+            parse_mode="HTML"
+        )
         return
 
     # --- ADMIN STATES ---
@@ -3429,53 +3069,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             val = text.strip()
             set_setting('link_admin', val)
             await update.message.reply_text(f"✅ Link Admin/CS berhasil diperbarui:\n{val}")
-            return
-
-        # --- State: broadcast blast ---
-        if _admin_awaiting.get(user_id) == 'blasting':
-            _admin_awaiting.pop(user_id, None)
-            buyers = get_all_buyers()
-            jumlah = len(buyers)
-
-            status_msg = await update.message.reply_text(f"📢 Mengirim ke {jumlah} buyer...")
-
-            blast_text = (
-                "📢 PESAN DARI ADMIN HYPER FAMILY STORE\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                + text
-            )
-
-            sent = 0
-            failed = 0
-            # REVISI BROADCAST (FLOOD CONTROL): Mencegah pemblokiran rate-limit Telegram
-            for b in buyers:
-                try:
-                    await context.bot.send_message(chat_id=b['user_id'], text=blast_text)
-                    sent += 1
-                except telegram.error.RetryAfter as e:
-                    await asyncio.sleep(e.retry_after)
-                    try:
-                        await context.bot.send_message(chat_id=b['user_id'], text=blast_text)
-                        sent += 1
-                    except Exception:
-                        failed += 1
-                except Exception:
-                    failed += 1
-                await asyncio.sleep(0.1)
-
-            try:
-                await status_msg.delete()
-            except Exception:
-                pass
-
-            await update.message.reply_text(
-                f"✅ *BROADCAST SELESAI*\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"✅ Terkirim: {sent}\n"
-                f"❌ Gagal: {failed}\n"
-                f"📊 Total: {jumlah}",
-                parse_mode="Markdown"
-            )
             return
 
         # --- State: tambah produk ---
@@ -3818,19 +3411,14 @@ async def admin_konfirmasi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update_order_status(order["order_id"], 'completed')
         set_sent_link(order["order_id"], link)
 
-        # Hapus pesan notifikasi lama di channel/admin
-        await hapus_notif_lama(context.bot, order["order_id"])
-
-        # Notifikasi order selesai (konfirmasi manual)
-        msg_id = await kirim_notif(
-            context.bot,
+        # REVISI CLUTTER ADMIN CHAT: Edit notifikasi lama menjadi Selesai Konfirmasi Manual
+        await edit_notif_lama(
+            context.bot, order["order_id"],
             _format_order_notif(
                 "✅ <b>ORDER SELESAI (KONFIRMASI MANUAL)</b>",
                 order['user_name'], user_id, paket, order['order_id']
             )
         )
-        if msg_id:
-            set_admin_msg_id(order["order_id"], msg_id)
 
         await query.edit_message_text(
             f"*✅ DIKONFIRMASI*\n"
@@ -3847,19 +3435,14 @@ async def admin_konfirmasi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # REVISI CHAT CLEANUP: Hapus QRIS di buyer jika ditolak oleh admin
         await hapus_qris_buyer_lama(context.bot, order["order_id"], user_id)
 
-        # Hapus pesan notifikasi lama di channel/admin
-        await hapus_notif_lama(context.bot, order["order_id"])
-
-        # Kirim notifikasi ditolak baru
-        msg_id = await kirim_notif(
-            context.bot,
+        # REVISI CLUTTER ADMIN CHAT: Edit notifikasi lama menjadi Ditolak
+        await edit_notif_lama(
+            context.bot, order["order_id"],
             _format_order_notif(
                 "❌ <b>ORDER DITOLAK</b>",
                 order['user_name'], user_id, paket, order['order_id']
             )
         )
-        if msg_id:
-            set_admin_msg_id(order["order_id"], msg_id)
 
         await query.edit_message_text(
             f"*❌ DITOLAK*\n"
@@ -4023,42 +3606,81 @@ async def admpanel_orders_cari(update: Update, context: ContextTypes.DEFAULT_TYP
     context.user_data['awaiting_cari'] = True
 
 async def admpanel_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Menampilkan statistik lengkap langsung di Telegram (pengganti web dashboard)."""
     query = update.callback_query
     await query.answer()
-    s = get_order_stats()
-    text = (
-        f"*📊 STATISTIK PENJUALAN*\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📅 *Hari Ini*\n"
-        f"├ Order Selesai: {s['today_orders']}\n"
-        f"└ Omzet: {format_harga(s['today_revenue'])}\n\n"
-        f"📅 *Bulan Ini*\n"
-        f"├ Order Selesai: {s['month_orders']}\n"
-        f"└ Omzet: {format_harga(s['month_revenue'])}\n\n"
-        f"🏆 *All Time*\n"
-        f"├ Total Order Selesai: {s['total_orders']}\n"
-        f"├ Total Dibatalkan: {s['cancelled_count']}\n"
-        f"├ Order Selesai Sekarang: {s['active_count']}\n"
-        f"└ Total Omzet: {format_harga(s['total_revenue'])}\n\n"
-    )
-    if s['best_product']:
-        text += f"🥇 *Produk Terlaris:* {esc(s['best_product'])}\n\n"
-    text += f"_Update: {now_wib().strftime('%H:%M, %d/%m/%Y')}_"
-
-    # REVISI: Tambahkan tombol WebApp jika WEBAPP_URL sudah dikonfigurasi di env var
-    keyboard = []
-    if WEBAPP_URL and "your-domain" not in WEBAPP_URL:
-        # Hapus slash di belakang jika ada, lalu arahkan ke /dashboard
-        clean_url = f"{WEBAPP_URL.rstrip('/')}/dashboard"
-        keyboard.append([InlineKeyboardButton("📊 Buka Web Dashboard", web_app=WebAppInfo(url=clean_url))])
     
-    keyboard.append([InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_back")])
-
-    await query.edit_message_text(
-        text,
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+    s = get_order_stats()
+    
+    # Ambil data performa & ulasan tambahan dari database
+    conn = get_conn()
+    try:
+        with conn.cursor() as c:
+            # 1. Rata-rata bintang testimoni approved
+            c.execute("SELECT COALESCE(AVG(rating), 0) as avg_rating, COUNT(*) as count FROM testimonials WHERE status='approved'")
+            row_testi = c.fetchone()
+            avg_rating = round(float(row_testi['avg_rating']), 1)
+            total_testi = row_testi['count']
+            
+            # 2. 3 Testimoni Approved Terbaru
+            c.execute("""
+                SELECT user_name, paket_id, rating, review 
+                FROM testimonials 
+                WHERE status='approved' 
+                ORDER BY id DESC LIMIT 3
+            """)
+            testi_rows = c.fetchall()
+            
+            # 3. Omset Detail per Paket Produk
+            c.execute("""
+                SELECT o.paket_id, p.nama, p.emoji, COUNT(*) as count, COALESCE(SUM(o.harga_dibayar), 0) as total
+                FROM orders o
+                LEFT JOIN products p ON o.paket_id = p.paket_id
+                WHERE o.status='completed'
+                GROUP BY o.paket_id, p.nama, p.emoji
+                ORDER BY count DESC
+            """)
+            products_breakdown = c.fetchall()
+    finally:
+        release_conn(conn)
+        
+    text = (
+        f"<b>📊 LIVE STATISTIK TOKO</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"<b>📅 HARI INI</b>\n"
+        f"├ Omset: <b>{format_harga(s['today_revenue'])}</b>\n"
+        f"└ Selesai: {s['today_orders']} transaksi\n\n"
+        f"<b>📅 BULAN INI</b>\n"
+        f"├ Omset: <b>{format_harga(s['month_revenue'])}</b>\n"
+        f"└ Selesai: {s['month_orders']} transaksi\n\n"
+        f"<b>🏆 SEMUA WAKTU (ALL-TIME)</b>\n"
+        f"├ Total Omset: <b>{format_harga(s['total_revenue'])}</b>\n"
+        f"├ Total Selesai: {s['total_orders']} order\n"
+        f"├ Sedang Menunggu: {s['active_count']} order\n"
+        f"└ Total Batal/Expired: {s['cancelled_count']} order\n\n"
+        f"<b>⭐ KEPUASAN BUYER (TESTIMONI)</b>\n"
+        f"├ Rating Toko: <b>⭐ {avg_rating} / 5.0</b>\n"
+        f"└ Total Testimoni: {total_testi} ulasan approved\n\n"
     )
+    
+    if products_breakdown:
+        text += "<b>📦 PERFORMA PRODUK:</b>\n"
+        for p in products_breakdown:
+            text += f"├ {p['emoji']} {p['nama'] or p['paket_id']}: {p['count']}x terjual ({format_harga(p['total'])})\n"
+        text += "\n"
+        
+    if testi_rows:
+        text += "<b>💬 3 TESTIMONI TERBARU:</b>\n"
+        for t in testi_rows:
+            masked = samarkan_nama(t['user_name'])
+            stars = "⭐" * t['rating']
+            text += f"├ 👤 {masked} - {stars}\n└ <i>\"{t['review']}\"</i>\n"
+        text += "\n"
+        
+    text += f"<i>Last Update: {now_wib().strftime('%H:%M — %d/%m/%Y')} WIB</i>"
+    
+    keyboard = [[InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_back")]]
+    await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def admpanel_blast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -4073,12 +3695,11 @@ async def admpanel_blast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     _requester_id = query.from_user.id
     await query.edit_message_text(
-        f"📢 *BROADCAST PESAN*\n"
+        f"📢 *BROADCAST PESAN BARU*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"Total penerima: *{jumlah} buyer*\n\n"
-        f"Ketik & kirim pesan yang mau di-blast sekarang.\n"
-        f"Pesan kamu akan dikirim dengan header toko secara otomatis.\n\n"
-        f"⚠️ Langsung terkirim ke semua buyer setelah kamu send.",
+        f"Total Penerima: *{jumlah} buyer*\n\n"
+        f"Kirimkan pesan broadcast Anda (Mendukung teks terformat HTML, gambar, video, dan dokumen).\n\n"
+        f"⚠️ Pesan yang Anda kirim akan langsung disebarkan otomatis ke seluruh buyer.",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Batal", callback_data="blast_batal")]])
     )
@@ -4637,38 +4258,6 @@ async def admpanel_admin_del(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"✅ Admin `{target_id}` berhasil dihapus.",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_admins")]])
-    )
-
-
-# =================== ADMIN: UBAH LINK SETTING ===================
-
-async def admpanel_setting_link_testi(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    context.user_data['awaiting_link_testi'] = True
-    current = get_setting('link_testimoni') or '-'
-    await query.edit_message_text(
-        f"*⭐ UBAH LINK TESTIMONI*\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"Link saat ini:\n`{esc(current)}`\n\n"
-        f"Kirim link baru (contoh: `https://t.me/channel`):",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Batal", callback_data="admpanel_setting")]])
-    )
-
-
-async def admpanel_setting_link_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    context.user_data['awaiting_link_admin'] = True
-    current = get_setting('link_admin') or '-'
-    await query.edit_message_text(
-        f"*💬 UBAH LINK ADMIN/CS*\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"Link saat ini:\n`{esc(current)}`\n\n"
-        f"Kirim link baru (contoh: `https://t.me/username`):",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Batal", callback_data="admpanel_setting")]])
     )
 
 

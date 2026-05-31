@@ -1,4 +1,3 @@
-
 import os
 import asyncio
 import re
@@ -868,11 +867,6 @@ async def hapus_qris_buyer_lama(bot, order_id, user_id):
         except Exception:
             pass
 
-async def _auto_hapus_notif_final(bot, order_id: str, delay_seconds: int = 300):
-    """Hapus notifikasi order final secara otomatis setelah beberapa menit agar chat admin tidak numpuk."""
-    await asyncio.sleep(delay_seconds)
-    await hapus_notif_lama(bot, order_id)
-
 # =================== MAIN MENU ===================
 
 def build_main_menu_text():
@@ -1154,7 +1148,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             if msg_id:
                 set_admin_msg_id(active['order_id'], msg_id)
-                asyncio.create_task(_auto_hapus_notif_final(context.bot, active['order_id'], delay_seconds=300))
             return
 
         total = (trans.get("amount", paket["harga"]) + trans.get("fee", 0)) if trans else paket["harga"]
@@ -1408,7 +1401,6 @@ async def back_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if msg_id:
             set_admin_msg_id(cancelled_order_id, msg_id)
-            asyncio.create_task(_auto_hapus_notif_final(context.bot, cancelled_order_id, delay_seconds=180))
 
     context.user_data.clear()
 
@@ -1521,7 +1513,6 @@ async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
         )
         if msg_id:
             set_admin_msg_id(order_id, msg_id)
-            asyncio.create_task(_auto_hapus_notif_final(bot, order_id, delay_seconds=180))
 
     except asyncio.CancelledError:
         pass
@@ -1597,7 +1588,6 @@ async def _handle_payment_success(bot, order_id: str, paket_id: str, user_id: in
     )
     if msg_id:
         set_admin_msg_id(order_id, msg_id)
-        asyncio.create_task(_auto_hapus_notif_final(bot, order_id, delay_seconds=300))
 
     if not kirim_berhasil:
         try:
@@ -1748,7 +1738,7 @@ async def handle_rate_text_skip(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception as e:
         print(f"Gagal mengirim notif moderasi ke admin: {e}")
 
-    await query.edit_message_text("🙏 Terima kasih banyak! Penilaian Anda telah dikirim dan menunggu peninjauan admin.")
+    await query.edit_message_text("🙏 Terima kasih banyak! Penilaian Anda telah dikirim and menunggu peninjauan admin.")
 
 async def handle_rate_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -2132,7 +2122,6 @@ async def admin_cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
     if msg_id:
         set_admin_msg_id(order_id, msg_id)
-        asyncio.create_task(_auto_hapus_notif_final(context.bot, order_id, delay_seconds=180))
 
     try:
         await context.bot.send_message(
@@ -2244,7 +2233,6 @@ async def admin_manual_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
     )
     if msg_id:
         set_admin_msg_id(order_id, msg_id)
-        asyncio.create_task(_auto_hapus_notif_final(context.bot, order_id, delay_seconds=300))
 
     await query.edit_message_text(
         f"✅ *Pembayaran dikonfirmasi manual*\n\n"
@@ -3035,9 +3023,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if _admin_awaiting.get(user_id) == 'blasting':
             _admin_awaiting.pop(user_id, None)
             buyers = get_all_buyers()
-            jumlah = len(buyers)
+            text_blast_count = len(buyers)
 
-            status_msg = await update.message.reply_text(f"📢 Mengirim ke {jumlah} buyer...")
+            status_msg = await update.message.reply_text(f"📢 Mengirim ke {text_blast_count} buyer...")
 
             # Format profesional pesan broadcast
             blast_text = (
@@ -3084,7 +3072,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                 f"✅ Terkirim : *{sent}* buyer\n"
                 f"❌ Gagal    : *{failed}*\n"
-                f"📊 Total    : *{jumlah}*\n\n"
+                f"📊 Total    : *{text_blast_count}*\n\n"
                 f"_Selesai: {now_wib().strftime('%H:%M, %d/%m/%Y')}_",
                 parse_mode="Markdown"
             )
@@ -3439,7 +3427,6 @@ async def admin_konfirmasi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if msg_id:
             set_admin_msg_id(order["order_id"], msg_id)
-            asyncio.create_task(_auto_hapus_notif_final(context.bot, order["order_id"], delay_seconds=300))
 
         await query.edit_message_text(
             f"*✅ DIKONFIRMASI*\n"
@@ -3464,7 +3451,6 @@ async def admin_konfirmasi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if msg_id:
             set_admin_msg_id(order["order_id"], msg_id)
-            asyncio.create_task(_auto_hapus_notif_final(context.bot, order["order_id"], delay_seconds=180))
 
         await query.edit_message_text(
             f"*❌ DITOLAK*\n"

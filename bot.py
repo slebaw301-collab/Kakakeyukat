@@ -184,12 +184,11 @@ def init_db():
                 )
             """)
 
-            c.execute("""
-                ALTER TABLE products ADD COLUMN IF NOT EXISTS link TEXT DEFAULT 'https://t.me/Kikukkvd'
-            """)
-            c.execute("""
-                ALTER TABLE products ADD COLUMN IF NOT EXISTS group_chat_id TEXT DEFAULT NULL
-            """)
+            # REVISI DATABASE (AUTO-MIGRATION): Memastikan kolom baru disuntikkan ke database lama
+            c.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS emoji TEXT DEFAULT '📦'")
+            c.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS deskripsi TEXT DEFAULT ''")
+            c.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS link TEXT DEFAULT 'https://t.me/Kikukkvd'")
+            c.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS group_chat_id TEXT DEFAULT NULL")
 
             c.execute("""
                 CREATE TABLE IF NOT EXISTS banned_users (
@@ -211,21 +210,11 @@ def init_db():
                 )
             """)
 
-            c.execute("""
-                ALTER TABLE orders ADD COLUMN IF NOT EXISTS admin_msg_id BIGINT DEFAULT NULL
-            """)
-            c.execute("""
-                ALTER TABLE orders ADD COLUMN IF NOT EXISTS buyer_msg_id BIGINT DEFAULT NULL
-            """)
-            c.execute("""
-                ALTER TABLE orders ADD COLUMN IF NOT EXISTS sent_link TEXT DEFAULT NULL
-            """)
-            c.execute("""
-                ALTER TABLE orders ADD COLUMN IF NOT EXISTS harga_dibayar INTEGER DEFAULT 0
-            """)
-            c.execute("""
-                ALTER TABLE orders ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
-            """)
+            c.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS admin_msg_id BIGINT DEFAULT NULL")
+            c.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS buyer_msg_id BIGINT DEFAULT NULL")
+            c.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS sent_link TEXT DEFAULT NULL")
+            c.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS harga_dibayar INTEGER DEFAULT 0")
+            c.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP")
 
             # REVISI DATABASE: Menambahkan skema tabel testimonials untuk sistem ulasan moderasi
             c.execute("""
@@ -809,6 +798,46 @@ async def update_admin_notif(bot, order_id, new_text, new_markup=None):
         except Exception:
             pass
 
+# =================== REVISI RESTORASI FUNGSI UTAMA ===================
+
+def is_maintenance() -> bool:
+    return get_setting('maintenance') == '1'
+
+def build_main_menu_text():
+    products = get_all_products()
+    text = (
+        "*🛒 HYPER FAMILY STORE*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Selamat datang! Pilih paket yang tersedia:\n\n"
+    )
+    for p in products:
+        # REVISI PROTEKSI DATA: Menggunakan metode .get() aman untuk mencegah KeyError 'emoji'
+        emoji = p.get('emoji', '📦')
+        nama = p.get('nama', 'Produk')
+        deskripsi = p.get('deskripsi', '')
+        harga = p.get('harga', 0)
+        text += (
+            f"{emoji} *{esc(nama).upper()}*\n"
+            f"├ {esc(deskripsi)}\n"
+            f"└ {format_harga(harga)}\n\n"
+        )
+    text += (
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "💳 QRIS (All E-Wallet)  |  ⚡ 1-5 Menit  |  🕒 24 Jam"
+    )
+    return text
+
+def build_main_menu_keyboard():
+    link_testi = get_setting('link_testimoni', 'https://t.me/+7zsdSrwYIG8wOTg1')
+    link_cs = get_setting('link_admin', 'https://t.me/Kikukkvd')
+    return [
+        [InlineKeyboardButton("🛒 Beli Sekarang", callback_data="buy")],
+        [
+            InlineKeyboardButton("⭐ Testimoni", url=link_testi),
+            InlineKeyboardButton("💬 Admin", url=link_cs)
+        ]
+    ]
+
 # =================== MAIN MENU & FORMATS ===================
 
 def format_rich_stats(s) -> str:
@@ -1078,16 +1107,21 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
     )
     for p in products:
+        # REVISI PROTEKSI DATA: Menggunakan metode .get() aman untuk mencegah KeyError 'emoji'
+        emoji = p.get('emoji', '📦')
+        nama = p.get('nama', 'Produk')
+        deskripsi = p.get('deskripsi', '')
+        harga = p.get('harga', 0)
         text += (
-            f"{p['emoji']} *{esc(p['nama']).upper()}*\n"
-            f"├ {esc(p['deskripsi'])}\n"
-            f"├ Harga: {format_harga(p['harga'])}\n"
+            f"{emoji} *{esc(nama).upper()}*\n"
+            f"├ {esc(deskripsi)}\n"
+            f"├ Harga: {format_harga(harga)}\n"
             f"└ Status: Tersedia ✅\n\n"
         )
     text += "━━━━━━━━━━━━━━━━━━━━━━━━"
 
     keyboard = [
-        [InlineKeyboardButton(f"{p['emoji']} {p['nama']} — {format_harga(p['harga'])}", callback_data=f"pilih_{p['paket_id']}")]
+        [InlineKeyboardButton(f"{p.get('emoji', '📦')} {p.get('nama', 'Produk')} — {format_harga(p.get('harga', 0))}", callback_data=f"pilih_{p.get('paket_id', 'produk')}")]
         for p in products
     ]
     keyboard.append([InlineKeyboardButton("⬅️ Kembali", callback_data="back_start")])
@@ -1121,7 +1155,7 @@ async def pilih_paket(update: Update, context: ContextTypes.DEFAULT_TYPE):
         caption = (
             f"*⏳ ORDER AKTIF*\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📦 Paket: {paket_active['emoji']} {esc(paket_active['nama'])}\n"
+            f"📦 Paket: {paket_active.get('emoji', '📦')} {esc(paket_active.get('nama', 'Produk'))}\n"
             f"💰 Total: {format_harga(total)}\n"
             f"📝 Order ID: `{active['order_id']}`\n\n"
             f"⚠️ Selesaikan pembayaran atau batalkan dulu."
@@ -1198,7 +1232,7 @@ async def pilih_paket(update: Update, context: ContextTypes.DEFAULT_TYPE):
     qr_buffer = generate_qr_image(qris_string)
 
     caption = (
-        f"*{paket['emoji']} {esc(paket['nama']).upper()}*\n"
+        f"*{paket.get('emoji', '📦')} {esc(paket.get('nama', 'Produk')).upper()}*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"📋 *Detail Pembayaran*\n"
         f"├ Harga: {format_harga(amount)}\n"
@@ -1286,7 +1320,7 @@ async def back_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"❌ <b>ORDER DIBATALKAN OLEH BUYER</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"👤 Pembeli: {html_module.escape(query.from_user.full_name)} (<code>{user_id}</code>)\n"
-            f"📦 Paket: {paket_notif['emoji']} {html_module.escape(paket_notif['nama'])}\n"
+            f"📦 Paket: {paket_notif.get('emoji', '📦')} {html_module.escape(paket_notif.get('nama', 'Produk'))}\n"
             f"📝 Order ID: <code>{cancelled_order_id}</code>\n"
         )
         await update_admin_notif(context.bot, cancelled_order_id, final_admin_text)
@@ -1397,7 +1431,7 @@ async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
             f"⏰ <b>ORDER EXPIRED (KEDALUWARSA)</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"👤 Pembeli: {html_module.escape(user_name)} (<code>{user_id}</code>)\n"
-            f"📦 Paket: {paket_exp['emoji']} {html_module.escape(paket_exp['nama'])}\n"
+            f"📦 Paket: {paket_exp.get('emoji', '📦')} {html_module.escape(paket_exp.get('nama', 'Produk'))}\n"
             f"📝 Order ID: <code>{order_id}</code>\n\n"
             f"❌ Pembayaran tidak diterima hingga batas waktu habis."
         )
@@ -1446,7 +1480,7 @@ async def _handle_payment_success(bot, order_id: str, paket_id: str, user_id: in
                 f"<b>✅ PEMBAYARAN BERHASIL</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                 f"📦 <b>Detail Pesanan</b>\n"
-                f"├ Paket: {paket['emoji']} {html_module.escape(paket['nama'])}\n"
+                f"├ Paket: {paket.get('emoji', '📦')} {html_module.escape(paket.get('nama', 'Produk'))}\n"
                 f"├ Order ID: <code>{order_id}</code>\n"
                 f"└ Total: {format_harga(paid_amount)}\n\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1470,7 +1504,7 @@ async def _handle_payment_success(bot, order_id: str, paket_id: str, user_id: in
         f"✅ <b>PEMBAYARAN BERHASIL (LUNAS)</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"👤 Pembeli: {html_module.escape(user_name)} (<code>{user_id}</code>)\n"
-        f"📦 Paket: {paket['emoji']} {html_module.escape(paket['nama'])}\n"
+        f"📦 Paket: {paket.get('emoji', '📦')} {html_module.escape(paket.get('nama', 'Produk'))}\n"
         f"📝 Order ID: <code>{order_id}</code>\n"
         f"💰 Total: {format_harga(paid_amount)}\n"
         f"🕒 Waktu Lunas: {now_wib().strftime('%H:%M, %d %b %Y')}\n\n"
@@ -1606,8 +1640,8 @@ async def handle_rate_text_skip(update: Update, context: ContextTypes.DEFAULT_TY
     
     order = get_order_by_id(order_id)
     paket = get_product(order['paket_id']) if order else None
-    paket_nama = paket['nama'] if paket else "Produk"
-    paket_emoji = paket['emoji'] if paket else "📦"
+    paket_nama = paket.get('nama', 'Produk') if paket else "Produk"
+    paket_emoji = paket.get('emoji', '📦') if paket else "📦"
     
     # Kirim ke admin untuk moderasi
     moderation_text = (
@@ -1672,15 +1706,15 @@ async def admin_testi_approve(update: Update, context: ContextTypes.DEFAULT_TYPE
     nama_sensor = samarkan_nama(testi['user_name'])
     order = get_order_by_id(order_id)
     paket = get_product(order['paket_id']) if order else None
-    paket_nama = paket['nama'] if paket else "Produk"
-    paket_emoji = paket['emoji'] if paket else "📦"
+    paket_nama = paket.get('nama', 'Produk') if paket else "Produk"
+    paket_emoji = paket.get('emoji', '📦') if paket else "📦"
     
     # REVISI VISUAL TESTIMONI: Format premium Opsi A dengan Header khusus baru
     channel_msg = (
         f"✨ <b>𝐓𝐄𝐒𝐓𝐈𝐌𝐎𝐍𝐈 𝐏𝐄𝐋𝐀𝐍𝐆𝐆𝐀𝐍</b>\n"
         f"───────────────────\n"
-        f"📦 𝗣𝗮𝗸𝗲𝘁: {paket_emoji} <b>{html_module.escape(paket_nama)}</b>\n"
-        f"👤 𝗕𝘂𝘆𝗲𝗿: {html_module.escape(nama_sensor)}\n"
+        f"📦 <b>Paket:</b> {paket_emoji} <b>{html_module.escape(paket_nama)}</b>\n"
+        f"👤 <b>Buyer:</b> {html_module.escape(nama_sensor)}\n"
         f"⭐ <b>Rating:</b> {'⭐' * testi['rating']}\n\n"
         f"💬 <i>\"{html_module.escape(testi['review'])}\"</i>\n"
         f"───────────────────\n"
@@ -1723,14 +1757,18 @@ async def _send_produk_menu(context, chat_id, message=None, query=None):
     )
     if products:
         for p in products:
-            text += f"{p['emoji']} *{esc(p['nama'])}* — {format_harga(p['harga'])}\n"
+            # REVISI PROTEKSI DATA: Menggunakan metode .get() aman untuk mencegah KeyError 'emoji'
+            emoji = p.get('emoji', '📦')
+            nama = p.get('nama', p.get('paket_id', 'Produk'))
+            harga = p.get('harga', 0)
+            text += f"{emoji} *{esc(nama)}* — {format_harga(harga)}\n"
     else:
         text += "_Belum ada produk._\n"
 
     text += "\nPilih produk untuk diedit, atau tambah produk baru:"
 
     keyboard = [
-        [InlineKeyboardButton(f"{p['emoji']} {p['nama']}", callback_data=f"pd_detail_{p['paket_id']}")]
+        [InlineKeyboardButton(f"{p.get('emoji', '📦')} {p.get('nama', 'Produk')}", callback_data=f"pd_detail_{p.get('paket_id', 'produk')}")]
         for p in products
     ]
     keyboard.append([InlineKeyboardButton("➕ Tambah Produk Baru", callback_data="pd_tambah")])
@@ -1765,11 +1803,11 @@ async def produk_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     text = (
-        f"*{esc(p['emoji'])} {esc(p['nama'])}*\n"
+        f"*{esc(p.get('emoji', '📦'))} {esc(p.get('nama', 'Produk'))}*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"💰 Harga: {format_harga(p['harga'])}\n"
-        f"📝 Deskripsi: {esc(p['deskripsi'])}\n"
-        f"🔗 Link: `{esc(p['link'])}`\n"
+        f"💰 Harga: {format_harga(p.get('harga', 0))}\n"
+        f"📝 Deskripsi: {esc(p.get('deskripsi', ''))}\n"
+        f"🔗 Link: `{esc(p.get('link', DEFAULT_LINK))}`\n"
         f"{grp_info}\n"
         f"Pilih field yang mau diubah:"
     )
@@ -1828,9 +1866,9 @@ async def produk_edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['editing_product'] = {'paket_id': paket_id, 'field': field}
 
     await query.edit_message_text(
-        f"*✍️ Edit {field.upper()} — {esc(p['emoji'])} {esc(p['nama'])}*\n"
+        f"*✍️ Edit {field.upper()} — {esc(p.get('emoji', '📦'))} {esc(p.get('nama', 'Produk'))}*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"Nilai saat ini: `{esc(str(p[field]))}`\n\n"
+        f"Nilai saat ini: `{esc(str(p.get(field, '')))}`\n\n"
         f"_Kirim {label_map[field]} baru sekarang:_",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
@@ -1851,7 +1889,7 @@ async def produk_hapus_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.edit_message_text(
         f"*⚠️ Hapus Produk?*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"Kamu yakin mau hapus *{esc(p['emoji'])} {esc(p['nama'])}*?\n"
+        f"Kamu yakin mau hapus *{esc(p.get('emoji', '📦'))} {esc(p.get('nama', 'Produk'))}*?\n"
         f"Tindakan ini tidak bisa dibatalkan.",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
@@ -1875,7 +1913,7 @@ async def produk_hapus_exec(update: Update, context: ContextTypes.DEFAULT_TYPE):
     delete_product(paket_id)
 
     await query.edit_message_text(
-        f"✅ Produk *{esc(p['emoji'])} {esc(p['nama'])}* berhasil dihapus.",
+        f"✅ Produk *{esc(p.get('emoji', '📦'))} {esc(p.get('nama', 'Produk'))}* berhasil dihapus.",
         parse_mode="Markdown"
     )
     await _send_produk_menu(context, chat_id=query.from_user.id)
@@ -1932,8 +1970,8 @@ async def cmd_aktif(update: Update, context: ContextTypes.DEFAULT_TYPE):
         paket = get_product(o["paket_id"]) or {"emoji": "📦", "nama": o["paket_id"], "harga": 0}
         durasi = hitung_durasi(o["waktu"])
         text += (
-            f"• {paket['emoji']} *{esc(o['user_name'])}*\n"
-            f"  Paket: {esc(paket['nama'])} — {format_harga(paket['harga'])}\n"
+            f"• {paket.get('emoji', '📦')} *{esc(o['user_name'])}*\n"
+            f"  Paket: {esc(paket.get('nama', 'Produk'))} — {format_harga(paket.get('harga', 0))}\n"
             f"  Dibuat: {durasi}\n"
             f"  ID: `{o['order_id']}`\n\n"
         )
@@ -1981,8 +2019,8 @@ async def admin_cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
     order = dict(order)
     paket = get_product(order['paket_id']) or {"emoji": "📦", "nama": order['paket_id'], "harga": 0}
 
-    if paket['harga']:
-        await cancel_transaction(order_id, paket['harga'])
+    if paket.get('harga', 0):
+        await cancel_transaction(order_id, paket.get('harga', 0))
 
     update_order_status(order_id, 'cancelled')
     _stop_payment_task(target_user_id)
@@ -1995,7 +2033,7 @@ async def admin_cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"❌ <b>ORDER DIBATALKAN OLEH ADMIN</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"👤 Pembeli: {html_module.escape(order.get('user_name', '-'))} (<code>{target_user_id}</code>)\n"
-        f"📦 Paket: {paket['emoji']} {html_module.escape(paket['nama'])}\n"
+        f"📦 Paket: {paket.get('emoji', '📦')} {html_module.escape(paket.get('nama', 'Produk'))}\n"
         f"📝 Order ID: <code>{order_id}</code>\n"
     )
     await update_admin_notif(context.bot, order_id, final_admin_text)
@@ -2018,7 +2056,7 @@ async def admin_cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.edit_message_text(
         f"✅ *Order berhasil dibatalkan*\n\n"
         f"👤 Buyer: {esc(order.get('user_name', '-'))}\n"
-        f"📦 Paket: {paket['emoji']} {esc(paket['nama'])}\n"
+        f"📦 Paket: {paket.get('emoji', '📦')} {esc(paket.get('nama', 'Produk'))}\n"
         f"📝 Order ID: `{order_id}`",
         parse_mode="Markdown"
     )
@@ -2087,7 +2125,7 @@ async def admin_manual_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
                 f"<b>✅ PEMBAYARAN DIKONFIRMASI</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                 f"📦 <b>Detail Pesanan</b>\n"
-                f"├ Paket: {paket['emoji']} {html_module.escape(paket['nama'])}\n"
+                f"├ Paket: {paket.get('emoji', '📦')} {html_module.escape(paket.get('nama', 'Produk'))}\n"
                 f"├ Order ID: <code>{order_id}</code>\n"
                 f"└ Total: {format_harga(harga)}\n\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -2110,7 +2148,7 @@ async def admin_manual_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
         f"✅ <b>DIKONFIRMASI MANUAL OLEH ADMIN</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"👤 Pembeli: {html_module.escape(order.get('user_name', '-'))} (<code>{target_user_id}</code>)\n"
-        f"📦 Paket: {paket['emoji']} {html_module.escape(paket['nama'])}\n"
+        f"📦 Paket: {paket.get('emoji', '📦')} {html_module.escape(paket.get('nama', 'Produk'))}\n"
         f"📝 Order ID: <code>{order_id}</code>\n"
         f"💰 Total: {format_harga(harga)}\n\n"
         f"✅ Link sukses terkirim ke buyer"
@@ -2120,7 +2158,7 @@ async def admin_manual_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.edit_message_text(
         f"✅ *Pembayaran dikonfirmasi manual*\n\n"
         f"👤 Buyer: {esc(order.get('user_name', '-'))}\n"
-        f"📦 Paket: {paket['emoji']} {esc(paket['nama'])}\n"
+        f"📦 Paket: {paket.get('emoji', '📦')} {esc(paket.get('nama', 'Produk'))}\n"
         f"📝 Order ID: `{order_id}`\n"
         f"🔗 Link sudah terkirim ke buyer.",
         parse_mode="Markdown"
@@ -2133,7 +2171,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     s = get_order_stats()
-    # REVISI STATS TEKS: Menggunakan format laporan visual yang super lengkap di Telegram
+    # REVISI STATS: Menggunakan format laporan visual yang super lengkap di Telegram
     text_stats = format_rich_stats(s)
     await update.message.reply_text(text_stats, parse_mode="HTML")
 
@@ -2166,9 +2204,9 @@ async def cmd_riwayat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for o in orders:
         paket = get_product(o['paket_id']) or {"emoji": "📦", "nama": o['paket_id'], "harga": 0}
         status = STATUS_LABEL.get(o['status'], o['status'])
-        harga = o.get('harga_dibayar') or paket['harga']
+        harga = o.get('harga_dibayar') or paket.get('harga', 0)
         text += (
-            f"{paket['emoji']} *{esc(paket['nama'])}*\n"
+            f"{paket.get('emoji', '📦')} *{esc(paket.get('nama', 'Produk'))}*\n"
             f"├ Status: {status}\n"
             f"├ Harga: {format_harga(harga)}\n"
             f"└ {o['waktu']}\n\n"
@@ -2642,7 +2680,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📩 <b>MODERASI TESTIMONI BARU</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"👤 Buyer: {html_module.escape(update.effective_user.full_name)} (<code>{user_id}</code>)\n"
-            f"📦 Paket: {paket['emoji']} {html_module.escape(paket['nama'])}\n"
+            f"📦 Paket: {paket.get('emoji', '📦')} {html_module.escape(paket.get('nama', 'Produk'))}\n"
             f"📊 Rating: {'⭐' * rating}\n"
             f"💬 Ulasan: <i>\"{html_module.escape(text)}\"</i>\n\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -2691,8 +2729,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                 f"Order ID: `{order['order_id']}`\n"
                 f"Buyer: {esc(order.get('user_name', '-'))} (`{order['user_id']}`)\n"
-                f"Paket: {paket['emoji']} {esc(paket['nama'])}\n"
-                f"Harga Dibayar: {format_harga(order.get('harga_dibayar') or paket['harga'])}\n"
+                f"Paket: {paket.get('emoji', '📦')} {esc(paket.get('nama', 'Produk'))}\n"
+                f"Harga Dibayar: {format_harga(order.get('harga_dibayar') or paket.get('harga', 0))}\n"
                 f"Status: {status}\n"
                 f"Dibuat: {order.get('waktu', '-')}\n"
                 f"Link terkirim: {sent_link}",
@@ -3030,11 +3068,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "🏢 Group ID: _Tidak di-set (pakai link biasa)_\n"
                 )
                 detail_text = (
-                    f"*{esc(p['emoji'])} {esc(p['nama'])}*\n"
+                    f"*{esc(p.get('emoji', '📦'))} {esc(p.get('nama', 'Produk'))}*\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    f"💰 Harga: {format_harga(p['harga'])}\n"
-                    f"📝 Deskripsi: {esc(p['deskripsi'])}\n"
-                    f"🔗 Link: `{esc(p['link'])}`\n"
+                    f"💰 Harga: {format_harga(p.get('harga', 0))}\n"
+                    f"📝 Deskripsi: {esc(p.get('deskripsi', ''))}\n"
+                    f"🔗 Link: `{esc(p.get('link', DEFAULT_LINK))}`\n"
                     f"{grp_info}\n"
                     f"Pilih field yang mau diubah:"
                 )
@@ -3097,7 +3135,7 @@ async def admin_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for o in orders:
         paket = get_product(o["paket_id"]) or {"emoji": "📦", "nama": o["paket_id"]}
         durasi = hitung_durasi(o["waktu"])
-        text += f"• {paket['emoji']} {esc(o['user_name'])} — {esc(paket['nama'])} — {durasi}\n"
+        text += f"• {paket.get('emoji', '📦')} {esc(o['user_name'])} — {esc(paket.get('nama', 'Produk'))} — {durasi}\n"
         keyboard.append([InlineKeyboardButton(f"👤 Proses: {o['user_name']}", callback_data=f"proses_{o['user_id']}")])
 
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
@@ -3122,22 +3160,22 @@ async def admin_proses_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     order = dict(order)
     paket = get_product(order["paket_id"]) or {"emoji": "📦", "nama": order["paket_id"], "harga": 0, "deskripsi": "-"}
-    trans = await get_transaction_detail(order["order_id"], paket["harga"]) if order["order_id"] else None
+    trans = await get_transaction_detail(order["order_id"], paket.get("harga", 0)) if order["order_id"] else None
     durasi = hitung_durasi(order["waktu"])
 
     caption = (
-        f"*{paket['emoji']} {esc(paket['nama']).upper()}*\n"
+        f"*{paket.get('emoji', '📦')} {esc(paket.get('nama', 'Produk')).upper()}*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"👤 Pembeli: {esc(order['user_name'])} (`{order['user_id']}`)\n"
-        f"📦 Konten: {esc(paket['deskripsi'])}\n"
-        f"💰 Total: {format_harga(paket['harga'])}\n"
+        f"📦 Konten: {esc(paket.get('deskripsi', ''))}\n"
+        f"💰 Total: {format_harga(paket.get('harga', 0))}\n"
         f"🕒 Dibuat: {durasi}\n"
     )
     if trans:
         caption += f"\n📝 Order ID: `{order['order_id']}`\n"
         caption += f"💳 Status: {'✅ Lunas' if trans['status'] == 'completed' else '⏳ Belum Bayar'}\n"
         if trans['status'] == 'completed':
-            caption += f"💵 Dibayar: {format_harga(trans.get('amount', paket['harga']))}\n"
+            caption += f"💵 Dibayar: {format_harga(trans.get('amount', paket.get('harga', 0)))}\n"
 
     keyboard = [
         [
@@ -3174,7 +3212,7 @@ async def back_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for o in orders:
         paket = get_product(o["paket_id"]) or {"emoji": "📦", "nama": o["paket_id"]}
         durasi = hitung_durasi(o["waktu"])
-        text += f"• {paket['emoji']} {esc(o['user_name'])} — {esc(paket['nama'])} — {durasi}\n"
+        text += f"• {paket.get('emoji', '📦')} {esc(o['user_name'])} — {esc(paket.get('nama', 'Produk'))} — {durasi}\n"
         keyboard.append([InlineKeyboardButton(f"👤 Proses: {o['user_name']}", callback_data=f"proses_{o['user_id']}")])
 
     await context.bot.send_message(
@@ -3238,8 +3276,8 @@ async def admin_konfirmasi(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"<b>✅ PESANAN SELESAI</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                 f"📦 <b>Detail</b>\n"
-                f"├ Paket: {paket['emoji']} {html_module.escape(paket['nama'])}\n"
-                f"└ Konten: {html_module.escape(paket['deskripsi'])}\n\n"
+                f"├ Paket: {paket.get('emoji', '📦')} {html_module.escape(paket.get('nama', 'Produk'))}\n"
+                f"└ Konten: {html_module.escape(paket.get('deskripsi', ''))}\n\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"{link_section}\n\n"
                 f"Terima kasih telah berbelanja! 🙏\n\n"
@@ -3273,7 +3311,7 @@ async def admin_konfirmasi(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"*✅ DIKONFIRMASI*\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"👤 Pembeli: {esc(order['user_name'])}\n"
-            f"📦 Paket: {paket['emoji']} {esc(paket['nama'])}\n\n"
+            f"📦 Paket: {paket.get('emoji', '📦')} {esc(paket.get('nama', 'Produk'))}\n\n"
             f"✅ Link produk otomatis terkirim ke buyer.",
             parse_mode="Markdown"
         )
@@ -3302,7 +3340,7 @@ async def admin_konfirmasi(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"*❌ DITOLAK*\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"👤 Pembeli: {esc(order['user_name'])}\n"
-            f"📦 Paket: {paket['emoji']} {esc(paket['nama'])}",
+            f"📦 Paket: {paket.get('emoji', '📦')} {esc(paket.get('nama', 'Produk'))}",
             parse_mode="Markdown"
         )
         msg = await context.bot.send_message(
@@ -3361,7 +3399,6 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def admpanel_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     await query.edit_message_text(
         "*⚙️ PANEL ADMIN*\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -3372,12 +3409,10 @@ async def admpanel_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def admpanel_produk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     await _send_produk_menu(context, chat_id=query.from_user.id, query=query)
 
 async def admpanel_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("⏳ Order Aktif",   callback_data="admpanel_orders_aktif"),
@@ -3396,7 +3431,6 @@ async def admpanel_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def admpanel_orders_aktif(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     orders = get_all_waiting()
     if not orders:
         await query.edit_message_text(
@@ -3413,8 +3447,8 @@ async def admpanel_orders_aktif(update: Update, context: ContextTypes.DEFAULT_TY
         paket = get_product(o["paket_id"]) or {"emoji": "📦", "nama": o["paket_id"], "harga": 0}
         durasi = hitung_durasi(o["waktu"])
         text += (
-            f"• {paket['emoji']} *{esc(o['user_name'])}*\n"
-            f"  Paket: {esc(paket['nama'])} — {format_harga(paket['harga'])}\n"
+            f"• {paket.get('emoji', '📦')} *{esc(o['user_name'])}*\n"
+            f"  Paket: {esc(paket.get('nama', 'Produk'))} — {format_harga(paket.get('harga', 0))}\n"
             f"  Dibuat: {durasi}\n"
             f"  ID: `{o['order_id']}`\n\n"
         )
@@ -3427,7 +3461,6 @@ async def admpanel_orders_aktif(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def admpanel_orders_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     orders = get_all_pending()
     if not orders:
         await query.edit_message_text(
@@ -3441,14 +3474,13 @@ async def admpanel_orders_pending(update: Update, context: ContextTypes.DEFAULT_
     for o in orders:
         paket = get_product(o["paket_id"]) or {"emoji": "📦", "nama": o["paket_id"]}
         durasi = hitung_durasi(o["waktu"])
-        text += f"• {paket['emoji']} {esc(o['user_name'])} — {esc(paket['nama'])} — {durasi}\n"
+        text += f"• {paket.get('emoji', '📦')} {esc(o['user_name'])} — {esc(paket.get('nama', 'Produk'))} — {durasi}\n"
         keyboard.append([InlineKeyboardButton(f"👤 Proses: {o['user_name']}", callback_data=f"proses_{o['user_id']}")])
     keyboard.append([InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_orders")])
     await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def admpanel_orders_cari(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     await query.edit_message_text(
         "*🔍 CARI ORDER*\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -3461,7 +3493,6 @@ async def admpanel_orders_cari(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def admpanel_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     s = get_order_stats()
     
     # REVISI STATS: Menggunakan format laporan visual yang super lengkap di Telegram
@@ -3472,7 +3503,6 @@ async def admpanel_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def admpanel_blast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     buyers = get_all_buyers()
     jumlah = len(buyers)
     if jumlah == 0:
@@ -3496,7 +3526,6 @@ async def admpanel_blast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def admpanel_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("📦 Backup",       callback_data="admpanel_data_backup"),
@@ -3518,7 +3547,6 @@ async def admpanel_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def admpanel_data_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     await query.edit_message_text("⏳ Membuat backup database...")
     await _kirim_backup(context.bot)
     await context.bot.send_message(
@@ -3528,7 +3556,6 @@ async def admpanel_data_backup(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def admpanel_data_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     await query.edit_message_text("⏳ Menyiapkan export JSON...")
     try:
         json_content, n_products, n_orders, n_banned = _generate_json_export()
@@ -3550,7 +3577,6 @@ async def admpanel_data_export(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def admpanel_data_import(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     context.user_data['awaiting_json_import'] = True
     await query.edit_message_text(
         "*📥 IMPORT DATA JSON*\n"
@@ -3564,15 +3590,14 @@ async def admpanel_data_import(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def admpanel_data_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     products = get_all_products()
     text = "*🔗 LINK PRODUK SAAT INI*\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
     for p in products:
         grp = p.get('group_chat_id')
         if grp:
-            text += f"{p['emoji']} *{esc(p['nama'])}*\n├ 🏢 Group: `{grp}`\n└ 🔗 Fallback: `{p['link']}`\n\n"
+            text += f"{p.get('emoji', '📦')} *{esc(p.get('nama', 'Produk'))}*\n├ 🏢 Group: `{grp}`\n└ 🔗 Fallback: `{p.get('link', DEFAULT_LINK)}`\n\n"
         else:
-            text += f"{p['emoji']} *{esc(p['nama'])}*\n└ `{p['link']}`\n\n"
+            text += f"{p.get('emoji', '📦')} *{esc(p.get('nama', 'Produk'))}*\n└ `{p.get('link', DEFAULT_LINK)}`\n\n"
     text += "_Ubah link lewat menu Produk._"
     await query.edit_message_text(
         text,
@@ -3582,7 +3607,6 @@ async def admpanel_data_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def admpanel_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("🚫 Ban User",      callback_data="admpanel_user_ban"),
@@ -3601,7 +3625,6 @@ async def admpanel_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def admpanel_user_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     await query.edit_message_text(
         "*🚫 BAN USER*\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -3615,7 +3638,6 @@ async def admpanel_user_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def admpanel_user_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     await query.edit_message_text(
         "*✅ UNBAN USER*\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -3628,7 +3650,6 @@ async def admpanel_user_unban(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def admpanel_user_daftar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     banned = get_all_banned()
     if not banned:
         await query.edit_message_text(
@@ -3656,7 +3677,6 @@ async def admpanel_user_daftar(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def admpanel_setting(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
 
     channel_id = get_setting('notif_channel_id')
     ch_status = f"✅ ID: <code>{html_module.escape(channel_id)}</code>" if channel_id else "🔕 Nonaktif"
@@ -3710,7 +3730,6 @@ async def admpanel_setting(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def admpanel_setting_maintenance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
 
     was_on = is_maintenance()
     set_setting('maintenance', '0' if was_on else '1')
@@ -3730,7 +3749,6 @@ async def admpanel_setting_maintenance(update: Update, context: ContextTypes.DEF
 
 async def admpanel_setting_channel_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     context.user_data['awaiting_channel_id'] = True
     await query.edit_message_text(
         "*✍️ SET CHANNEL ID*\n"
@@ -3749,7 +3767,6 @@ async def admpanel_setting_channel_set(update: Update, context: ContextTypes.DEF
 
 async def admpanel_setting_channel_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     set_setting('notif_channel_id', None)
     await query.edit_message_text(
         "🔕 *Channel notifikasi dinonaktifkan.*\n\n"
@@ -3763,7 +3780,6 @@ async def admpanel_setting_channel_off(update: Update, context: ContextTypes.DEF
 async def admpanel_setting_testich_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Menangani permintaan perubahan ID Channel Testimoni."""
     query = update.callback_query
-    await query.answer()
     context.user_data['awaiting_testi_channel_id'] = True
     await query.edit_message_text(
         "*✍️ SET CHANNEL TESTIMONI*\n"
@@ -3783,7 +3799,6 @@ async def admpanel_setting_testich_set(update: Update, context: ContextTypes.DEF
 async def admpanel_setting_testich_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Menonaktifkan pengiriman testimoni otomatis ke channel."""
     query = update.callback_query
-    await query.answer()
     set_setting('testimoni_channel_id', None)
     await query.edit_message_text(
         "🔕 *Channel testimoni otomatis dinonaktifkan.*\n\n"
@@ -3796,7 +3811,6 @@ async def admpanel_setting_testich_off(update: Update, context: ContextTypes.DEF
 
 async def admpanel_setting_channel_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
 
     channel_id = get_setting('notif_channel_id')
     if not channel_id:
@@ -3941,8 +3955,8 @@ async def cmd_cari(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"📝 Order ID: `{order['order_id']}`\n"
         f"👤 Buyer: {esc(order.get('user_name', '-'))} (`{order['user_id']}`)\n"
-        f"📦 Paket: {paket['emoji']} {esc(paket['nama'])}\n"
-        f"💰 Harga Dibayar: {format_harga(order.get('harga_dibayar') or paket['harga'])}\n"
+        f"📦 Paket: {paket.get('emoji', '📦')} {esc(paket.get('nama', 'Produk'))}\n"
+        f"💰 Harga Dibayar: {format_harga(order.get('harga_dibayar') or paket.get('harga', 0))}\n"
         f"📊 Status: {status}\n"
         f"🕒 Dibuat: {order.get('waktu', '-')}\n"
         f"{link_info}"
@@ -3954,7 +3968,6 @@ async def cmd_cari(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def admpanel_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     if not is_super_admin(query.from_user.id):
         await query.answer("❌ Hanya super admin.", show_alert=True)
         return
@@ -3982,7 +3995,6 @@ async def admpanel_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def admpanel_admin_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     if not is_super_admin(query.from_user.id):
         await query.answer("❌ Hanya super admin.", show_alert=True)
         return
@@ -4000,7 +4012,6 @@ async def admpanel_admin_add(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def admpanel_admin_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     if not is_super_admin(query.from_user.id):
         await query.answer("❌ Hanya super admin.", show_alert=True)
         return
@@ -4031,7 +4042,6 @@ async def admpanel_admin_remove(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def admpanel_admin_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     if not is_super_admin(query.from_user.id):
         await query.answer("❌ Hanya super admin.", show_alert=True)
         return
@@ -4054,7 +4064,6 @@ async def admpanel_admin_del(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def admpanel_setting_link_testi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     context.user_data['awaiting_link_testi'] = True
     current = get_setting('link_testimoni') or '-'
     await query.edit_message_text(
@@ -4069,7 +4078,6 @@ async def admpanel_setting_link_testi(update: Update, context: ContextTypes.DEFA
 
 async def admpanel_setting_link_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     context.user_data['awaiting_link_admin'] = True
     current = get_setting('link_admin') or '-'
     await query.edit_message_text(

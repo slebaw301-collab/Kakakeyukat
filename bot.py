@@ -1798,7 +1798,7 @@ async def admin_testi_approve(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"📦 <b>Produk:</b> {paket_emoji} {html_module.escape(paket_nama)}\n"
         f"👤 <b>Pembeli:</b> {html_module.escape(nama_sensor)}\n"
         f"🌟 <b>Rating:</b> {bintang_penuh}{bintang_kosong}  <b>{testi['rating']}/5</b>\n\n"
-        f"💬 <i>"{html_module.escape(testi['review'])}"</i>\n\n"
+        f"💬 <i>'{html_module.escape(testi['review'])}'</i>\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"✅ <b>Transaksi Terverifikasi</b>\n"
         f"🛒 Order otomatis via @{context.bot.username}"

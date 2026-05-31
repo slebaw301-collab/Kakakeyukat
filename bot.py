@@ -3,7 +3,7 @@ import asyncio
 import re
 import json
 import html as html_module
-import requests
+import aiohttp
 import qrcode
 import psycopg2
 from aiohttp import web as aio_web
@@ -11,7 +11,8 @@ from psycopg2.extras import RealDictCursor
 from psycopg2.pool import ThreadedConnectionPool
 from io import BytesIO
 from datetime import datetime, timedelta, timezone
-from telegram import Update, BotCommand, BotCommandScopeChat, BotCommandScopeDefault, InlineKeyboardButton, InlineKeyboardMarkup
+import telegram.error
+from telegram import Update, BotCommand, BotCommandScopeChat, BotCommandScopeDefault, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, ChatJoinRequestHandler, filters, ContextTypes
@@ -40,6 +41,9 @@ PAKASIR_BASE_URL = "https://app.pakasir.com"
 
 DEFAULT_LINK = "https://t.me/Kikukkvd"
 
+# URL WebApp (Mini App) untuk live dashboard admin (atur di env var server)
+WEBAPP_URL = os.environ.get("WEBAPP_URL", "https://your-domain.up.railway.app")
+
 if not TOKEN:
     raise ValueError("BOT_TOKEN tidak di-set!")
 if not ADMIN_ID:
@@ -49,7 +53,7 @@ if not PAKASIR_API_KEY:
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL tidak di-set!")
 
-# =================== PAKASIR API (NON-BLOCKING) ===================
+# =================== PAKASIR API (NON-BLOCKING NATIVE ASYNC) ===================
 
 async def create_transaction_qris(order_id, amount, description):
     payload = {
@@ -59,18 +63,18 @@ async def create_transaction_qris(order_id, amount, description):
         "api_key": PAKASIR_API_KEY,
     }
     try:
-        response = await asyncio.to_thread(
-            requests.post,
-            f'{PAKASIR_BASE_URL}/api/transactioncreate/qris',
-            json=payload,
-            headers={'Content-Type': 'application/json'},
-            timeout=30
-        )
-        result = response.json()
-        if 'payment' in result:
-            return result['payment']
-        print(f"Pakasir error: {result}")
-        return None
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f'{PAKASIR_BASE_URL}/api/transactioncreate/qris',
+                json=payload,
+                headers={'Content-Type': 'application/json'},
+                timeout=30
+            ) as response:
+                result = await response.json()
+                if 'payment' in result:
+                    return result['payment']
+                print(f"Pakasir error: {result}")
+                return None
     except Exception as e:
         print(f"Error create transaction: {e}")
         return None
@@ -85,35 +89,35 @@ async def cancel_transaction(order_id, amount):
         "api_key": PAKASIR_API_KEY,
     }
     try:
-        response = await asyncio.to_thread(
-            requests.post,
-            f'{PAKASIR_BASE_URL}/api/transactioncancel',
-            json=payload,
-            headers={'Content-Type': 'application/json'},
-            timeout=30
-        )
-        return response.json()
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f'{PAKASIR_BASE_URL}/api/transactioncancel',
+                json=payload,
+                headers={'Content-Type': 'application/json'},
+                timeout=30
+            ) as response:
+                return await response.json()
     except Exception as e:
         print(f"Error cancel transaction: {e}")
         return None
 
 async def get_transaction_detail(order_id, amount):
     try:
-        response = await asyncio.to_thread(
-            requests.get,
-            f'{PAKASIR_BASE_URL}/api/transactiondetail',
-            params={
-                'project': PAKASIR_SLUG,
-                'amount': amount,
-                'order_id': order_id,
-                'api_key': PAKASIR_API_KEY,
-            },
-            timeout=30
-        )
-        result = response.json()
-        if 'transaction' in result:
-            return result['transaction']
-        return None
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f'{PAKASIR_BASE_URL}/api/transactiondetail',
+                params={
+                    'project': PAKASIR_SLUG,
+                    'amount': amount,
+                    'order_id': order_id,
+                    'api_key': PAKASIR_API_KEY,
+                },
+                timeout=30
+            ) as response:
+                result = await response.json()
+                if 'transaction' in result:
+                    return result['transaction']
+                return None
     except Exception as e:
         print(f"Error get detail: {e}")
         return None
@@ -157,101 +161,104 @@ def release_conn(conn):
 def init_db():
     conn = get_conn()
     try:
-        c = conn.cursor()
+        with conn.cursor() as c:
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS products (
+                    paket_id TEXT PRIMARY KEY,
+                    nama TEXT NOT NULL,
+                    emoji TEXT DEFAULT '📦',
+                    deskripsi TEXT DEFAULT '',
+                    harga INTEGER NOT NULL,
+                    link TEXT DEFAULT 'https://t.me/Kikukkvd'
+                )
+            """)
 
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS products (
-                paket_id TEXT PRIMARY KEY,
-                nama TEXT NOT NULL,
-                emoji TEXT DEFAULT '📦',
-                deskripsi TEXT DEFAULT '',
-                harga INTEGER NOT NULL,
-                link TEXT DEFAULT 'https://t.me/Kikukkvd'
-            )
-        """)
+            c.execute("""
+                ALTER TABLE products ADD COLUMN IF NOT EXISTS link TEXT DEFAULT 'https://t.me/Kikukkvd'
+            """)
+            c.execute("""
+                ALTER TABLE products ADD COLUMN IF NOT EXISTS group_chat_id TEXT DEFAULT NULL
+            """)
 
-        c.execute("""
-            ALTER TABLE products ADD COLUMN IF NOT EXISTS link TEXT DEFAULT 'https://t.me/Kikukkvd'
-        """)
-        c.execute("""
-            ALTER TABLE products ADD COLUMN IF NOT EXISTS group_chat_id TEXT DEFAULT NULL
-        """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS banned_users (
+                    user_id BIGINT PRIMARY KEY,
+                    reason TEXT DEFAULT '',
+                    banned_at TEXT NOT NULL
+                )
+            """)
 
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS banned_users (
-                user_id BIGINT PRIMARY KEY,
-                reason TEXT DEFAULT '',
-                banned_at TEXT NOT NULL
-            )
-        """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS orders (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT,
+                    user_name TEXT,
+                    paket_id TEXT,
+                    order_id TEXT UNIQUE,
+                    status TEXT DEFAULT 'waiting',
+                    waktu TEXT
+                )
+            """)
 
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS orders (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT,
-                user_name TEXT,
-                paket_id TEXT,
-                order_id TEXT UNIQUE,
-                status TEXT DEFAULT 'waiting',
-                waktu TEXT
-            )
-        """)
+            c.execute("""
+                ALTER TABLE orders ADD COLUMN IF NOT EXISTS admin_msg_id BIGINT DEFAULT NULL
+            """)
+            # REVISI DATABASE: Menambahkan buyer_msg_id untuk melacak chat lama buyer
+            c.execute("""
+                ALTER TABLE orders ADD COLUMN IF NOT EXISTS buyer_msg_id BIGINT DEFAULT NULL
+            """)
+            c.execute("""
+                ALTER TABLE orders ADD COLUMN IF NOT EXISTS sent_link TEXT DEFAULT NULL
+            """)
+            c.execute("""
+                ALTER TABLE orders ADD COLUMN IF NOT EXISTS harga_dibayar INTEGER DEFAULT 0
+            """)
 
-        c.execute("""
-            ALTER TABLE orders ADD COLUMN IF NOT EXISTS admin_msg_id BIGINT DEFAULT NULL
-        """)
-        c.execute("""
-            ALTER TABLE orders ADD COLUMN IF NOT EXISTS sent_link TEXT DEFAULT NULL
-        """)
-        c.execute("""
-            ALTER TABLE orders ADD COLUMN IF NOT EXISTS harga_dibayar INTEGER DEFAULT 0
-        """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """)
 
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-        """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS cooldowns (
+                    user_id BIGINT PRIMARY KEY,
+                    expires_at TEXT NOT NULL
+                )
+            """)
 
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS cooldowns (
-                user_id BIGINT PRIMARY KEY,
-                expires_at TEXT NOT NULL
-            )
-        """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS admins (
+                    user_id BIGINT PRIMARY KEY,
+                    nama TEXT DEFAULT '',
+                    added_by BIGINT NOT NULL,
+                    added_at TEXT NOT NULL
+                )
+            """)
 
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS admins (
-                user_id BIGINT PRIMARY KEY,
-                nama TEXT DEFAULT '',
-                added_by BIGINT NOT NULL,
-                added_at TEXT NOT NULL
-            )
-        """)
+            for key, val in [
+                ('link_testimoni', 'https://t.me/+7zsdSrwYIG8wOTg1'),
+                ('link_admin', 'https://t.me/Kikukkvd'),
+            ]:
+                c.execute(
+                    "INSERT INTO settings (key, value) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+                    (key, val)
+                )
 
-        for key, val in [
-            ('link_testimoni', 'https://t.me/+7zsdSrwYIG8wOTg1'),
-            ('link_admin', 'https://t.me/Kikukkvd'),
-        ]:
-            c.execute(
-                "INSERT INTO settings (key, value) VALUES (%s, %s) ON CONFLICT DO NOTHING",
-                (key, val)
-            )
+            c.execute("SELECT COUNT(*) as cnt FROM products")
+            row = c.fetchone()
+            if row["cnt"] == 0:
+                c.executemany(
+                    """INSERT INTO products (paket_id, nama, emoji, deskripsi, harga, link)
+                       VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING""",
+                    [
+                        ("gb_biasa", "GB Biasa", "🔥", "160+ Video Premium", 5000, DEFAULT_LINK),
+                        ("gb_vip",   "GB VIP",   "👑", "6.800+ Video Premium", 25000, DEFAULT_LINK),
+                    ]
+                )
 
-        c.execute("SELECT COUNT(*) as cnt FROM products")
-        row = c.fetchone()
-        if row["cnt"] == 0:
-            c.executemany(
-                """INSERT INTO products (paket_id, nama, emoji, deskripsi, harga, link)
-                   VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING""",
-                [
-                    ("gb_biasa", "GB Biasa", "🔥", "160+ Video Premium", 5000, DEFAULT_LINK),
-                    ("gb_vip",   "GB VIP",   "👑", "6.800+ Video Premium", 25000, DEFAULT_LINK),
-                ]
-            )
-
-        conn.commit()
+            conn.commit()
     finally:
         release_conn(conn)
 
@@ -260,36 +267,36 @@ def init_db():
 def get_all_products():
     conn = get_conn()
     try:
-        c = conn.cursor()
-        c.execute("SELECT * FROM products ORDER BY harga ASC")
-        return [dict(r) for r in c.fetchall()]
+        with conn.cursor() as c:
+            c.execute("SELECT * FROM products ORDER BY harga ASC")
+            return [dict(r) for r in c.fetchall()]
     finally:
         release_conn(conn)
 
 def get_product(paket_id):
     conn = get_conn()
     try:
-        c = conn.cursor()
-        c.execute("SELECT * FROM products WHERE paket_id=%s", (paket_id,))
-        row = c.fetchone()
-        return dict(row) if row else None
+        with conn.cursor() as c:
+            c.execute("SELECT * FROM products WHERE paket_id=%s", (paket_id,))
+            row = c.fetchone()
+            return dict(row) if row else None
     finally:
         release_conn(conn)
 
 def add_product(paket_id, nama, emoji, deskripsi, harga, link=None, group_chat_id=None):
     conn = get_conn()
     try:
-        c = conn.cursor()
-        c.execute(
-            """INSERT INTO products (paket_id, nama, emoji, deskripsi, harga, link, group_chat_id)
-               VALUES (%s, %s, %s, %s, %s, %s, %s)
-               ON CONFLICT (paket_id) DO UPDATE SET
-                   nama=EXCLUDED.nama, emoji=EXCLUDED.emoji,
-                   deskripsi=EXCLUDED.deskripsi, harga=EXCLUDED.harga,
-                   link=EXCLUDED.link, group_chat_id=EXCLUDED.group_chat_id""",
-            (paket_id, nama, emoji, deskripsi, harga, link or DEFAULT_LINK, group_chat_id)
-        )
-        conn.commit()
+        with conn.cursor() as c:
+            c.execute(
+                """INSERT INTO products (paket_id, nama, emoji, deskripsi, harga, link, group_chat_id)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s)
+                   ON CONFLICT (paket_id) DO UPDATE SET
+                       nama=EXCLUDED.nama, emoji=EXCLUDED.emoji,
+                       deskripsi=EXCLUDED.deskripsi, harga=EXCLUDED.harga,
+                       link=EXCLUDED.link, group_chat_id=EXCLUDED.group_chat_id""",
+                (paket_id, nama, emoji, deskripsi, harga, link or DEFAULT_LINK, group_chat_id)
+            )
+            conn.commit()
     finally:
         release_conn(conn)
 
@@ -299,18 +306,18 @@ def update_product_field(paket_id, field, value):
         return
     conn = get_conn()
     try:
-        c = conn.cursor()
-        c.execute(f"UPDATE products SET {field}=%s WHERE paket_id=%s", (value, paket_id))
-        conn.commit()
+        with conn.cursor() as c:
+            c.execute(f"UPDATE products SET {field}=%s WHERE paket_id=%s", (value, paket_id))
+            conn.commit()
     finally:
         release_conn(conn)
 
 def delete_product(paket_id):
     conn = get_conn()
     try:
-        c = conn.cursor()
-        c.execute("DELETE FROM products WHERE paket_id=%s", (paket_id,))
-        conn.commit()
+        with conn.cursor() as c:
+            c.execute("DELETE FROM products WHERE paket_id=%s", (paket_id,))
+            conn.commit()
     finally:
         release_conn(conn)
 
@@ -323,43 +330,43 @@ def make_paket_id(nama):
 def get_active_order(user_id):
     conn = get_conn()
     try:
-        c = conn.cursor()
-        c.execute(
-            "SELECT * FROM orders WHERE user_id=%s AND status IN ('waiting','pending') ORDER BY id DESC LIMIT 1",
-            (user_id,)
-        )
-        row = c.fetchone()
-        return dict(row) if row else None
+        with conn.cursor() as c:
+            c.execute(
+                "SELECT * FROM orders WHERE user_id=%s AND status IN ('waiting','pending') ORDER BY id DESC LIMIT 1",
+                (user_id,)
+            )
+            row = c.fetchone()
+            return dict(row) if row else None
     finally:
         release_conn(conn)
 
 def get_all_pending():
     conn = get_conn()
     try:
-        c = conn.cursor()
-        c.execute("SELECT * FROM orders WHERE status='pending' ORDER BY id ASC")
-        return [dict(r) for r in c.fetchall()]
+        with conn.cursor() as c:
+            c.execute("SELECT * FROM orders WHERE status='pending' ORDER BY id ASC")
+            return [dict(r) for r in c.fetchall()]
     finally:
         release_conn(conn)
 
 def get_all_waiting():
     conn = get_conn()
     try:
-        c = conn.cursor()
-        c.execute("SELECT * FROM orders WHERE status='waiting' ORDER BY id ASC")
-        return [dict(r) for r in c.fetchall()]
+        with conn.cursor() as c:
+            c.execute("SELECT * FROM orders WHERE status='waiting' ORDER BY id ASC")
+            return [dict(r) for r in c.fetchall()]
     finally:
         release_conn(conn)
 
 def get_buyer_history(user_id, limit=10):
     conn = get_conn()
     try:
-        c = conn.cursor()
-        c.execute(
-            "SELECT * FROM orders WHERE user_id=%s ORDER BY id DESC LIMIT %s",
-            (user_id, limit)
-        )
-        return [dict(r) for r in c.fetchall()]
+        with conn.cursor() as c:
+            c.execute(
+                "SELECT * FROM orders WHERE user_id=%s ORDER BY id DESC LIMIT %s",
+                (user_id, limit)
+            )
+            return [dict(r) for r in c.fetchall()]
     finally:
         release_conn(conn)
 
@@ -367,66 +374,64 @@ def get_all_buyers():
     """Mengambil semua buyer yang terdaftar dengan query PostgreSQL yang aman."""
     conn = get_conn()
     try:
-        c = conn.cursor()
-        c.execute("""
-            SELECT user_id, user_name, MAX(id) as max_id 
-            FROM orders 
-            GROUP BY user_id, user_name 
-            ORDER BY max_id DESC
-        """)
-        return [dict(r) for r in c.fetchall()]
+        with conn.cursor() as c:
+            c.execute("""
+                SELECT user_id, user_name, MAX(id) as max_id 
+                FROM orders 
+                GROUP BY user_id, user_name 
+                ORDER BY max_id DESC
+            """)
+            return [dict(r) for r in c.fetchall()]
     finally:
         release_conn(conn)
 
 def get_order_stats():
     conn = get_conn()
     try:
-        c = conn.cursor()
+        with conn.cursor() as c:
+            today = now_wib().strftime("%d/%m/%Y")
+            this_month = now_wib().strftime("%m/%Y")
 
-        today = now_wib().strftime("%d/%m/%Y")
-        this_month = now_wib().strftime("%m/%Y")
+            c.execute("SELECT COUNT(*) as cnt FROM orders WHERE status='completed'")
+            total_orders = c.fetchone()['cnt']
 
-        c.execute("SELECT COUNT(*) as cnt FROM orders WHERE status='completed'")
-        total_orders = c.fetchone()['cnt']
+            c.execute("SELECT COUNT(*) as cnt FROM orders WHERE status='completed' AND waktu LIKE %s", (f"% — {today}",))
+            today_orders = c.fetchone()['cnt']
 
-        c.execute("SELECT COUNT(*) as cnt FROM orders WHERE status='completed' AND waktu LIKE %s", (f"% — {today}",))
-        today_orders = c.fetchone()['cnt']
+            c.execute("SELECT COUNT(*) as cnt FROM orders WHERE status='completed' AND waktu LIKE %s", (f"%/{this_month}",))
+            month_orders = c.fetchone()['cnt']
 
-        c.execute("SELECT COUNT(*) as cnt FROM orders WHERE status='completed' AND waktu LIKE %s", (f"%/{this_month}",))
-        month_orders = c.fetchone()['cnt']
+            c.execute("SELECT COUNT(*) as cnt FROM orders WHERE status IN ('waiting','pending')")
+            active_count = c.fetchone()['cnt']
 
-        c.execute("SELECT COUNT(*) as cnt FROM orders WHERE status IN ('waiting','pending')")
-        active_count = c.fetchone()['cnt']
+            c.execute("SELECT COUNT(*) as cnt FROM orders WHERE status='cancelled'")
+            cancelled_count = c.fetchone()['cnt']
 
-        c.execute("SELECT COUNT(*) as cnt FROM orders WHERE status='cancelled'")
-        cancelled_count = c.fetchone()['cnt']
+            c.execute("""
+                SELECT paket_id, COUNT(*) as cnt FROM orders
+                WHERE status='completed'
+                GROUP BY paket_id ORDER BY cnt DESC LIMIT 1
+            """)
+            best_row = c.fetchone()
+            best_product = None
+            if best_row:
+                p = get_product(best_row['paket_id'])
+                best_product = f"{p['emoji']} {p['nama']} ({best_row['cnt']}x)" if p else best_row['paket_id']
 
-        c.execute("""
-            SELECT paket_id, COUNT(*) as cnt FROM orders
-            WHERE status='completed'
-            GROUP BY paket_id ORDER BY cnt DESC LIMIT 1
-        """)
-        best_row = c.fetchone()
-        best_product = None
-        if best_row:
-            p = get_product(best_row['paket_id'])
-            best_product = f"{p['emoji']} {p['nama']} ({best_row['cnt']}x)" if p else best_row['paket_id']
+            c.execute("SELECT COALESCE(SUM(harga_dibayar), 0) as total FROM orders WHERE status='completed'")
+            total_revenue = c.fetchone()['total']
 
-        c.execute("SELECT COALESCE(SUM(harga_dibayar), 0) as total FROM orders WHERE status='completed'")
-        total_revenue = c.fetchone()['total']
+            c.execute(
+                "SELECT COALESCE(SUM(harga_dibayar), 0) as total FROM orders WHERE status='completed' AND waktu LIKE %s",
+                (f"% — {today}",)
+            )
+            today_revenue = c.fetchone()['total']
 
-        c.execute(
-            "SELECT COALESCE(SUM(harga_dibayar), 0) as total FROM orders WHERE status='completed' AND waktu LIKE %s",
-            (f"% — {today}",)
-        )
-        today_revenue = c.fetchone()['total']
-
-        c.execute(
-            "SELECT COALESCE(SUM(harga_dibayar), 0) as total FROM orders WHERE status='completed' AND waktu LIKE %s",
-            (f"%/{this_month}",)
-        )
-        month_revenue = c.fetchone()['total']
-
+            c.execute(
+                "SELECT COALESCE(SUM(harga_dibayar), 0) as total FROM orders WHERE status='completed' AND waktu LIKE %s",
+                (f"%/{this_month}",)
+            )
+            month_revenue = c.fetchone()['total']
     finally:
         release_conn(conn)
 
@@ -445,51 +450,60 @@ def get_order_stats():
 def update_order_status(order_id, status):
     conn = get_conn()
     try:
-        c = conn.cursor()
-        c.execute("UPDATE orders SET status=%s WHERE order_id=%s", (status, order_id))
-        conn.commit()
+        with conn.cursor() as c:
+            c.execute("UPDATE orders SET status=%s WHERE order_id=%s", (status, order_id))
+            conn.commit()
     finally:
         release_conn(conn)
 
 def get_order_by_id(order_id):
     conn = get_conn()
     try:
-        c = conn.cursor()
-        c.execute("SELECT * FROM orders WHERE order_id=%s", (order_id,))
-        row = c.fetchone()
-        return dict(row) if row else None
+        with conn.cursor() as c:
+            c.execute("SELECT * FROM orders WHERE order_id=%s", (order_id,))
+            row = c.fetchone()
+            return dict(row) if row else None
     finally:
         release_conn(conn)
 
 def set_admin_msg_id(order_id, msg_id):
     conn = get_conn()
     try:
-        c = conn.cursor()
-        c.execute("UPDATE orders SET admin_msg_id=%s WHERE order_id=%s", (msg_id, order_id))
-        conn.commit()
+        with conn.cursor() as c:
+            c.execute("UPDATE orders SET admin_msg_id=%s WHERE order_id=%s", (msg_id, order_id))
+            conn.commit()
+    finally:
+        release_conn(conn)
+
+def set_buyer_msg_id(order_id, msg_id):
+    conn = get_conn()
+    try:
+        with conn.cursor() as c:
+            c.execute("UPDATE orders SET buyer_msg_id=%s WHERE order_id=%s", (msg_id, order_id))
+            conn.commit()
     finally:
         release_conn(conn)
 
 def set_sent_link(order_id, link):
     conn = get_conn()
     try:
-        c = conn.cursor()
-        c.execute("UPDATE orders SET sent_link=%s WHERE order_id=%s", (link, order_id))
-        conn.commit()
+        with conn.cursor() as c:
+            c.execute("UPDATE orders SET sent_link=%s WHERE order_id=%s", (link, order_id))
+            conn.commit()
     finally:
         release_conn(conn)
 
 def save_order(user_id, user_name, paket_id, order_id, harga_dibayar=0):
     conn = get_conn()
     try:
-        c = conn.cursor()
-        c.execute(
-            """INSERT INTO orders (user_id, user_name, paket_id, order_id, status, waktu, harga_dibayar)
-               VALUES (%s, %s, %s, %s, 'waiting', %s, %s)""",
-            (user_id, user_name, paket_id, order_id,
-             now_wib().strftime("%H:%M — %d/%m/%Y"), harga_dibayar)
-        )
-        conn.commit()
+        with conn.cursor() as c:
+            c.execute(
+                """INSERT INTO orders (user_id, user_name, paket_id, order_id, status, waktu, harga_dibayar)
+                   VALUES (%s, %s, %s, %s, 'waiting', %s, %s)""",
+                (user_id, user_name, paket_id, order_id,
+                 now_wib().strftime("%H:%M — %d/%m/%Y"), harga_dibayar)
+            )
+            conn.commit()
     finally:
         release_conn(conn)
 
@@ -498,41 +512,41 @@ def save_order(user_id, user_name, paket_id, order_id, harga_dibayar=0):
 def is_banned(user_id):
     conn = get_conn()
     try:
-        c = conn.cursor()
-        c.execute("SELECT 1 FROM banned_users WHERE user_id=%s", (user_id,))
-        return c.fetchone() is not None
+        with conn.cursor() as c:
+            c.execute("SELECT 1 FROM banned_users WHERE user_id=%s", (user_id,))
+            return c.fetchone() is not None
     finally:
         release_conn(conn)
 
 def ban_user(user_id, reason=""):
     conn = get_conn()
     try:
-        c = conn.cursor()
-        c.execute(
-            """INSERT INTO banned_users (user_id, reason, banned_at)
-               VALUES (%s, %s, %s)
-               ON CONFLICT (user_id) DO UPDATE SET reason=EXCLUDED.reason, banned_at=EXCLUDED.banned_at""",
-            (user_id, reason, now_wib().strftime("%H:%M — %d/%m/%Y"))
-        )
-        conn.commit()
+        with conn.cursor() as c:
+            c.execute(
+                """INSERT INTO banned_users (user_id, reason, banned_at)
+                   VALUES (%s, %s, %s)
+                   ON CONFLICT (user_id) DO UPDATE SET reason=EXCLUDED.reason, banned_at=EXCLUDED.banned_at""",
+                (user_id, reason, now_wib().strftime("%H:%M — %d/%m/%Y"))
+            )
+            conn.commit()
     finally:
         release_conn(conn)
 
 def unban_user(user_id):
     conn = get_conn()
     try:
-        c = conn.cursor()
-        c.execute("DELETE FROM banned_users WHERE user_id=%s", (user_id,))
-        conn.commit()
+        with conn.cursor() as c:
+            c.execute("DELETE FROM banned_users WHERE user_id=%s", (user_id,))
+            conn.commit()
     finally:
         release_conn(conn)
 
 def get_all_banned():
     conn = get_conn()
     try:
-        c = conn.cursor()
-        c.execute("SELECT * FROM banned_users ORDER BY banned_at DESC")
-        return [dict(r) for r in c.fetchall()]
+        with conn.cursor() as c:
+            c.execute("SELECT * FROM banned_users ORDER BY banned_at DESC")
+            return [dict(r) for r in c.fetchall()]
     finally:
         release_conn(conn)
 
@@ -541,26 +555,26 @@ def get_all_banned():
 def get_setting(key, default=None):
     conn = get_conn()
     try:
-        c = conn.cursor()
-        c.execute("SELECT value FROM settings WHERE key=%s", (key,))
-        row = c.fetchone()
-        return row['value'] if row else default
+        with conn.cursor() as c:
+            c.execute("SELECT value FROM settings WHERE key=%s", (key,))
+            row = c.fetchone()
+            return row['value'] if row else default
     finally:
         release_conn(conn)
 
 def set_setting(key, value):
     conn = get_conn()
     try:
-        c = conn.cursor()
-        if value is None:
-            c.execute("DELETE FROM settings WHERE key=%s", (key,))
-        else:
-            c.execute(
-                """INSERT INTO settings (key, value) VALUES (%s, %s)
-                   ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value""",
-                (key, str(value))
-            )
-        conn.commit()
+        with conn.cursor() as c:
+            if value is None:
+                c.execute("DELETE FROM settings WHERE key=%s", (key,))
+            else:
+                c.execute(
+                    """INSERT INTO settings (key, value) VALUES (%s, %s)
+                       ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value""",
+                    (key, str(value))
+                )
+            conn.commit()
     finally:
         release_conn(conn)
 
@@ -571,39 +585,39 @@ def set_cooldown_db(user_id):
     expires_at = (now_wib() + timedelta(minutes=COOLDOWN_MENIT)).strftime('%Y-%m-%d %H:%M:%S')
     conn = get_conn()
     try:
-        c = conn.cursor()
-        c.execute(
-            """INSERT INTO cooldowns (user_id, expires_at) VALUES (%s, %s)
-               ON CONFLICT (user_id) DO UPDATE SET expires_at=EXCLUDED.expires_at""",
-            (user_id, expires_at)
-        )
-        conn.commit()
+        with conn.cursor() as c:
+            c.execute(
+                """INSERT INTO cooldowns (user_id, expires_at) VALUES (%s, %s)
+                   ON CONFLICT (user_id) DO UPDATE SET expires_at=EXCLUDED.expires_at""",
+                (user_id, expires_at)
+            )
+            conn.commit()
     finally:
         release_conn(conn)
 
 def get_cooldown_sisa_db(user_id):
     conn = get_conn()
     try:
-        c = conn.cursor()
-        c.execute("SELECT expires_at FROM cooldowns WHERE user_id=%s", (user_id,))
-        row = c.fetchone()
-        if not row:
-            return 0
-        try:
-            until = datetime.strptime(row['expires_at'], '%Y-%m-%d %H:%M:%S')
-            sisa = (until - now_wib()).total_seconds()
-            return max(0, int(sisa / 60) + 1) if sisa > 0 else 0
-        except Exception:
-            return 0
+        with conn.cursor() as c:
+            c.execute("SELECT expires_at FROM cooldowns WHERE user_id=%s", (user_id,))
+            row = c.fetchone()
+            if not row:
+                return 0
+            try:
+                until = datetime.strptime(row['expires_at'], '%Y-%m-%d %H:%M:%S')
+                sisa = (until - now_wib()).total_seconds()
+                return max(0, int(sisa / 60) + 1) if sisa > 0 else 0
+            except Exception:
+                return 0
     finally:
         release_conn(conn)
 
 def clear_cooldown_db(user_id):
     conn = get_conn()
     try:
-        c = conn.cursor()
-        c.execute("DELETE FROM cooldowns WHERE user_id=%s", (user_id,))
-        conn.commit()
+        with conn.cursor() as c:
+            c.execute("DELETE FROM cooldowns WHERE user_id=%s", (user_id,))
+            conn.commit()
     finally:
         release_conn(conn)
 
@@ -612,41 +626,41 @@ def clear_cooldown_db(user_id):
 def get_all_admins():
     conn = get_conn()
     try:
-        c = conn.cursor()
-        c.execute("SELECT * FROM admins ORDER BY added_at ASC")
-        return [dict(r) for r in c.fetchall()]
+        with conn.cursor() as c:
+            c.execute("SELECT * FROM admins ORDER BY added_at ASC")
+            return [dict(r) for r in c.fetchall()]
     finally:
         release_conn(conn)
 
 def add_admin(user_id, nama, added_by):
     conn = get_conn()
     try:
-        c = conn.cursor()
-        c.execute(
-            """INSERT INTO admins (user_id, nama, added_by, added_at)
-               VALUES (%s, %s, %s, %s)
-               ON CONFLICT (user_id) DO UPDATE SET nama=EXCLUDED.nama""",
-            (user_id, str(nama), added_by, now_wib().strftime("%H:%M — %d/%m/%Y"))
-        )
-        conn.commit()
+        with conn.cursor() as c:
+            c.execute(
+                """INSERT INTO admins (user_id, nama, added_by, added_at)
+                   VALUES (%s, %s, %s, %s)
+                   ON CONFLICT (user_id) DO UPDATE SET nama=EXCLUDED.nama""",
+                (user_id, str(nama), added_by, now_wib().strftime("%H:%M — %d/%m/%Y"))
+            )
+            conn.commit()
     finally:
         release_conn(conn)
 
 def remove_admin(user_id):
     conn = get_conn()
     try:
-        c = conn.cursor()
-        c.execute("DELETE FROM admins WHERE user_id=%s", (user_id,))
-        conn.commit()
+        with conn.cursor() as c:
+            c.execute("DELETE FROM admins WHERE user_id=%s", (user_id,))
+            conn.commit()
     finally:
         release_conn(conn)
 
 def is_admin_in_db(user_id):
     conn = get_conn()
     try:
-        c = conn.cursor()
-        c.execute("SELECT 1 FROM admins WHERE user_id=%s", (user_id,))
-        return c.fetchone() is not None
+        with conn.cursor() as c:
+            c.execute("SELECT 1 FROM admins WHERE user_id=%s", (user_id,))
+            return c.fetchone() is not None
     finally:
         release_conn(conn)
 
@@ -776,6 +790,15 @@ async def hapus_pesan_admin_order(bot, order_id):
     """Dibungkus menggunakan helper hapus_notif_lama demi kestabilan terpusat."""
     await hapus_notif_lama(bot, order_id)
 
+async def hapus_qris_buyer_lama(bot, order_id, user_id):
+    """Menghapus gambar QRIS yang sudah tidak digunakan di chat buyer."""
+    order = get_order_by_id(order_id)
+    if order and order.get('buyer_msg_id'):
+        try:
+            await bot.delete_message(chat_id=int(user_id), message_id=int(order['buyer_msg_id']))
+        except Exception:
+            pass
+
 # =================== MAIN MENU ===================
 
 def build_main_menu_text():
@@ -887,7 +910,7 @@ async def kirim_link_ke_buyer(context, user_id, paket, order_id, amount):
 # =================== WEBHOOK SERVER (PAKASIR) ===================
 
 async def pakasir_webhook_handler(request: aio_web.Request) -> aio_web.Response:
-    """Terima notifikasi pembayaran berhasil dari Pakasir secara real-time."""
+    """Terima notifikasi pembayaran berhasil dari Pakasir secara real-time dengan Verifikasi Ganda."""
     try:
         data = await request.json()
     except Exception:
@@ -910,6 +933,12 @@ async def pakasir_webhook_handler(request: aio_web.Request) -> aio_web.Response:
     if order['status'] != 'waiting':
         return aio_web.Response(text='already processed')
 
+    # --- CELAH KEAMANAN TERATASI: VERIFIKASI KEASLIAN WEBHOOK (DOUBLE CHECK VERIFICATION) ---
+    verified_detail = await get_transaction_detail(order_id, amount)
+    if not verified_detail or verified_detail.get('status') != 'completed':
+        print(f"[SECURITY ALERT] Percobaan transaksi ilegal webhook palsu diblokir! Order ID: {order_id}")
+        return aio_web.Response(status=400, text='verification failed')
+
     paket_id = order['paket_id']
     user_id = order['user_id']
     user_name = order.get('user_name', 'User')
@@ -928,14 +957,336 @@ async def pakasir_webhook_handler(request: aio_web.Request) -> aio_web.Response:
             )
         )
 
-    print(f"[WEBHOOK] ✅ Webhook diterima & diproses: {order_id}")
+    print(f"[WEBHOOK] ✅ Webhook sukses diverifikasi & diproses: {order_id}")
     return aio_web.Response(text='ok')
+
+
+# =================== TMA WEB DASHBOARD BACKEND & FRONTEND ===================
+
+async def api_get_stats(request: aio_web.Request) -> aio_web.Response:
+    """Mengembalikan data statistik penjualan dan estimasi saldo lengkap untuk Dashboard."""
+    conn = get_conn()
+    try:
+        with conn.cursor() as c:
+            # 1. Total Semua Waktu
+            c.execute("SELECT COALESCE(SUM(harga_dibayar), 0) as total, COUNT(*) as count FROM orders WHERE status='completed'")
+            row_all = c.fetchone()
+            total_revenue = row_all['total']
+            total_orders = row_all['count']
+
+            # 2. Hari Ini
+            today = now_wib().strftime("%d/%m/%Y")
+            c.execute("SELECT COALESCE(SUM(harga_dibayar), 0) as total, COUNT(*) as count FROM orders WHERE status='completed' AND waktu LIKE %s", (f"% — {today}",))
+            row_today = c.fetchone()
+            today_revenue = row_today['total']
+            today_orders = row_today['count']
+
+            # 3. Bulan Ini
+            this_month = now_wib().strftime("%m/%Y")
+            c.execute("SELECT COALESCE(SUM(harga_dibayar), 0) as total, COUNT(*) as count FROM orders WHERE status='completed' AND waktu LIKE %s", (f"%/{this_month}",))
+            row_month = c.fetchone()
+            month_revenue = row_month['total']
+            month_orders = row_month['count']
+
+            # 4. Status Penghitungan Transaksi
+            c.execute("SELECT COUNT(*) as count FROM orders WHERE status='waiting'")
+            active_waiting = c.fetchone()['count']
+            c.execute("SELECT COUNT(*) as count FROM orders WHERE status='pending'")
+            active_pending = c.fetchone()['count']
+            c.execute("SELECT COUNT(*) as count FROM orders WHERE status='cancelled'")
+            cancelled_count = c.fetchone()['count']
+            c.execute("SELECT COUNT(*) as count FROM orders WHERE status='expired'")
+            expired_count = c.fetchone()['count']
+
+            # 5. Detail Produk Terlaris
+            c.execute("""
+                SELECT o.paket_id, p.nama, p.emoji, COUNT(*) as count, COALESCE(SUM(o.harga_dibayar), 0) as total
+                FROM orders o
+                LEFT JOIN products p ON o.paket_id = p.paket_id
+                WHERE o.status='completed'
+                GROUP BY o.paket_id, p.nama, p.emoji
+                ORDER BY count DESC
+            """)
+            products_breakdown = [dict(r) for r in c.fetchall()]
+
+            # 6. ESTIMASI SALDO PAKASIR (Virtual Settlement Calculation - Settle H+1 12:00 WIB)
+            c.execute("SELECT harga_dibayar, waktu FROM orders WHERE status='completed'")
+            all_completed = c.fetchall()
+            
+            saldo_siap_cair = 0
+            saldo_tertahan = 0
+            
+            today_date_str = now_wib().strftime("%d/%m/%Y")
+            for order in all_completed:
+                try:
+                    waktu_parts = order['waktu'].split(" — ")
+                    if len(waktu_parts) == 2:
+                        order_date = waktu_parts[1].strip()
+                        if order_date == today_date_str:
+                            saldo_tertahan += order['harga_dibayar']
+                        else:
+                            saldo_siap_cair += order['harga_dibayar']
+                    else:
+                        saldo_siap_cair += order['harga_dibayar']
+                except Exception:
+                    saldo_siap_cair += order['harga_dibayar']
+
+    finally:
+        release_conn(conn)
+
+    return aio_web.json_response({
+        "total_revenue": total_revenue,
+        "total_orders": total_orders,
+        "today_revenue": today_revenue,
+        "today_orders": today_orders,
+        "month_revenue": month_revenue,
+        "month_orders": month_orders,
+        "active_waiting": active_waiting,
+        "active_pending": active_pending,
+        "cancelled_count": cancelled_count,
+        "expired_count": expired_count,
+        "saldo_siap_cair": saldo_siap_cair,
+        "saldo_tertahan": saldo_tertahan,
+        "products_breakdown": products_breakdown
+    })
+
+
+async def dashboard_html_handler(request: aio_web.Request) -> aio_web.Response:
+    """Menyajikan halaman frontend dashboard premium yang responsif untuk Telegram Mini App."""
+    html_content = """
+    <!DOCTYPE html>
+    <html lang="id">
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+        <title>Dashboard Admin - Hyper Family</title>
+        <!-- Tailwind CSS v4 & ApexCharts untuk visualisasi data interaktif -->
+        <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+        <script src="https://cdn.jsdelivr.net/npm/apexcharts"></script>
+        <!-- Telegram WebApp SDK -->
+        <script src="https://telegram.org/js/telegram-web-app.js"></script>
+        <style>
+            body {
+                background-color: #0b1426; /* Dark Navy Theme */
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            }
+        </style>
+    </head>
+    <body class="text-slate-100 min-h-screen pb-10">
+        <div class="max-w-md mx-auto px-4 py-4">
+            
+            <!-- Header -->
+            <div class="flex items-center justify-between mb-6">
+                <div>
+                    <h1 class="text-lg font-bold tracking-tight">HYPER FAMILY STORE</h1>
+                    <p class="text-xs text-slate-400">Live Dashboard & Settlement</p>
+                </div>
+                <span class="inline-flex items-center rounded-md bg-emerald-500/10 px-2 py-1 text-xs font-medium text-emerald-400 ring-1 ring-inset ring-emerald-500/20">
+                    Live Sync
+                </span>
+            </div>
+
+            <!-- SALDO ESTIMASI PAKASIR (Virtual Wallet) -->
+            <div class="bg-slate-900 border border-slate-800 rounded-2xl p-4 mb-4 shadow-xl">
+                <div class="flex items-center justify-between mb-3">
+                    <span class="text-xs font-semibold text-slate-400 tracking-wider uppercase">Estimasi Saldo Pakasir (H+1)</span>
+                    <span class="text-xs text-slate-500">Pukul 12:00 WIB</span>
+                </div>
+                <div class="grid grid-cols-2 gap-3">
+                    <div class="bg-slate-950 p-3 rounded-xl border border-emerald-500/10">
+                        <p class="text-[10px] text-slate-400 font-medium">💰 SIAP CAIR (Settle)</p>
+                        <p id="saldo_siap_cair" class="text-sm font-bold text-emerald-400 mt-1">Rp 0</p>
+                    </div>
+                    <div class="bg-slate-950 p-3 rounded-xl border border-yellow-500/10">
+                        <p class="text-[10px] text-slate-400 font-medium">⏳ TERTAHAN (Pending)</p>
+                        <p id="saldo_tertahan" class="text-sm font-bold text-yellow-400 mt-1">Rp 0</p>
+                    </div>
+                </div>
+                <p class="text-[9px] text-slate-500 mt-2 text-center italic">*Estimasi otomatis berdasarkan data penyelesaian transaksi lokal.</p>
+            </div>
+
+            <!-- PENJUALAN UTAMA -->
+            <div class="grid grid-cols-2 gap-3 mb-4">
+                <div class="bg-slate-900 border border-slate-800 rounded-2xl p-4">
+                    <p class="text-xs text-slate-400 font-medium">Hari Ini</p>
+                    <p id="today_revenue" class="text-base font-extrabold text-white mt-1">Rp 0</p>
+                    <p id="today_orders" class="text-[10px] text-emerald-400 mt-1">0 Transaksi</p>
+                </div>
+                <div class="bg-slate-900 border border-slate-800 rounded-2xl p-4">
+                    <p class="text-xs text-slate-400 font-medium">Bulan Ini</p>
+                    <p id="month_revenue" class="text-base font-extrabold text-white mt-1">Rp 0</p>
+                    <p id="month_orders" class="text-[10px] text-emerald-400 mt-1">0 Transaksi</p>
+                </div>
+            </div>
+
+            <!-- ALL TIME VALUE -->
+            <div class="bg-slate-900 border border-slate-800 rounded-2xl p-4 mb-4 flex items-center justify-between">
+                <div>
+                    <p class="text-xs text-slate-400 font-medium">Total Omset Penjualan</p>
+                    <p id="total_revenue" class="text-lg font-black text-indigo-400 mt-1">Rp 0</p>
+                </div>
+                <div class="text-right">
+                    <p class="text-xs text-slate-400 font-medium">Total Selesai</p>
+                    <p id="total_orders" class="text-base font-bold text-white mt-1">0</p>
+                </div>
+            </div>
+
+            <!-- GRAFIK STATUS ORDER (DONUT CHART) -->
+            <div class="bg-slate-900 border border-slate-800 rounded-2xl p-4 mb-4">
+                <h3 class="text-xs font-bold text-slate-400 tracking-wider uppercase mb-3">Distribusi Status Transaksi</h3>
+                <div id="chart_status"></div>
+            </div>
+
+            <!-- GRAFIK OMSET PER PRODUK (BAR CHART) -->
+            <div class="bg-slate-900 border border-slate-800 rounded-2xl p-4 mb-4">
+                <h3 class="text-xs font-bold text-slate-400 tracking-wider uppercase mb-3">Grafik Omset Produk</h3>
+                <div id="chart_products"></div>
+            </div>
+
+            <!-- PRODUK TERLARIS -->
+            <div class="bg-slate-900 border border-slate-800 rounded-2xl p-4">
+                <h3 class="text-xs font-bold text-slate-400 tracking-wider uppercase mb-3">Detail Produk Terlaris</h3>
+                <div id="products_list" class="space-y-3">
+                    <!-- Dinamis via JS -->
+                </div>
+            </div>
+
+        </div>
+
+        <script>
+            // Integrasi Telegram WebApp
+            const tg = window.Telegram.WebApp;
+            tg.expand();
+
+            const formatRupiah = (val) => {
+                return "Rp " + parseInt(val).toLocaleString('id-ID');
+            };
+
+            // Fetch Data dari API
+            fetch('/api/stats')
+                .then(res => res.json())
+                .then(data => {
+                    // Update Text Card
+                    document.getElementById('saldo_siap_cair').innerText = formatRupiah(data.saldo_siap_cair);
+                    document.getElementById('saldo_tertahan').innerText = formatRupiah(data.saldo_tertahan);
+                    document.getElementById('today_revenue').innerText = formatRupiah(data.today_revenue);
+                    document.getElementById('today_orders').innerText = data.today_orders + " Transaksi";
+                    document.getElementById('month_revenue').innerText = formatRupiah(data.month_revenue);
+                    document.getElementById('month_orders').innerText = data.month_orders + " Transaksi";
+                    document.getElementById('total_revenue').innerText = formatRupiah(data.total_revenue);
+                    document.getElementById('total_orders').innerText = data.total_orders;
+
+                    // render donut chart
+                    const optionsStatus = {
+                        series: [data.total_orders, data.active_waiting, data.active_pending, data.cancelled_count, data.expired_count],
+                        chart: {
+                            type: 'donut',
+                            height: 220,
+                            foreColor: '#94a3b8'
+                        },
+                        labels: ['Lunas', 'Menunggu', 'Diproses', 'Batal', 'Expired'],
+                        colors: ['#10b981', '#f59e0b', '#3b82f6', '#ef4444', '#64748b'],
+                        legend: {
+                            position: 'bottom'
+                        },
+                        dataLabels: {
+                            enabled: false
+                        },
+                        stroke: {
+                            show: false
+                        }
+                    };
+                    const chartStatus = new ApexCharts(document.querySelector("#chart_status"), optionsStatus);
+                    chartStatus.render();
+
+                    // render products breakdown bar chart
+                    const productLabels = data.products_breakdown.map(p => (p.emoji || '📦') + " " + (p.nama || p.paket_id));
+                    const productSales = data.products_breakdown.map(p => p.total);
+                    
+                    if (productSales.length > 0) {
+                        const optionsProducts = {
+                            series: [{
+                                name: 'Omset',
+                                data: productSales
+                            }],
+                            chart: {
+                                type: 'bar',
+                                height: 220,
+                                toolbar: { show: false },
+                                foreColor: '#94a3b8'
+                            },
+                            plotOptions: {
+                                bar: {
+                                    horizontal: true,
+                                    borderRadius: 4,
+                                }
+                            },
+                            colors: ['#6366f1'],
+                            dataLabels: { enabled: false },
+                            xaxis: {
+                                categories: productLabels,
+                                labels: {
+                                    formatter: function(val) {
+                                        return "Rp " + parseInt(val).toLocaleString('id-ID');
+                                    }
+                                }
+                            },
+                            tooltip: {
+                                theme: 'dark',
+                                y: {
+                                    formatter: function(val) {
+                                        return "Rp " + parseInt(val).toLocaleString('id-ID');
+                                    }
+                                }
+                            }
+                        };
+                        const chartProducts = new ApexCharts(document.querySelector("#chart_products"), optionsProducts);
+                        chartProducts.render();
+                    } else {
+                        document.querySelector("#chart_products").innerHTML = '<p class="text-xs text-slate-500 italic text-center py-10">Belum ada penjualan produk.</p>';
+                    }
+
+                    // render list produk terlaris
+                    const listContainer = document.getElementById('products_list');
+                    if (data.products_breakdown.length === 0) {
+                        listContainer.innerHTML = '<p class="text-xs text-slate-500 italic">Belum ada penjualan produk.</p>';
+                    } else {
+                        data.products_breakdown.forEach((p, idx) => {
+                            const row = document.createElement('div');
+                            row.className = "flex items-center justify-between border-b border-slate-800/50 pb-2 last:border-none last:pb-0";
+                            row.innerHTML = `
+                                <div class="flex items-center gap-3">
+                                    <span class="text-lg">${p.emoji || '📦'}</span>
+                                    <div>
+                                        <p class="text-xs font-semibold text-white">${p.nama || p.paket_id}</p>
+                                        <p class="text-[9px] text-slate-400">${p.count}x Terjual</p>
+                                    </div>
+                                </div>
+                                <span class="text-xs font-bold text-indigo-400">${formatRupiah(p.total)}</span>
+                            `;
+                            listContainer.appendChild(row);
+                        });
+                    }
+                })
+                .catch(err => console.error("Gagal mengambil data statistik:", err));
+        </script>
+    </body>
+    </html>
+    """
+    return aio_web.Response(text=html_content, content_type='text/html')
+
+# ============================================================================
 
 
 async def _start_webhook_server():
     """Jalankan aiohttp server untuk menerima webhook Pakasir dan health check Railway."""
     webhook_app = aio_web.Application()
     webhook_app.router.add_post('/webhook/pakasir', pakasir_webhook_handler)
+    
+    # REVISI ROUTING WEB: Mendaftarkan halaman dashboard dan endpoint statistik
+    webhook_app.router.add_get('/dashboard', dashboard_html_handler)
+    webhook_app.router.add_get('/api/stats', api_get_stats)
+
     webhook_app.router.add_get('/health', lambda r: aio_web.Response(text='ok'))
     webhook_app.router.add_get('/', lambda r: aio_web.Response(text='Hyper Family Store Bot — OK'))
 
@@ -944,7 +1295,7 @@ async def _start_webhook_server():
     port = int(os.environ.get('PORT', 8080))
     site = aio_web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
-    print(f"[WEBHOOK] Server berjalan di port {port} — siap terima webhook Pakasir")
+    print(f"[WEBHOOK] Server berjalan di port {port} — siap terima webhook & TMA Dashboard")
 
 
 # =================== POST INIT ===================
@@ -1032,6 +1383,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if trans and trans.get("status") == "completed":
             update_order_status(active["order_id"], "completed")
             _stop_payment_task(user_id)
+
+            # REVISI CHAT CLEANUP: Hapus QRIS di buyer saat start mendeteksi sudah lunas
+            await hapus_qris_buyer_lama(context.bot, active["order_id"], user_id)
 
             paid_amount = trans.get("amount", paket["harga"])
             link = await kirim_link_ke_buyer(context, user_id, paket, active["order_id"], paid_amount)
@@ -1180,7 +1534,8 @@ async def pilih_paket(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-    if not_trans_data := None if not trans_data else False:
+    # REVISI BUG LOGIKA: Memperbaiki logic checking error response Pakasir
+    if not trans_data:
         msg = await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text="❌ Gagal membuat invoice. Silakan coba lagi.\nKetik /start untuk memulai ulang.",
@@ -1249,6 +1604,10 @@ async def pilih_paket(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
+    
+    # REVISI CHAT CLEANUP: Menyimpan ID Pesan QRIS di buyer saat dikirim
+    set_buyer_msg_id(order_id, msg.message_id)
+
     simpan_msg_user(context, user_id, msg.message_id)
     await hapus_msg_user_lama(context, user_id, keep_last=1)
 
@@ -1290,6 +1649,9 @@ async def back_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await cancel_transaction(active["order_id"], amount)
         update_order_status(active["order_id"], "cancelled")
         _stop_payment_task(user_id)
+
+        # REVISI CHAT CLEANUP: Hapus foto QRIS lama jika dibatalkan pembeli
+        await hapus_qris_buyer_lama(context.bot, active["order_id"], user_id)
 
         set_cooldown_db(user_id)
 
@@ -1354,9 +1716,9 @@ async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
 
             conn = get_conn()
             try:
-                c = conn.cursor()
-                c.execute("SELECT status FROM orders WHERE order_id=%s", (order_id,))
-                row = c.fetchone()
+                with conn.cursor() as c:
+                    c.execute("SELECT status FROM orders WHERE order_id=%s", (order_id,))
+                    row = c.fetchone()
             finally:
                 release_conn(conn)
 
@@ -1374,9 +1736,9 @@ async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
         # TIMEOUT: cek sekali lagi sebelum expire
         conn = get_conn()
         try:
-            c = conn.cursor()
-            c.execute("SELECT status FROM orders WHERE order_id=%s", (order_id,))
-            row = c.fetchone()
+            with conn.cursor() as c:
+                c.execute("SELECT status FROM orders WHERE order_id=%s", (order_id,))
+                row = c.fetchone()
         finally:
             release_conn(conn)
 
@@ -1391,6 +1753,9 @@ async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
         if amount:
             await cancel_transaction(order_id, amount)
         update_order_status(order_id, 'expired')
+
+        # REVISI CHAT CLEANUP: Hapus QRIS di buyer jika kedaluwarsa (expired)
+        await hapus_qris_buyer_lama(bot, order_id, user_id)
 
         try:
             await bot.send_message(
@@ -1429,6 +1794,9 @@ async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
 
 async def _handle_payment_success(bot, order_id: str, paket_id: str, user_id: int,
                                    user_name: str, amount: int, trans: dict):
+    # REVISI CHAT CLEANUP: Hapus QRIS lama yang sudah lunas dibayar
+    await hapus_qris_buyer_lama(bot, order_id, user_id)
+
     paket = get_product(paket_id) or {"emoji": "📦", "nama": "Produk", "harga": amount, "link": DEFAULT_LINK}
     update_order_status(order_id, 'completed')
 
@@ -1520,15 +1888,15 @@ async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     conn = get_conn()
     try:
-        c = conn.cursor()
-        c.execute("""
-            SELECT o.id FROM orders o
-            JOIN products p ON o.paket_id = p.paket_id
-            WHERE o.user_id = %s AND o.status = 'completed'
-            AND p.group_chat_id = %s
-            ORDER BY o.id DESC LIMIT 1
-        """, (user_id, chat_id))
-        row = c.fetchone()
+        with conn.cursor() as c:
+            c.execute("""
+                SELECT o.id FROM orders o
+                JOIN products p ON o.paket_id = p.paket_id
+                WHERE o.user_id = %s AND o.status = 'completed'
+                AND p.group_chat_id = %s
+                ORDER BY o.id DESC LIMIT 1
+            """, (user_id, chat_id))
+            row = c.fetchone()
     finally:
         release_conn(conn)
 
@@ -1806,9 +2174,9 @@ async def admin_cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     conn = get_conn()
     try:
-        c = conn.cursor()
-        c.execute("SELECT * FROM orders WHERE order_id=%s AND status='waiting'", (order_id,))
-        order = c.fetchone()
+        with conn.cursor() as c:
+            c.execute("SELECT * FROM orders WHERE order_id=%s AND status='waiting'", (order_id,))
+            order = c.fetchone()
     finally:
         release_conn(conn)
 
@@ -1824,6 +2192,9 @@ async def admin_cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     update_order_status(order_id, 'cancelled')
     _stop_payment_task(target_user_id)
+
+    # REVISI CHAT CLEANUP: Hapus QRIS di buyer saat order dicancel admin
+    await hapus_qris_buyer_lama(context.bot, order_id, target_user_id)
 
     # Hapus pesan notifikasi lama di channel/admin
     await hapus_notif_lama(context.bot, order_id)
@@ -1879,9 +2250,9 @@ async def admin_manual_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
 
     conn = get_conn()
     try:
-        c = conn.cursor()
-        c.execute("SELECT * FROM orders WHERE order_id=%s AND status='waiting'", (order_id,))
-        order = c.fetchone()
+        with conn.cursor() as c:
+            c.execute("SELECT * FROM orders WHERE order_id=%s AND status='waiting'", (order_id,))
+            order = c.fetchone()
     finally:
         release_conn(conn)
 
@@ -1894,6 +2265,9 @@ async def admin_manual_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
 
     _stop_payment_task(target_user_id)
     update_order_status(order_id, 'completed')
+
+    # REVISI CHAT CLEANUP: Hapus QRIS di buyer saat order dikonfirmasi manual oleh admin
+    await hapus_qris_buyer_lama(context.bot, order_id, target_user_id)
 
     group_link = await generate_group_link(context.bot, paket, order_id)
     link = group_link or (paket.get("link") or DEFAULT_LINK)
@@ -2033,13 +2407,13 @@ async def cmd_riwayat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def _generate_json_export():
     conn = get_conn()
     try:
-        c = conn.cursor()
-        c.execute("SELECT * FROM products ORDER BY harga ASC")
-        products = [dict(r) for r in c.fetchall()]
-        c.execute("SELECT * FROM orders ORDER BY id ASC")
-        orders = [dict(r) for r in c.fetchall()]
-        c.execute("SELECT * FROM banned_users ORDER BY banned_at DESC")
-        banned = [dict(r) for r in c.fetchall()]
+        with conn.cursor() as c:
+            c.execute("SELECT * FROM products ORDER BY harga ASC")
+            products = [dict(r) for r in c.fetchall()]
+            c.execute("SELECT * FROM orders ORDER BY id ASC")
+            orders = [dict(r) for r in c.fetchall()]
+            c.execute("SELECT * FROM banned_users ORDER BY banned_at DESC")
+            banned = [dict(r) for r in c.fetchall()]
     finally:
         release_conn(conn)
 
@@ -2072,13 +2446,13 @@ async def _kirim_backup(bot):
     try:
         conn = get_conn()
         try:
-            c = conn.cursor()
-            c.execute("SELECT * FROM orders ORDER BY id DESC")
-            orders = c.fetchall()
-            c.execute("SELECT * FROM products ORDER BY harga ASC")
-            products = c.fetchall()
-            c.execute("SELECT * FROM banned_users ORDER BY banned_at DESC")
-            banned = c.fetchall()
+            with conn.cursor() as c:
+                c.execute("SELECT * FROM orders ORDER BY id DESC")
+                orders = c.fetchall()
+                c.execute("SELECT * FROM products ORDER BY harga ASC")
+                products = c.fetchall()
+                c.execute("SELECT * FROM banned_users ORDER BY banned_at DESC")
+                banned = c.fetchall()
         finally:
             release_conn(conn)
 
@@ -2205,74 +2579,73 @@ async def handle_json_document(update: Update, context: ContextTypes.DEFAULT_TYP
 
     conn = get_conn()
     try:
-        c = conn.cursor()
+        with conn.cursor() as c:
+            for p in products:
+                try:
+                    c.execute(
+                        """INSERT INTO products (paket_id, nama, emoji, deskripsi, harga, link, group_chat_id)
+                           VALUES (%(paket_id)s, %(nama)s, %(emoji)s, %(deskripsi)s, %(harga)s, %(link)s, %(group_chat_id)s)
+                           ON CONFLICT (paket_id) DO UPDATE SET
+                               nama=EXCLUDED.nama, emoji=EXCLUDED.emoji,
+                               deskripsi=EXCLUDED.deskripsi, harga=EXCLUDED.harga,
+                               link=EXCLUDED.link, group_chat_id=EXCLUDED.group_chat_id""",
+                        {
+                            "paket_id":     p.get("paket_id"),
+                            "nama":         p.get("nama"),
+                            "emoji":        p.get("emoji", "📦"),
+                            "deskripsi":    p.get("deskripsi", ""),
+                            "harga":        int(p.get("harga", 0)),
+                            "link":         p.get("link", DEFAULT_LINK),
+                            "group_chat_id": p.get("group_chat_id"),
+                        }
+                    )
+                    ok_p += 1
+                except Exception as e:
+                    print(f"[IMPORT] produk gagal: {e}")
+                    fail_p += 1
 
-        for p in products:
-            try:
-                c.execute(
-                    """INSERT INTO products (paket_id, nama, emoji, deskripsi, harga, link, group_chat_id)
-                       VALUES (%(paket_id)s, %(nama)s, %(emoji)s, %(deskripsi)s, %(harga)s, %(link)s, %(group_chat_id)s)
-                       ON CONFLICT (paket_id) DO UPDATE SET
-                           nama=EXCLUDED.nama, emoji=EXCLUDED.emoji,
-                           deskripsi=EXCLUDED.deskripsi, harga=EXCLUDED.harga,
-                           link=EXCLUDED.link, group_chat_id=EXCLUDED.group_chat_id""",
-                    {
-                        "paket_id":     p.get("paket_id"),
-                        "nama":         p.get("nama"),
-                        "emoji":        p.get("emoji", "📦"),
-                        "deskripsi":    p.get("deskripsi", ""),
-                        "harga":        int(p.get("harga", 0)),
-                        "link":         p.get("link", DEFAULT_LINK),
-                        "group_chat_id": p.get("group_chat_id"),
-                    }
-                )
-                ok_p += 1
-            except Exception as e:
-                print(f"[IMPORT] produk gagal: {e}")
-                fail_p += 1
+            for o in orders:
+                try:
+                    c.execute(
+                        """INSERT INTO orders
+                           (user_id, user_name, paket_id, order_id, status, waktu, harga_dibayar, sent_link)
+                           VALUES (%(user_id)s, %(user_name)s, %(paket_id)s, %(order_id)s,
+                                   %(status)s, %(waktu)s, %(harga_dibayar)s, %(sent_link)s)
+                           ON CONFLICT (order_id) DO NOTHING""",
+                        {
+                            "user_id":       o.get("user_id"),
+                            "user_name":     o.get("user_name"),
+                            "paket_id":      o.get("paket_id"),
+                            "order_id":      o.get("order_id"),
+                            "status":        o.get("status", "completed"),
+                            "waktu":         o.get("waktu", ""),
+                            "harga_dibayar": int(o.get("harga_dibayar") or 0),
+                            "sent_link":     o.get("sent_link"),
+                        }
+                    )
+                    ok_o += 1
+                except Exception as e:
+                    print(f"[IMPORT] order gagal: {e}")
+                    fail_o += 1
 
-        for o in orders:
-            try:
-                c.execute(
-                    """INSERT INTO orders
-                       (user_id, user_name, paket_id, order_id, status, waktu, harga_dibayar, sent_link)
-                       VALUES (%(user_id)s, %(user_name)s, %(paket_id)s, %(order_id)s,
-                               %(status)s, %(waktu)s, %(harga_dibayar)s, %(sent_link)s)
-                       ON CONFLICT (order_id) DO NOTHING""",
-                    {
-                        "user_id":       o.get("user_id"),
-                        "user_name":     o.get("user_name"),
-                        "paket_id":      o.get("paket_id"),
-                        "order_id":      o.get("order_id"),
-                        "status":        o.get("status", "completed"),
-                        "waktu":         o.get("waktu", ""),
-                        "harga_dibayar": int(o.get("harga_dibayar") or 0),
-                        "sent_link":     o.get("sent_link"),
-                    }
-                )
-                ok_o += 1
-            except Exception as e:
-                print(f"[IMPORT] order gagal: {e}")
-                fail_o += 1
+            for b in banned:
+                try:
+                    c.execute(
+                        """INSERT INTO banned_users (user_id, reason, banned_at)
+                           VALUES (%(user_id)s, %(reason)s, %(banned_at)s)
+                           ON CONFLICT (user_id) DO NOTHING""",
+                        {
+                            "user_id":   b.get("user_id"),
+                            "reason":    b.get("reason", ""),
+                            "banned_at": b.get("banned_at", now_wib().strftime("%H:%M — %d/%m/%Y")),
+                        }
+                    )
+                    ok_b += 1
+                except Exception as e:
+                    print(f"[IMPORT] banned user gagal: {e}")
+                    fail_b += 1
 
-        for b in banned:
-            try:
-                c.execute(
-                    """INSERT INTO banned_users (user_id, reason, banned_at)
-                       VALUES (%(user_id)s, %(reason)s, %(banned_at)s)
-                       ON CONFLICT (user_id) DO NOTHING""",
-                    {
-                        "user_id":   b.get("user_id"),
-                        "reason":    b.get("reason", ""),
-                        "banned_at": b.get("banned_at", now_wib().strftime("%H:%M — %d/%m/%Y")),
-                    }
-                )
-                ok_b += 1
-            except Exception as e:
-                print(f"[IMPORT] banned user gagal: {e}")
-                fail_b += 1
-
-        conn.commit()
+            conn.commit()
     finally:
         release_conn(conn)
 
@@ -2301,12 +2674,12 @@ async def resend_group_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     conn = get_conn()
     try:
-        c = conn.cursor()
-        c.execute(
-            "SELECT * FROM orders WHERE order_id=%s AND user_id=%s AND status='completed'",
-            (order_id, user_id)
-        )
-        order = c.fetchone()
+        with conn.cursor() as c:
+            c.execute(
+                "SELECT * FROM orders WHERE order_id=%s AND user_id=%s AND status='completed'",
+                (order_id, user_id)
+            )
+            order = c.fetchone()
     finally:
         release_conn(conn)
 
@@ -2349,12 +2722,12 @@ def get_buyers_for_reminder(hari: int):
     target_date = (now_wib() - timedelta(days=hari)).strftime("%d/%m/%Y")
     conn = get_conn()
     try:
-        c = conn.cursor()
-        c.execute(
-            "SELECT DISTINCT user_id, user_name FROM orders WHERE status='completed' AND waktu LIKE %s",
-            (f"% — {target_date}",)
-        )
-        return [dict(r) for r in c.fetchall()]
+        with conn.cursor() as c:
+            c.execute(
+                "SELECT DISTINCT user_id, user_name FROM orders WHERE status='completed' AND waktu LIKE %s",
+                (f"% — {target_date}",)
+            )
+            return [dict(r) for r in c.fetchall()]
     finally:
         release_conn(conn)
 
@@ -2651,13 +3024,21 @@ async def admin_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
         sent = 0
         failed = 0
+        # REVISI BROADCAST (FLOOD CONTROL): Mencegah pemblokiran rate-limit Telegram
         for b in buyers:
             try:
                 await context.bot.send_message(chat_id=b['user_id'], text=blast_text)
                 sent += 1
+            except telegram.error.RetryAfter as e:
+                await asyncio.sleep(e.retry_after)
+                try:
+                    await context.bot.send_message(chat_id=b['user_id'], text=blast_text)
+                    sent += 1
+                except Exception:
+                    failed += 1
             except Exception:
                 failed += 1
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.1)
 
         try:
             await status_msg.delete()
@@ -2870,9 +3251,9 @@ async def admin_proses_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     conn = get_conn()
     try:
-        c = conn.cursor()
-        c.execute("SELECT * FROM orders WHERE user_id=%s AND status='pending' ORDER BY id DESC LIMIT 1", (user_id,))
-        order = c.fetchone()
+        with conn.cursor() as c:
+            c.execute("SELECT * FROM orders WHERE user_id=%s AND status='pending' ORDER BY id DESC LIMIT 1", (user_id,))
+            order = c.fetchone()
     finally:
         release_conn(conn)
 
@@ -2952,12 +3333,12 @@ async def admin_konfirmasi(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     conn = get_conn()
     try:
-        c = conn.cursor()
-        c.execute(
-            "SELECT * FROM orders WHERE user_id=%s AND status='pending' ORDER BY id DESC LIMIT 1",
-            (user_id,)
-        )
-        order = c.fetchone()
+        with conn.cursor() as c:
+            c.execute(
+                "SELECT * FROM orders WHERE user_id=%s AND status='pending' ORDER BY id DESC LIMIT 1",
+                (user_id,)
+            )
+            order = c.fetchone()
     finally:
         release_conn(conn)
 
@@ -2969,6 +3350,9 @@ async def admin_konfirmasi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     paket = get_product(order["paket_id"]) or {"emoji": "📦", "nama": order["paket_id"], "harga": 0, "link": DEFAULT_LINK}
 
     if action == "confirm":
+        # REVISI CHAT CLEANUP: Hapus QRIS di buyer pada konfirmasi manual (pending orders)
+        await hapus_qris_buyer_lama(context.bot, order["order_id"], user_id)
+
         group_link = await generate_group_link(context.bot, paket, order["order_id"])
         link = group_link or (paket.get("link") or DEFAULT_LINK)
 
@@ -3034,6 +3418,9 @@ async def admin_konfirmasi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "reject":
         update_order_status(order["order_id"], 'rejected')
         
+        # REVISI CHAT CLEANUP: Hapus QRIS di buyer jika ditolak oleh admin
+        await hapus_qris_buyer_lama(context.bot, order["order_id"], user_id)
+
         # Hapus pesan notifikasi lama di channel/admin
         await hapus_notif_lama(context.bot, order["order_id"])
 
@@ -3231,10 +3618,20 @@ async def admpanel_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if s['best_product']:
         text += f"🥇 *Produk Terlaris:* {esc(s['best_product'])}\n\n"
     text += f"_Update: {now_wib().strftime('%H:%M, %d/%m/%Y')}_"
+
+    # REVISI: Tambahkan tombol WebApp jika WEBAPP_URL sudah dikonfigurasi di env var
+    keyboard = []
+    if WEBAPP_URL and "your-domain" not in WEBAPP_URL:
+        # Hapus slash di belakang jika ada, lalu arahkan ke /dashboard
+        clean_url = f"{WEBAPP_URL.rstrip('/')}/dashboard"
+        keyboard.append([InlineKeyboardButton("📊 Buka Web Dashboard", web_app=WebAppInfo(url=clean_url))])
+    
+    keyboard.append([InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_back")])
+
     await query.edit_message_text(
         text,
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_back")]])
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
 async def admpanel_blast(update: Update, context: ContextTypes.DEFAULT_TYPE):

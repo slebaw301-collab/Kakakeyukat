@@ -4404,6 +4404,22 @@ async def admpanel_admin_del(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 # =================== MAIN ===================
 
+# =================== ADMIN: LINK ===================
+
+async def cmd_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update.message.from_user.id):
+        return
+    products = await get_all_products()
+    text = "<b>🔗 LINK PRODUK SAAT INI</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    for p in products:
+        grp = p.get('group_chat_id')
+        if grp:
+            text += f"{p['emoji']} <b>{html_module.escape(p['nama'])}</b>\n├ 🏢 Group: <code>{grp}</code>\n└ 🔗 Fallback: <code>{p['link']}</code>\n\n"
+        else:
+            text += f"{p['emoji']} <b>{html_module.escape(p['nama'])}</b>\n└ <code>{p['link']}</code>\n\n"
+    text += "<i>Ubah link lewat menu Produk.</i>"
+    await update.message.reply_text(text, parse_mode="HTML")
+
 def main():
     init_pool()
     init_db()

@@ -3,6 +3,7 @@ import asyncio
 import re
 import json
 import logging
+import math
 import random
 import string
 import html as html_module
@@ -16,7 +17,7 @@ from psycopg2.pool import ThreadedConnectionPool
 from io import BytesIO
 from datetime import datetime, timedelta, timezone
 import telegram.error
-from telegram import Update, BotCommand, BotCommandScopeChat, BotCommandScopeDefault, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
+from telegram import Update, BotCommand, BotCommandScopeChat, BotCommandScopeDefault, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, ChatJoinRequestHandler, filters, ContextTypes
@@ -36,7 +37,9 @@ def samarkan_nama(nama: str) -> str:
     parts = nama.split()
     masked_parts = []
     for part in parts:
-        if len(part) <= 2:
+        if len(part) == 1:
+            masked_parts.append(part[0])
+        elif len(part) == 2:
             masked_parts.append(part[0] + "*")
         else:
             masked_parts.append(part[:2] + "*" * (len(part) - 2))
@@ -471,30 +474,88 @@ def get_all_buyers():
     finally:
         release_conn(conn)
 
+def _get_managed_groups_sync() -> list:
+    conn = get_conn()
+    try:
+        with conn.cursor() as c:
+            c.execute("SELECT value FROM settings WHERE key='managed_groups'")
+            row = c.fetchone()
+            if row and row['value']:
+                import json as _json
+                return _json.loads(row['value'])
+            return []
+    finally:
+        release_conn(conn)
+
+def _set_managed_groups_sync(groups: list):
+    import json as _json
+    conn = get_conn()
+    try:
+        with conn.cursor() as c:
+            c.execute(
+                "INSERT INTO settings (key, value) VALUES ('managed_groups', %s) "
+                "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
+                (_json.dumps(groups),)
+            )
+        conn.commit()
+    finally:
+        release_conn(conn)
+
+async def get_managed_groups() -> list:
+    return await asyncio.to_thread(_get_managed_groups_sync)
+
+async def set_managed_groups(groups: list):
+    return await asyncio.to_thread(_set_managed_groups_sync, groups)
+
 @async_wrap
 def get_order_stats(today_start: datetime, month_start: datetime):
     """
     Mengambil data laporan statistik toko dengan akurasi zona waktu WIB.
-    Parameter hari ini dan bulan ini dikalkulasi di Python lalu dikirim ke PostgreSQL.
+    Semua pengelompokan tanggal/jam menggunakan AT TIME ZONE 'Asia/Jakarta'
+    agar tidak salah offset karena PostgreSQL menyimpan TIMESTAMPTZ dalam UTC.
     """
     conn = get_conn()
     try:
         with conn.cursor() as c:
-            # Total completed all time
+            yesterday_start = today_start - timedelta(days=1)
+            if month_start.month == 1:
+                last_month_start = month_start.replace(year=month_start.year - 1, month=12, day=1)
+            else:
+                last_month_start = month_start.replace(month=month_start.month - 1, day=1)
+            last_month_end = month_start
+
+            # --- Hari ini & kemarin ---
+            c.execute("""
+                SELECT COUNT(*) as cnt, COALESCE(SUM(harga_dibayar), 0) as rev
+                FROM orders WHERE status='completed' AND created_at >= %s
+            """, (today_start,))
+            r = c.fetchone(); today_completed = r['cnt']; today_revenue = r['rev']
+
+            c.execute("""
+                SELECT COUNT(*) as cnt, COALESCE(SUM(harga_dibayar), 0) as rev
+                FROM orders WHERE status='completed' AND created_at >= %s AND created_at < %s
+            """, (yesterday_start, today_start))
+            r = c.fetchone(); yesterday_completed = r['cnt']; yesterday_revenue = r['rev']
+
+            # --- Bulan ini & bulan lalu ---
+            c.execute("""
+                SELECT COUNT(*) as cnt, COALESCE(SUM(harga_dibayar), 0) as rev
+                FROM orders WHERE status='completed' AND created_at >= %s
+            """, (month_start,))
+            r = c.fetchone(); month_completed = r['cnt']; month_revenue = r['rev']
+
+            c.execute("""
+                SELECT COUNT(*) as cnt, COALESCE(SUM(harga_dibayar), 0) as rev
+                FROM orders WHERE status='completed' AND created_at >= %s AND created_at < %s
+            """, (last_month_start, last_month_end))
+            r = c.fetchone(); last_month_completed = r['cnt']; last_month_revenue = r['rev']
+
+            # --- All time totals ---
             c.execute("SELECT COUNT(*) as cnt FROM orders WHERE status='completed'")
             total_orders = c.fetchone()['cnt']
 
-            # Hari ini (WIB)
-            c.execute("SELECT COUNT(*) as cnt FROM orders WHERE status='completed' AND created_at >= %s", (today_start,))
-            today_completed = c.fetchone()['cnt']
-
-            # Bulan ini (WIB)
-            c.execute("SELECT COUNT(*) as cnt FROM orders WHERE status='completed' AND created_at >= %s", (month_start,))
-            month_completed = c.fetchone()['cnt']
-
-            # Total Generated Orders All Time (unfiltered)
             c.execute("SELECT COUNT(*) as cnt FROM orders")
-            total_generated = c.fetchone()['cnt'] or 1 # Hindari division by zero
+            total_generated = c.fetchone()['cnt'] or 1
 
             c.execute("SELECT COUNT(*) as cnt FROM orders WHERE status IN ('waiting','pending')")
             active_count = c.fetchone()['cnt']
@@ -505,41 +566,76 @@ def get_order_stats(today_start: datetime, month_start: datetime):
             c.execute("SELECT COUNT(*) as cnt FROM orders WHERE status='expired'")
             expired_count = c.fetchone()['cnt']
 
-            # Revenue
             c.execute("SELECT COALESCE(SUM(harga_dibayar), 0) as total FROM orders WHERE status='completed'")
             total_revenue = c.fetchone()['total']
 
-            c.execute("SELECT COALESCE(SUM(harga_dibayar), 0) as total FROM orders WHERE status='completed' AND created_at >= %s", (today_start,))
-            today_revenue = c.fetchone()['total']
-
-            c.execute("SELECT COALESCE(SUM(harga_dibayar), 0) as total FROM orders WHERE status='completed' AND created_at >= %s", (month_start,))
-            month_revenue = c.fetchone()['total']
-
-            # Average Order Value (AOV)
             aov = round(total_revenue / total_orders) if total_orders > 0 else 0
 
-            # Conversion Rate (Rasio Konversi)
-            conversion_rate = round((total_orders / total_generated) * 100, 1) if total_generated > 0 else 0
+            # --- Pembeli ---
+            c.execute("SELECT COUNT(DISTINCT user_id) as cnt FROM orders WHERE status='completed'")
+            total_buyers = c.fetchone()['cnt']
 
-            # Produk terlaris
             c.execute("""
-                SELECT paket_id, COUNT(*) as cnt FROM orders
-                WHERE status='completed'
-                GROUP BY paket_id ORDER BY cnt DESC LIMIT 1
+                SELECT COUNT(*) as cnt FROM (
+                    SELECT user_id FROM orders WHERE status='completed'
+                    GROUP BY user_id HAVING COUNT(*) > 1
+                ) t
             """)
-            best_row = c.fetchone()
-            best_product = None
-            if best_row:
-                p = _get_product_sync(best_row['paket_id'])
-                best_product = f"{p['emoji']} {p['nama']} ({best_row['cnt']}x)" if p else best_row['paket_id']
+            repeat_buyers = c.fetchone()['cnt']
 
-            # Rating & testimoni
+            c.execute("""
+                SELECT COUNT(DISTINCT user_id) as cnt FROM orders
+                WHERE status='completed' AND created_at >= %s
+                AND user_id NOT IN (
+                    SELECT DISTINCT user_id FROM orders
+                    WHERE status='completed' AND created_at < %s
+                )
+            """, (month_start, month_start))
+            new_buyers_month = c.fetchone()['cnt']
+
+            # --- Tren 7 hari (TIMEZONE-SAFE) ---
+            c.execute("""
+                SELECT
+                    DATE(created_at AT TIME ZONE 'Asia/Jakarta') as hari,
+                    COUNT(*) as cnt,
+                    COALESCE(SUM(harga_dibayar), 0) as rev
+                FROM orders
+                WHERE status='completed' AND created_at >= %s
+                GROUP BY DATE(created_at AT TIME ZONE 'Asia/Jakarta')
+                ORDER BY hari ASC
+            """, (today_start - timedelta(days=6),))
+            trend_7d = [dict(r) for r in c.fetchall()]
+
+            # --- Jam tersibuk (TIMEZONE-SAFE) ---
+            c.execute("""
+                SELECT
+                    EXTRACT(HOUR FROM (created_at AT TIME ZONE 'Asia/Jakarta'))::int as jam,
+                    COUNT(*) as cnt
+                FROM orders WHERE status='completed'
+                GROUP BY jam ORDER BY cnt DESC LIMIT 1
+            """)
+            peak_row = c.fetchone()
+            peak_hour = peak_row['jam'] if peak_row else None
+            peak_count = peak_row['cnt'] if peak_row else 0
+
+            # --- Rata-rata harian 30 hari ---
+            c.execute("""
+                SELECT COALESCE(SUM(harga_dibayar), 0) as rev
+                FROM orders WHERE status='completed' AND created_at >= %s
+            """, (today_start - timedelta(days=29),))
+            rev_30d = c.fetchone()['rev']
+            avg_daily_revenue = round(rev_30d / 30) if rev_30d else 0
+
+            # --- Rating & testimoni ---
             c.execute("SELECT COALESCE(AVG(rating), 0) as avg, COUNT(*) as cnt FROM testimonials WHERE status='approved'")
             testi_row = c.fetchone()
             avg_rating = round(float(testi_row['avg']), 1)
             total_testi = testi_row['cnt']
 
-            # Breakdown per produk
+            c.execute("SELECT COUNT(*) as cnt FROM testimonials WHERE status='pending'")
+            pending_testi = c.fetchone()['cnt']
+
+            # --- Breakdown per produk ---
             c.execute("""
                 SELECT o.paket_id, p.nama, p.emoji, COUNT(*) as cnt, COALESCE(SUM(o.harga_dibayar), 0) as total
                 FROM orders o
@@ -550,9 +646,12 @@ def get_order_stats(today_start: datetime, month_start: datetime):
             """)
             products_breakdown = [dict(r) for r in c.fetchall()]
 
-            # Total buyer unik
-            c.execute("SELECT COUNT(DISTINCT user_id) as cnt FROM orders WHERE status='completed'")
-            total_buyers = c.fetchone()['cnt']
+            best_product = None
+            if products_breakdown:
+                b = products_breakdown[0]
+                emoji = b.get('emoji') or '📦'
+                nama = b.get('nama') or b['paket_id']
+                best_product = f"{emoji} {nama} ({b['cnt']}x)"
 
     finally:
         release_conn(conn)
@@ -560,21 +659,31 @@ def get_order_stats(today_start: datetime, month_start: datetime):
     return {
         'total_orders': total_orders,
         'today_completed': today_completed,
+        'today_revenue': today_revenue,
+        'yesterday_completed': yesterday_completed,
+        'yesterday_revenue': yesterday_revenue,
         'month_completed': month_completed,
+        'month_revenue': month_revenue,
+        'last_month_completed': last_month_completed,
+        'last_month_revenue': last_month_revenue,
         'total_generated': total_generated,
         'active_count': active_count,
         'cancelled_count': cancelled_count,
         'expired_count': expired_count,
         'best_product': best_product,
         'total_revenue': total_revenue,
-        'today_revenue': today_revenue,
-        'month_revenue': month_revenue,
+        'avg_daily_revenue': avg_daily_revenue,
         'aov': aov,
-        'conversion_rate': conversion_rate,
+        'total_buyers': total_buyers,
+        'repeat_buyers': repeat_buyers,
+        'new_buyers_month': new_buyers_month,
+        'trend_7d': trend_7d,
+        'peak_hour': peak_hour,
+        'peak_count': peak_count,
         'avg_rating': avg_rating,
         'total_testi': total_testi,
+        'pending_testi': pending_testi,
         'products_breakdown': products_breakdown,
-        'total_buyers': total_buyers,
     }
 
 @async_wrap
@@ -751,7 +860,7 @@ def get_cooldown_sisa_db(user_id):
                 until = datetime.strptime(row['expires_at'], '%Y-%m-%d %H:%M:%S')
                 until = until.replace(tzinfo=WIB)
                 sisa = (until - now_wib()).total_seconds()
-                return max(0, int(sisa / 60) + 1) if sisa > 0 else 0
+                return math.ceil(sisa / 60) if sisa > 0 else 0
             except Exception as e:
                 logger.error(f"[COOLDOWN] Gagal menghitung sisa cooldown: {e}")
                 return 0
@@ -828,7 +937,12 @@ def format_harga(harga):
 
 def hitung_durasi(waktu_str):
     try:
-        order_time = datetime.strptime(waktu_str, "%H:%M — %d/%m/%Y")
+        parts = re.split(r'\s*[—\-]\s*', waktu_str, maxsplit=1)
+        if len(parts) != 2:
+            return waktu_str
+        time_part = parts[0].strip()
+        date_part = parts[1].strip()
+        order_time = datetime.strptime(f"{time_part} {date_part}", "%H:%M %d/%m/%Y")
         order_time = order_time.replace(tzinfo=WIB)
         delta = now_wib() - order_time
         total_minutes = int(delta.total_seconds() / 60)
@@ -1148,14 +1262,23 @@ async def post_init(application: Application):
             paket = await get_product(order['paket_id'])
             if not paket:
                 continue
+            recovery_amount = order.get('harga_dibayar') or paket['harga']
+            if order.get('created_at'):
+                try:
+                    elapsed = int((now_wib() - order['created_at']).total_seconds())
+                    recovery_timeout = max(300, 1800 - elapsed)
+                except Exception:
+                    recovery_timeout = 300
+            else:
+                recovery_timeout = 300
             _start_payment_task(
                 application.bot,
                 order_id=order['order_id'],
                 paket_id=order['paket_id'],
                 user_id=order['user_id'],
                 user_name=order.get('user_name', 'User'),
-                amount=paket['harga'],
-                timeout_seconds=1800
+                amount=recovery_amount,
+                timeout_seconds=recovery_timeout
             )
             logger.info(f"[POST_INIT] Task dimulai ulang untuk order {order['order_id']}")
 
@@ -1471,7 +1594,7 @@ async def pilih_paket(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     _start_payment_task(
         context.bot, order_id, paket_id, user_id, user_name,
-        paket["harga"], timeout_seconds=timeout_secs
+        total_payment, timeout_seconds=timeout_secs
     )
 
 async def back_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1482,7 +1605,7 @@ async def back_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     active = await get_active_order(user_id)
     if active:
         paket = await get_product(active["paket_id"])
-        amount = paket["harga"] if paket else 0
+        amount = active.get("harga_dibayar") or (paket["harga"] if paket else 0)
         if amount:
             await cancel_transaction(active["order_id"], amount)
         await update_order_status(active["order_id"], "cancelled")
@@ -1822,12 +1945,13 @@ async def handle_rate_text_skip(update: Update, context: ContextTypes.DEFAULT_TY
     rating = temp['rating']
     review_text = "Tidak ada ulasan tertulis."
 
-    await save_testimonial(query.from_user.id, query.from_user.full_name, "", order_id, rating, review_text)
-
     order = await get_order_by_id(order_id)
-    paket = await get_product(order['paket_id']) if order else None
+    paket_id_testi = order['paket_id'] if order else ""
+    paket = await get_product(paket_id_testi) if order else None
     paket_nama = paket['nama'] if paket else "Produk"
     paket_emoji = paket['emoji'] if paket else "📦"
+
+    await save_testimonial(query.from_user.id, query.from_user.full_name, paket_id_testi, order_id, rating, review_text)
 
     moderation_text = (
         f"📩 <b>MODERASI TESTIMONI BARU</b>\n"
@@ -1852,7 +1976,7 @@ async def handle_rate_text_skip(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception as e:
         logger.error(f"Gagal mengirim notif moderasi ke admin: {e}")
 
-    await query.edit_message_text("🙏 Terima kasih banyak! Penilaian Anda telah dikirim and menunggu peninjauan admin.")
+    await query.edit_message_text("🙏 Terima kasih banyak! Penilaian Anda telah dikirim dan menunggu peninjauan admin.")
 
 async def handle_rate_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -2201,6 +2325,10 @@ async def admin_cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query = update.callback_query
     await query.answer()
 
+    if not await is_admin(query.from_user.id):
+        await query.answer("⛔ Akses ditolak.", show_alert=True)
+        return
+
     parts = query.data.split("|")
     if len(parts) != 3:
         await query.answer("Format tidak valid.", show_alert=True)
@@ -2217,8 +2345,9 @@ async def admin_cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
     order = dict(order)
     paket = await get_product(order['paket_id']) or {"emoji": "📦", "nama": order['paket_id'], "harga": 0}
 
-    if paket['harga']:
-        await cancel_transaction(order_id, paket['harga'])
+    cancel_amount = order.get('harga_dibayar') or paket.get('harga', 0)
+    if cancel_amount:
+        await cancel_transaction(order_id, cancel_amount)
 
     await update_order_status(order_id, 'cancelled')
     _stop_payment_task(target_user_id)
@@ -2350,75 +2479,130 @@ async def admin_manual_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # =================== ADMIN: STATISTIK ===================
 
-async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.message.from_user.id):
-        return
+def _format_short(harga: int) -> str:
+    if harga >= 1_000_000:
+        return f"Rp {harga/1_000_000:.1f}Jt"
+    elif harga >= 1_000:
+        return f"Rp {harga//1_000}rb"
+    return format_harga(harga)
 
-    # Hitung batas waktu harian dan bulanan secara akurat (WIB)
-    now = now_wib()
-    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+def _build_stats_text(s: dict, now: datetime) -> str:
+    def growth_str(new_val, old_val, is_money=False):
+        if old_val == 0:
+            return ""
+        diff = new_val - old_val
+        if diff > 0:
+            label = _format_short(diff) if is_money else str(diff)
+            return f" ↑ \\+{label}"
+        elif diff < 0:
+            label = _format_short(abs(diff)) if is_money else str(abs(diff))
+            return f" ↓ \\-{label}"
+        return ""
 
-    s = await get_order_stats(today_start, month_start)
+    total_all = (s['total_orders'] + s['active_count'] + s['cancelled_count'] + s['expired_count']) or 1
+    def pct(n): return f"{round(n / total_all * 100, 1)}%"
 
-    rating_str = ""
     if s['avg_rating'] > 0:
         full_stars = int(s['avg_rating'])
         half = "✨" if s['avg_rating'] - full_stars >= 0.5 else ""
-        rating_str = "⭐" * full_stars + half
+        rating_str = f"*{s['avg_rating']}/5* " + "⭐" * full_stars + half
+    else:
+        rating_str = "_Belum ada penilaian_"
 
-    # Olah breakdown produk menjadi teks terstruktur
     products_breakdown_str = ""
     if s['products_breakdown']:
-        for p in s['products_breakdown']:
+        max_cnt = s['products_breakdown'][0]['cnt'] or 1
+        total_rev = s['total_revenue'] or 1
+        bar_max = 8
+        for idx, p in enumerate(s['products_breakdown']):
             emoji = p.get('emoji') or '📦'
             nama = esc(p.get('nama') or p['paket_id'])
+            bars = round((p['cnt'] / max_cnt) * bar_max)
+            bar = '█' * bars + '░' * (bar_max - bars)
+            pct_rev = round(p['total'] / total_rev * 100)
+            prefix = "└" if idx == len(s['products_breakdown']) - 1 else "├"
             products_breakdown_str += (
-                f"├ {emoji} *{nama}*\n"
-                f"│  └ {p['cnt']}x terjual · {format_harga(p['total'])}\n"
+                f"{prefix} {emoji} *{nama}*\n"
+                f"│  {bar} {p['cnt']}x · {_format_short(p['total'])} \\({pct_rev}%\\)\n"
             )
     else:
-        products_breakdown_str = "└ _Belum ada transaksi produk._\n"
+        products_breakdown_str = "└ _Belum ada transaksi produk\\._\n"
 
-    best_product_str = esc(s['best_product']) if s['best_product'] else "_Belum ada produk terlaris_"
+    trend_str = ""
+    if s.get('trend_7d'):
+        days_id = ['Sen', 'Sel', 'Rab', 'Kam', 'Jum', 'Sab', 'Min']
+        max_cnt_t = max((r['cnt'] for r in s['trend_7d']), default=1) or 1
+        for r in s['trend_7d']:
+            hari_dt = r['hari']
+            day_name = days_id[hari_dt.weekday()]
+            bars = round((r['cnt'] / max_cnt_t) * 5)
+            bar = '█' * bars + '░' * (5 - bars)
+            trend_str += f"  {day_name} {bar} {r['cnt']}x · {_format_short(r['rev'])}\n"
+    else:
+        trend_str = "  _Belum ada data_\n"
+
+    peak_str = ""
+    if s.get('peak_hour') is not None:
+        jam_end = (s['peak_hour'] + 1) % 24
+        peak_str = f"⏰ *JAM TERSIBUK*\n└ {s['peak_hour']:02d}:00–{jam_end:02d}:00 WIB \\({s['peak_count']} order\\)\n\n"
+
+    pending_warn = f" ⏳ *{s['pending_testi']} pending*" if s.get('pending_testi', 0) > 0 else "*0*"
 
     text = (
         f"📊 *LAPORAN STATISTIK TOKO*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
 
-        f"📅 *HARI INI (WIB)*\n"
-        f"├ Transaksi Selesai : *{s['today_completed']}* order\n"
-        f"└ Omzet Hari Ini    : *{format_harga(s['today_revenue'])}*\n\n"
+        f"📅 *HARI INI \\(WIB\\)*\n"
+        f"├ Order Selesai : *{s['today_completed']}*{growth_str(s['today_completed'], s['yesterday_completed'])}\n"
+        f"└ Omzet        : *{_format_short(s['today_revenue'])}*{growth_str(s['today_revenue'], s['yesterday_revenue'], True)}\n\n"
 
-        f"📆 *BULAN INI (WIB)*\n"
-        f"├ Transaksi Selesai : *{s['month_completed']}* order\n"
-        f"└ Omzet Bulan Ini   : *{format_harga(s['month_revenue'])}*\n\n"
+        f"🗓️ *BULAN INI \\(WIB\\)*\n"
+        f"├ Order Selesai : *{s['month_completed']}*{growth_str(s['month_completed'], s['last_month_completed'])}\n"
+        f"└ Omzet        : *{_format_short(s['month_revenue'])}*{growth_str(s['month_revenue'], s['last_month_revenue'], True)}\n\n"
 
-        f"🏆 *AKUMULASI ALL TIME*\n"
-        f"├ Total Omzet       : *{format_harga(s['total_revenue'])}*\n"
-        f"├ Total Pembeli Unik: *{s['total_buyers']}* orang\n"
-        f"├ Rata-rata Belanja : *{format_harga(s['aov'])}* (AOV)\n"
-        f"└ Rasio Konversi    : *{s['conversion_rate']}%* (Rasio Lunas)\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📈 *TREN 7 HARI TERAKHIR*\n"
+        f"{trend_str}\n"
+        f"{peak_str}"
 
-        f"📈 *STATUS TRANSASI* (All Time)\n"
-        f"├ Berhasil (Lunas)  : *{s['total_orders']}*\n"
-        f"├ Sedang Aktif      : *{s['active_count']}*\n"
-        f"├ Kedaluwarsa       : *{s['expired_count']}*\n"
-        f"└ Dibatalkan        : *{s['cancelled_count']}*\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🏆 *ALL TIME*\n"
+        f"├ Total Omzet    : *{_format_short(s['total_revenue'])}*\n"
+        f"├ Rata-rata/hari : *{_format_short(s['avg_daily_revenue'])}* \\(30 hari\\)\n"
+        f"├ Pembeli Unik   : *{s['total_buyers']}* orang\n"
+        f"├ Beli Ulang     : *{s['repeat_buyers']}* orang\n"
+        f"├ Baru Bulan Ini : *{s['new_buyers_month']}* orang\n"
+        f"└ AOV            : *{_format_short(s['aov'])}*\n\n"
 
-        f"⭐ *ULASAN & TESTIMONI*\n"
-        f"├ Rating Rata-rata  : *{s['avg_rating']}/5* {rating_str}\n"
-        f"└ Total Testimoni   : *{s['total_testi']}* ulasan disetujui\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 *STATUS TRANSAKSI*\n"
+        f"├ ✅ Selesai    : *{s['total_orders']}* \\({pct(s['total_orders'])}\\)\n"
+        f"├ ⏳ Aktif skrg : *{s['active_count']}*\n"
+        f"├ ❌ Dibatalkan : *{s['cancelled_count']}* \\({pct(s['cancelled_count'])}\\)\n"
+        f"└ ⏰ Kadaluarsa : *{s['expired_count']}* \\({pct(s['expired_count'])}\\)\n\n"
 
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📦 *PENJUALAN PER PRODUK*\n"
         f"{products_breakdown_str}\n"
 
-        f"🥇 *PRODUK TERLARIS*\n"
-        f"└ {best_product_str}\n"
+        f"⭐ *ULASAN & TESTIMONI*\n"
+        f"├ Rating    : {rating_str}\n"
+        f"├ Disetujui : *{s['total_testi']}* ulasan\n"
+        f"└ Pending   : {pending_warn}\n\n"
+
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"_Update: {now.strftime('%H:%M, %d/%m/%Y WIB')}_"
     )
+    return text
 
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update.message.from_user.id):
+        return
+    now = now_wib()
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    s = await get_order_stats(today_start, month_start)
+    text = _build_stats_text(s, now)
     await update.message.reply_text(text, parse_mode="Markdown")
 
 # =================== USER: RIWAYAT ORDER ===================
@@ -2790,13 +2974,14 @@ async def resend_group_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 REMINDER_HARI = 3
 
 def _get_buyers_for_reminder_sync(hari: int):
-    target_date = (now_wib() - timedelta(days=hari)).strftime("%d/%m/%Y")
+    target_day_start = (now_wib() - timedelta(days=hari)).replace(hour=0, minute=0, second=0, microsecond=0)
+    target_day_end = target_day_start + timedelta(days=1)
     conn = get_conn()
     try:
         with conn.cursor() as c:
             c.execute(
-                "SELECT DISTINCT user_id, user_name FROM orders WHERE status='completed' AND waktu LIKE %s",
-                (f"% — {target_date}",)
+                "SELECT DISTINCT user_id, user_name FROM orders WHERE status='completed' AND created_at >= %s AND created_at < %s",
+                (target_day_start, target_day_end)
             )
             return [dict(r) for r in c.fetchall()]
     finally:
@@ -3121,6 +3306,64 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 f"✅ *User Berhasil Di-unban*\n\n👤 User ID: `{target_id}`",
                 parse_mode="Markdown"
+            )
+            return
+
+        # --- State: awaiting kick user ID (admin) ---
+        if context.user_data.get('awaiting_kick_userid') and await is_admin(user_id):
+            context.user_data.pop('awaiting_kick_userid', None)
+            try:
+                target_id = int(text.strip())
+            except ValueError:
+                await update.message.reply_text("❌ User ID harus berupa angka. Contoh: <code>123456789</code>", parse_mode="HTML")
+                return
+            managed_groups = await get_managed_groups()
+            if not managed_groups:
+                await update.message.reply_text("❌ Belum ada grup terdaftar. Tambahkan grup dulu dari menu Kick.", parse_mode="HTML")
+                return
+            lines = []
+            kick_buttons = []
+            for gid in managed_groups:
+                try:
+                    member = await context.bot.get_chat_member(chat_id=int(gid), user_id=target_id)
+                    status = member.status
+                    if status in ('member', 'administrator', 'creator', 'restricted'):
+                        ada = f"✅ Ada ({status})"
+                    else:
+                        ada = f"❌ Tidak ada ({status})"
+                except Exception as e:
+                    ada = f"⚠️ Gagal cek: {e}"
+                lines.append(f"  • <code>{gid}</code>: {ada}")
+            result_text = (
+                f"🔍 <b>Hasil Cek User</b> <code>{target_id}</code>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                + "\n".join(lines)
+                + "\n\n<i>Tekan tombol di bawah untuk mengeluarkan user dari semua grup.</i>"
+            )
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"👢 Kick dari Semua Grup", callback_data=f"kick_do_kick|{target_id}")],
+                [InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_kick")],
+            ])
+            await update.message.reply_text(result_text, parse_mode="HTML", reply_markup=keyboard)
+            return
+
+        # --- State: awaiting tambah grup (admin) ---
+        if context.user_data.get('awaiting_add_group') and await is_admin(user_id):
+            context.user_data.pop('awaiting_add_group', None)
+            gid_str = text.strip()
+            if not gid_str.lstrip('-').isdigit():
+                await update.message.reply_text("❌ Chat ID tidak valid. Harus berupa angka, contoh: <code>-1001234567890</code>", parse_mode="HTML")
+                return
+            managed_groups = await get_managed_groups()
+            if gid_str in [str(g) for g in managed_groups]:
+                await update.message.reply_text(f"⚠️ Grup <code>{gid_str}</code> sudah ada dalam daftar.", parse_mode="HTML")
+                return
+            managed_groups.append(int(gid_str))
+            await set_managed_groups(managed_groups)
+            await update.message.reply_text(
+                f"✅ Grup <code>{gid_str}</code> berhasil ditambahkan.\n"
+                f"Total grup terdaftar: <b>{len(managed_groups)}</b>",
+                parse_mode="HTML"
             )
             return
 
@@ -3669,6 +3912,7 @@ def build_admin_panel_keyboard(user_id: int | None = None):
             InlineKeyboardButton("🚫 Kelola User",    callback_data="admpanel_user"),
         ],
         [
+            InlineKeyboardButton("👢 Cek & Kick Grup", callback_data="admpanel_kick"),
             InlineKeyboardButton("⚙️ Pengaturan",     callback_data="admpanel_setting"),
         ],
     ]
@@ -3791,70 +4035,11 @@ async def admpanel_orders_cari(update: Update, context: ContextTypes.DEFAULT_TYP
 async def admpanel_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     now = now_wib()
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-
     s = await get_order_stats(today_start, month_start)
-
-    rating_str = ""
-    if s['avg_rating'] > 0:
-        full_stars = int(s['avg_rating'])
-        half = "✨" if s['avg_rating'] - full_stars >= 0.5 else ""
-        rating_str = "⭐" * full_stars + half
-
-    products_breakdown_str = ""
-    if s['products_breakdown']:
-        for p in s['products_breakdown']:
-            emoji = p.get('emoji') or '📦'
-            nama = esc(p.get('nama') or p['paket_id'])
-            products_breakdown_str += (
-                f"├ {emoji} *{nama}*\n"
-                f"│  └ {p['cnt']}x terjual · {format_harga(p['total'])}\n"
-            )
-    else:
-        products_breakdown_str = "└ _Belum ada transaksi produk._\n"
-
-    best_product_str = esc(s['best_product']) if s['best_product'] else "_Belum ada produk terlaris_"
-
-    text = (
-        f"📊 *LAPORAN STATISTIK TOKO*\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-
-        f"📅 *HARI INI (WIB)*\n"
-        f"├ Transaksi Selesai : *{s['today_completed']}* order\n"
-        f"└ Omzet Hari Ini    : *{format_harga(s['today_revenue'])}*\n\n"
-
-        f"📆 *BULAN INI (WIB)*\n"
-        f"├ Transaksi Selesai : *{s['month_completed']}* order\n"
-        f"└ Omzet Bulan Ini   : *{format_harga(s['month_revenue'])}*\n\n"
-
-        f"🏆 *AKUMULASI ALL TIME*\n"
-        f"├ Total Omzet       : *{format_harga(s['total_revenue'])}*\n"
-        f"├ Total Pembeli Unik: *{s['total_buyers']}* orang\n"
-        f"├ Rata-rata Belanja : *{format_harga(s['aov'])}* (AOV)\n"
-        f"└ Rasio Konversi    : *{s['conversion_rate']}%* (Rasio Lunas)\n\n"
-
-        f"📈 *STATUS TRANSASI* (All Time)\n"
-        f"├ Berhasil (Lunas)  : *{s['total_orders']}*\n"
-        f"├ Sedang Aktif      : *{s['active_count']}*\n"
-        f"├ Kedaluwarsa       : *{s['expired_count']}*\n"
-        f"└ Dibatalkan        : *{s['cancelled_count']}*\n\n"
-
-        f"⭐ *ULASAN & TESTIMONI*\n"
-        f"├ Rating Rata-rata  : *{s['avg_rating']}/5* {rating_str}\n"
-        f"└ Total Testimoni   : *{s['total_testi']}* ulasan disetujui\n\n"
-
-        f"📦 *PENJUALAN PER PRODUK*\n"
-        f"{products_breakdown_str}\n"
-
-        f"🥇 *PRODUK TERLARIS*\n"
-        f"└ {best_product_str}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"_Update: {now.strftime('%H:%M, %d/%m/%Y WIB')}_"
-    )
-
+    text = _build_stats_text(s, now)
     await query.edit_message_text(
         text,
         parse_mode="Markdown",
@@ -4042,6 +4227,146 @@ async def admpanel_user_daftar(update: Update, context: ContextTypes.DEFAULT_TYP
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_user")]])
     )
+
+# =================== ADMIN: CEK & KICK USER DI GRUP ===================
+
+async def admpanel_kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not await is_admin(query.from_user.id):
+        await query.answer("⛔ Akses ditolak.", show_alert=True)
+        return
+
+    managed_groups = await get_managed_groups()
+
+    group_lines = ""
+    if managed_groups:
+        for i, gid in enumerate(managed_groups, 1):
+            group_lines += f"  {i}. <code>{gid}</code>\n"
+    else:
+        group_lines = "  <i>Belum ada grup terdaftar.</i>\n"
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔍 Cek User di Grup", callback_data="kick_cek_user"),
+            InlineKeyboardButton("➕ Tambah Grup",      callback_data="kick_add_group"),
+        ],
+        [InlineKeyboardButton("🗑️ Hapus Grup",          callback_data="kick_del_group")],
+        [InlineKeyboardButton("⬅️ Kembali",              callback_data="admpanel_back")],
+    ])
+
+    await query.edit_message_text(
+        f"👢 <b>CEK &amp; KICK USER DI GRUP</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"Fitur ini memungkinkan kamu mengecek apakah user ada di grup tertentu "
+        f"dan mengeluarkannya jika diperlukan.\n\n"
+        f"<b>Grup Terdaftar ({len(managed_groups)}):</b>\n"
+        f"{group_lines}\n"
+        f"<i>Pastikan bot sudah menjadi admin di semua grup tersebut.</i>",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+
+async def kick_cek_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not await is_admin(query.from_user.id):
+        return
+    context.user_data['awaiting_kick_userid'] = True
+    await query.edit_message_text(
+        "🔍 <b>CEK USER DI GRUP</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Kirim <b>User ID</b> yang ingin dicek.\n"
+        "Contoh: <code>123456789</code>\n\n"
+        "<i>Bot akan mengecek keberadaan user di semua grup terdaftar.</i>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Batal", callback_data="admpanel_kick")]])
+    )
+
+async def kick_add_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not await is_admin(query.from_user.id):
+        return
+    context.user_data['awaiting_add_group'] = True
+    await query.edit_message_text(
+        "➕ <b>TAMBAH GRUP</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Kirim <b>Chat ID grup</b> yang ingin ditambahkan.\n"
+        "Contoh: <code>-1001234567890</code>\n\n"
+        "<i>Cara mendapatkan Chat ID: tambahkan @userinfobot ke grup, lalu lihat ID-nya.</i>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Batal", callback_data="admpanel_kick")]])
+    )
+
+async def kick_del_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not await is_admin(query.from_user.id):
+        return
+    managed_groups = await get_managed_groups()
+    if not managed_groups:
+        await query.answer("Belum ada grup terdaftar.", show_alert=True)
+        return
+    buttons = []
+    for gid in managed_groups:
+        buttons.append([InlineKeyboardButton(f"🗑️ {gid}", callback_data=f"kick_del_confirm|{gid}")])
+    buttons.append([InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_kick")])
+    await query.edit_message_text(
+        "🗑️ <b>HAPUS GRUP</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Pilih grup yang ingin dihapus dari daftar:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+async def kick_del_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not await is_admin(query.from_user.id):
+        return
+    gid_str = query.data.split("|", 1)[1]
+    managed_groups = await get_managed_groups()
+    new_groups = [g for g in managed_groups if str(g) != gid_str]
+    await set_managed_groups(new_groups)
+    await query.answer(f"✅ Grup {gid_str} dihapus.", show_alert=True)
+    await admpanel_kick(update, context)
+
+async def kick_do_kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Kick (ban+unban) satu user dari semua grup terdaftar."""
+    query = update.callback_query
+    await query.answer()
+    if not await is_admin(query.from_user.id):
+        return
+    target_id = int(query.data.split("|", 1)[1])
+    managed_groups = await get_managed_groups()
+    if not managed_groups:
+        await query.answer("Tidak ada grup terdaftar.", show_alert=True)
+        return
+    kicked = []
+    failed = []
+    for gid in managed_groups:
+        try:
+            await query.get_bot().ban_chat_member(chat_id=int(gid), user_id=target_id)
+            await query.get_bot().unban_chat_member(chat_id=int(gid), user_id=target_id, only_if_banned=True)
+            kicked.append(str(gid))
+        except Exception as e:
+            failed.append(f"{gid}: {e}")
+    result_text = (
+        f"✅ User <code>{target_id}</code> berhasil dikick dari:\n"
+        + "\n".join(f"  • <code>{g}</code>" for g in kicked)
+    )
+    if failed:
+        result_text += "\n\n❌ Gagal di:\n" + "\n".join(f"  • {f}" for f in failed)
+    await query.edit_message_text(
+        result_text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_kick")]])
+    )
+
+async def kick_do_kick_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Kick semua user non-member / cek dan kick yang tidak berhak (fallback ke kick satu user)."""
+    await kick_do_kick(update, context)
 
 # =================== ADMIN: PENGATURAN ===================
 
@@ -4534,6 +4859,14 @@ def main():
     app.add_handler(CallbackQueryHandler(admpanel_user_ban,        pattern="^admpanel_user_ban$"))
     app.add_handler(CallbackQueryHandler(admpanel_user_unban,      pattern="^admpanel_user_unban$"))
     app.add_handler(CallbackQueryHandler(admpanel_user_daftar,     pattern="^admpanel_user_daftar$"))
+
+    # Kick feature callbacks
+    app.add_handler(CallbackQueryHandler(admpanel_kick,    pattern="^admpanel_kick$"))
+    app.add_handler(CallbackQueryHandler(kick_cek_user,    pattern="^kick_cek_user$"))
+    app.add_handler(CallbackQueryHandler(kick_add_group,   pattern="^kick_add_group$"))
+    app.add_handler(CallbackQueryHandler(kick_del_group,   pattern="^kick_del_group$"))
+    app.add_handler(CallbackQueryHandler(kick_del_confirm, pattern="^kick_del_confirm\\|"))
+    app.add_handler(CallbackQueryHandler(kick_do_kick,     pattern="^kick_do_kick\\|"))
 
     # Pengaturan callbacks
     app.add_handler(CallbackQueryHandler(admpanel_setting,              pattern="^admpanel_setting$"))

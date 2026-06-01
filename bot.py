@@ -51,7 +51,6 @@ def esc(text):
 WIB = timezone(timedelta(hours=7))
 
 def now_wib() -> datetime:
-    # Menjaga datetime tetap aware (tidak membuang tzinfo)
     return datetime.now(WIB)
 
 # =================== KONFIGURASI ===================
@@ -456,13 +455,16 @@ def get_buyer_history(user_id, limit=10):
 
 @async_wrap
 def get_all_buyers():
+    """Mengambil semua daftar pembeli unik di database yang TIDAK sedang di-banned."""
     conn = get_conn()
     try:
         with conn.cursor() as c:
             c.execute("""
-                SELECT user_id, user_name, MAX(id) as max_id 
-                FROM orders 
-                GROUP BY user_id, user_name 
+                SELECT o.user_id, o.user_name, MAX(o.id) as max_id 
+                FROM orders o
+                LEFT JOIN banned_users b ON o.user_id = b.user_id
+                WHERE b.user_id IS NULL
+                GROUP BY o.user_id, o.user_name 
                 ORDER BY max_id DESC
             """)
             return [dict(r) for r in c.fetchall()]
@@ -470,29 +472,29 @@ def get_all_buyers():
         release_conn(conn)
 
 @async_wrap
-def get_order_stats():
+def get_order_stats(today_start: datetime, month_start: datetime):
+    """
+    Mengambil data laporan statistik toko dengan akurasi zona waktu WIB.
+    Parameter hari ini dan bulan ini dikalkulasi di Python lalu dikirim ke PostgreSQL.
+    """
     conn = get_conn()
     try:
         with conn.cursor() as c:
-            # Total selesai all time
+            # Total completed all time
             c.execute("SELECT COUNT(*) as cnt FROM orders WHERE status='completed'")
             total_orders = c.fetchone()['cnt']
 
             # Hari ini (WIB)
-            c.execute("""
-                SELECT COUNT(*) as cnt FROM orders
-                WHERE status='completed'
-                AND created_at AT TIME ZONE 'Asia/Jakarta' >= CURRENT_DATE
-            """)
-            today_orders = c.fetchone()['cnt']
+            c.execute("SELECT COUNT(*) as cnt FROM orders WHERE status='completed' AND created_at >= %s", (today_start,))
+            today_completed = c.fetchone()['cnt']
 
             # Bulan ini (WIB)
-            c.execute("""
-                SELECT COUNT(*) as cnt FROM orders
-                WHERE status='completed'
-                AND created_at AT TIME ZONE 'Asia/Jakarta' >= DATE_TRUNC('month', CURRENT_DATE)
-            """)
-            month_orders = c.fetchone()['cnt']
+            c.execute("SELECT COUNT(*) as cnt FROM orders WHERE status='completed' AND created_at >= %s", (month_start,))
+            month_completed = c.fetchone()['cnt']
+
+            # Total Generated Orders All Time (unfiltered)
+            c.execute("SELECT COUNT(*) as cnt FROM orders")
+            total_generated = c.fetchone()['cnt'] or 1 # Hindari division by zero
 
             c.execute("SELECT COUNT(*) as cnt FROM orders WHERE status IN ('waiting','pending')")
             active_count = c.fetchone()['cnt']
@@ -502,6 +504,22 @@ def get_order_stats():
 
             c.execute("SELECT COUNT(*) as cnt FROM orders WHERE status='expired'")
             expired_count = c.fetchone()['cnt']
+
+            # Revenue
+            c.execute("SELECT COALESCE(SUM(harga_dibayar), 0) as total FROM orders WHERE status='completed'")
+            total_revenue = c.fetchone()['total']
+
+            c.execute("SELECT COALESCE(SUM(harga_dibayar), 0) as total FROM orders WHERE status='completed' AND created_at >= %s", (today_start,))
+            today_revenue = c.fetchone()['total']
+
+            c.execute("SELECT COALESCE(SUM(harga_dibayar), 0) as total FROM orders WHERE status='completed' AND created_at >= %s", (month_start,))
+            month_revenue = c.fetchone()['total']
+
+            # Average Order Value (AOV)
+            aov = round(total_revenue / total_orders) if total_orders > 0 else 0
+
+            # Conversion Rate (Rasio Konversi)
+            conversion_rate = round((total_orders / total_generated) * 100, 1) if total_generated > 0 else 0
 
             # Produk terlaris
             c.execute("""
@@ -514,24 +532,6 @@ def get_order_stats():
             if best_row:
                 p = _get_product_sync(best_row['paket_id'])
                 best_product = f"{p['emoji']} {p['nama']} ({best_row['cnt']}x)" if p else best_row['paket_id']
-
-            # Revenue
-            c.execute("SELECT COALESCE(SUM(harga_dibayar), 0) as total FROM orders WHERE status='completed'")
-            total_revenue = c.fetchone()['total']
-
-            c.execute("""
-                SELECT COALESCE(SUM(harga_dibayar), 0) as total FROM orders
-                WHERE status='completed'
-                AND created_at AT TIME ZONE 'Asia/Jakarta' >= CURRENT_DATE
-            """)
-            today_revenue = c.fetchone()['total']
-
-            c.execute("""
-                SELECT COALESCE(SUM(harga_dibayar), 0) as total FROM orders
-                WHERE status='completed'
-                AND created_at AT TIME ZONE 'Asia/Jakarta' >= DATE_TRUNC('month', CURRENT_DATE)
-            """)
-            month_revenue = c.fetchone()['total']
 
             # Rating & testimoni
             c.execute("SELECT COALESCE(AVG(rating), 0) as avg, COUNT(*) as cnt FROM testimonials WHERE status='approved'")
@@ -559,8 +559,9 @@ def get_order_stats():
 
     return {
         'total_orders': total_orders,
-        'today_orders': today_orders,
-        'month_orders': month_orders,
+        'today_completed': today_completed,
+        'month_completed': month_completed,
+        'total_generated': total_generated,
         'active_count': active_count,
         'cancelled_count': cancelled_count,
         'expired_count': expired_count,
@@ -568,6 +569,8 @@ def get_order_stats():
         'total_revenue': total_revenue,
         'today_revenue': today_revenue,
         'month_revenue': month_revenue,
+        'aov': aov,
+        'conversion_rate': conversion_rate,
         'avg_rating': avg_rating,
         'total_testi': total_testi,
         'products_breakdown': products_breakdown,
@@ -746,7 +749,6 @@ def get_cooldown_sisa_db(user_id):
                 return 0
             try:
                 until = datetime.strptime(row['expires_at'], '%Y-%m-%d %H:%M:%S')
-                # strptime naive, now_wib WIB aware. Sesuaikan agar timezone-aware
                 until = until.replace(tzinfo=WIB)
                 sisa = (until - now_wib()).total_seconds()
                 return max(0, int(sisa / 60) + 1) if sisa > 0 else 0
@@ -1360,7 +1362,6 @@ async def pilih_paket(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text="⏳ Membuat invoice...",
     )
 
-    # Tambah suffix 4-karakter acak untuk mencegah tabrakan order_id (Po-3)
     rand_suffix = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
     order_id = f"HFB-{user_id}-{now_wib().strftime('%Y%m%d%H%M%S')}-{rand_suffix}"
 
@@ -1375,7 +1376,7 @@ async def pilih_paket(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-    if not trans_data:
+    if not_trans_data := (not trans_data):
         msg = await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text="❌ Gagal membuat invoice. Silakan coba lagi.\nKetik /start untuk memulai ulang.",
@@ -1412,7 +1413,6 @@ async def pilih_paket(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         expire = (now_wib() + timedelta(minutes=30)).strftime("%H:%M")
 
-    # Jalankan generate QR asinkron di Thread Pool agar CPU non-blocking
     qr_buffer = await asyncio.to_thread(generate_qr_image, qris_string)
 
     caption = (
@@ -1729,7 +1729,6 @@ async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE
     user_id = join_req.from_user.id
     chat_id = str(join_req.chat.id)
 
-    # Jalankan query asinkron via thread pool
     row = await asyncio.to_thread(_check_join_request_sync, user_id, chat_id)
 
     if row:
@@ -1737,7 +1736,6 @@ async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE
             await join_req.approve()
             logger.info(f"[JOIN] ✅ Approved {user_id} ke chat {chat_id}")
             
-            # P1-7: Hapus/Revoke link undangan lama setelah join request disetujui
             if join_req.invite_link and join_req.invite_link.invite_link:
                 try:
                     await context.bot.revoke_chat_invite_link(
@@ -2356,7 +2354,12 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update.message.from_user.id):
         return
 
-    s = await get_order_stats()
+    # Hitung batas waktu harian dan bulanan secara akurat (WIB)
+    now = now_wib()
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    s = await get_order_stats(today_start, month_start)
 
     rating_str = ""
     if s['avg_rating'] > 0:
@@ -2364,49 +2367,57 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         half = "✨" if s['avg_rating'] - full_stars >= 0.5 else ""
         rating_str = "⭐" * full_stars + half
 
+    # Olah breakdown produk menjadi teks terstruktur
+    products_breakdown_str = ""
+    if s['products_breakdown']:
+        for p in s['products_breakdown']:
+            emoji = p.get('emoji') or '📦'
+            nama = esc(p.get('nama') or p['paket_id'])
+            products_breakdown_str += (
+                f"├ {emoji} *{nama}*\n"
+                f"│  └ {p['cnt']}x terjual · {format_harga(p['total'])}\n"
+            )
+    else:
+        products_breakdown_str = "└ _Belum ada transaksi produk._\n"
+
+    best_product_str = esc(s['best_product']) if s['best_product'] else "_Belum ada produk terlaris_"
+
     text = (
         f"📊 *LAPORAN STATISTIK TOKO*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
 
-        f"📅 *HARI INI*\n"
-        f"├ Transaksi Selesai : *{s['today_orders']}* order\n"
-        f"└ Omzet             : *{format_harga(s['today_revenue'])}*\n\n"
+        f"📅 *HARI INI (WIB)*\n"
+        f"├ Transaksi Selesai : *{s['today_completed']}* order\n"
+        f"└ Omzet Hari Ini    : *{format_harga(s['today_revenue'])}*\n\n"
 
-        f"📆 *BULAN INI*\n"
-        f"├ Transaksi Selesai : *{s['month_orders']}* order\n"
-        f"└ Omzet             : *{format_harga(s['month_revenue'])}*\n\n"
+        f"📆 *BULAN INI (WIB)*\n"
+        f"├ Transaksi Selesai : *{s['month_completed']}* order\n"
+        f"└ Omzet Bulan Ini   : *{format_harga(s['month_revenue'])}*\n\n"
 
-        f"🏆 *ALL TIME*\n"
-        f"├ Total Order Selesai : *{s['total_orders']}*\n"
-        f"├ Total Buyer Unik    : *{s['total_buyers']}* orang\n"
-        f"├ Order Aktif         : *{s['active_count']}*\n"
-        f"├ Dibatalkan          : *{s['cancelled_count']}*\n"
-        f"├ Expired             : *{s['expired_count']}*\n"
-        f"└ Total Omzet         : *{format_harga(s['total_revenue'])}*\n\n"
+        f"🏆 *AKUMULASI ALL TIME*\n"
+        f"├ Total Omzet       : *{format_harga(s['total_revenue'])}*\n"
+        f"├ Total Pembeli Unik: *{s['total_buyers']}* orang\n"
+        f"├ Rata-rata Belanja : *{format_harga(s['aov'])}* (AOV)\n"
+        f"└ Rasio Konversi    : *{s['conversion_rate']}%* (Rasio Lunas)\n\n"
+
+        f"📈 *STATUS TRANSASI* (All Time)\n"
+        f"├ Berhasil (Lunas)  : *{s['total_orders']}*\n"
+        f"├ Sedang Aktif      : *{s['active_count']}*\n"
+        f"├ Kedaluwarsa       : *{s['expired_count']}*\n"
+        f"└ Dibatalkan        : *{s['cancelled_count']}*\n\n"
+
+        f"⭐ *ULASAN & TESTIMONI*\n"
+        f"├ Rating Rata-rata  : *{s['avg_rating']}/5* {rating_str}\n"
+        f"└ Total Testimoni   : *{s['total_testi']}* ulasan disetujui\n\n"
+
+        f"📦 *PENJUALAN PER PRODUK*\n"
+        f"{products_breakdown_str}\n"
+
+        f"🥇 *PRODUK TERLARIS*\n"
+        f"└ {best_product_str}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"_Update: {now.strftime('%H:%M, %d/%m/%Y WIB')}_"
     )
-
-    if s['best_product']:
-        text += f"🥇 *Produk Terlaris:* {esc(s['best_product'])}\n\n"
-
-    if s['avg_rating'] > 0:
-        text += (
-            f"⭐ *KEPUASAN PEMBELI*\n"
-            f"├ Rating Rata-rata : *{s['avg_rating']}/5* {rating_str}\n"
-            f"└ Total Ulasan     : *{s['total_testi']}* ulasan\n\n"
-        )
-
-    if s['products_breakdown']:
-        text += f"📦 *BREAKDOWN PER PRODUK*\n"
-        for p in s['products_breakdown']:
-            emoji = p.get('emoji') or '📦'
-            nama = esc(p.get('nama') or p['paket_id'])
-            text += (
-                f"├ {emoji} *{nama}*\n"
-                f"│  └ {p['cnt']}x terjual · {format_harga(p['total'])}\n"
-            )
-        text += "\n"
-
-    text += f"_Update: {now_wib().strftime('%H:%M, %d/%m/%Y WIB')}_"
 
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -2704,7 +2715,6 @@ async def handle_json_document(update: Update, context: ContextTypes.DEFAULT_TYP
     orders    = data.get("orders",     [])
     banned    = data.get("banned_users", [])
 
-    # Jalankan import masif pada Thread Pool asinkron
     ok_p, fail_p, ok_o, fail_o, ok_b, fail_b = await asyncio.to_thread(_import_json_data_sync, products, orders, banned)
 
     await status_msg.edit_text(
@@ -2863,7 +2873,94 @@ async def _auto_backup_loop():
                 pass
             await asyncio.sleep(3600)
 
-# =================== ADMIN: BROADCAST ===================
+# =================== ADMIN: BROADCAST BACKGROUND TASK ===================
+
+async def _run_broadcast(bot, admin_id, buyers, text_blast):
+    """
+    Menjalankan proses pengiriman broadcast di latar belakang (Background Task).
+    Mendukung deteksi otomatis akun yang memblokir bot (auto cleanup database).
+    """
+    total = len(buyers)
+    progress_msg = await bot.send_message(
+        chat_id=admin_id,
+        text=f"📢 *Memulai Broadcast...*\nTarget: {total} buyer.",
+        parse_mode="Markdown"
+    )
+
+    sent = 0
+    failed = 0
+    blocked = 0
+
+    for index, b in enumerate(buyers):
+        target_id = b['user_id']
+        try:
+            await bot.send_message(
+                chat_id=target_id,
+                text=text_blast,
+                parse_mode="Markdown"
+            )
+            sent += 1
+        except telegram.error.Forbidden:
+            # Otomatis deteksi & bersihkan akun yang memblokir bot
+            blocked += 1
+            await ban_user(target_id, reason="Blocked Bot (Auto)")
+        except telegram.error.RetryAfter as e:
+            # Amankan dari flood wait Telegram
+            logger.warning(f"[BLAST] Terkena rate limit, tidur {e.retry_after} detik.")
+            await asyncio.sleep(e.retry_after)
+            try:
+                await bot.send_message(chat_id=target_id, text=text_blast, parse_mode="Markdown")
+                sent += 1
+            except telegram.error.Forbidden:
+                blocked += 1
+                await ban_user(target_id, reason="Blocked Bot (Auto)")
+            except Exception:
+                failed += 1
+        except Exception as e:
+            logger.error(f"[BLAST] Gagal mengirim pesan ke {target_id}: {e}")
+            failed += 1
+
+        # Berikan jeda waktu aman (~20 pesan/detik)
+        await asyncio.sleep(0.05)
+
+        # Update status progress admin secara berkala (setiap 20 pengiriman)
+        if (index + 1) % 20 == 0 or (index + 1) == total:
+            percent = int(((index + 1) / total) * 100)
+            try:
+                await bot.edit_message_text(
+                    chat_id=admin_id,
+                    message_id=progress_msg.message_id,
+                    text=(
+                        f"📢 *Progres Broadcast: {percent}%*\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"👤 Diproses : {index + 1} / {total}\n"
+                        f"✅ Sukses   : {sent}\n"
+                        f"🚫 Diblokir (Auto-Clean): {blocked}\n"
+                        f"❌ Gagal Lainnya        : {failed}"
+                    ),
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass
+
+    # Laporan Akhir
+    try:
+        await bot.send_message(
+            chat_id=admin_id,
+            text=(
+                f"✅ *BROADCAST SELESAI*\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"✅ Sukses Terkirim  : *{sent}* buyer\n"
+                f"🚫 Diblokir (Auto-Clean): *{blocked}* buyer\n"
+                f"❌ Gagal Lainnya        : *{failed}*\n"
+                f"📊 Total Target         : *{total}*\n\n"
+                f"_Selesai pada: {now_wib().strftime('%H:%M, %d/%m/%Y WIB')}_"
+            ),
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+
 
 async def cmd_blast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update.message.from_user.id):
@@ -2873,17 +2970,17 @@ async def cmd_blast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     buyers = await get_all_buyers()
     jumlah = len(buyers)
     if jumlah == 0:
-        await update.message.reply_text("❌ Belum ada buyer yang terdaftar.")
+        await update.message.reply_text("❌ Belum ada buyer aktif terdaftar.")
         return
 
     _admin_awaiting[_requester_id] = 'blasting'
     await update.message.reply_text(
         f"*📢 BROADCAST PESAN*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"Total penerima: *{jumlah} buyer*\n\n"
+        f"Total penerima: *{jumlah} buyer* (Akun memblokir otomatis dilewati)\n\n"
         f"Kirim pesan yang mau di-blast sekarang.\n"
         f"_Mendukung teks biasa, bold, italic \\(format Markdown\\)\\._\n\n"
-        f"⚠️ Pesan akan langsung dikirim ke semua buyer.",
+        f"⚠️ Pesan akan dikirim di latar belakang tanpa membekukan bot.",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("❌ Batal", callback_data="blast_batal")]
@@ -3147,9 +3244,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if _admin_awaiting.get(user_id) == 'blasting':
             _admin_awaiting.pop(user_id, None)
             buyers = await get_all_buyers()
-            text_blast_count = len(buyers)
-
-            status_msg = await update.message.reply_text(f"📢 Mengirim ke {text_blast_count} buyer...")
+            if not buyers:
+                await update.message.reply_text("❌ Tidak ada target penerima yang valid (aktif).")
+                return
 
             blast_text = (
                 f"📣 *HYPER FAMILY STORE*\n"
@@ -3160,45 +3257,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"🛒 Belanja sekarang: /start"
             )
 
-            sent = 0
-            failed = 0
-            for b in buyers:
-                try:
-                    await context.bot.send_message(
-                        chat_id=b['user_id'],
-                        text=blast_text,
-                        parse_mode="Markdown"
-                    )
-                    sent += 1
-                except telegram.error.RetryAfter as e:
-                    await asyncio.sleep(e.retry_after)
-                    try:
-                        await context.bot.send_message(
-                            chat_id=b['user_id'],
-                            text=blast_text,
-                            parse_mode="Markdown"
-                        )
-                        sent += 1
-                    except Exception:
-                        failed += 1
-                except Exception:
-                    failed += 1
-                await asyncio.sleep(0.1)
-
-            try:
-                await status_msg.delete()
-            except Exception:
-                pass
-
-            await update.message.reply_text(
-                f"✅ *BROADCAST SELESAI*\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"✅ Terkirim : *{sent}* buyer\n"
-                f"❌ Gagal    : *{failed}*\n"
-                f"📊 Total    : *{text_blast_count}*\n\n"
-                f"_Selesai: {now_wib().strftime('%H:%M, %d/%m/%Y')}_",
-                parse_mode="Markdown"
-            )
+            # Jalankan di latar belakang (Background Task) agar bot tetap responsif melayani buyer lain
+            asyncio.create_task(_run_broadcast(context.application.bot, user_id, buyers, blast_text))
             return
 
         # --- State: tambah produk ---
@@ -3732,7 +3792,11 @@ async def admpanel_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    s = await get_order_stats()
+    now = now_wib()
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    s = await get_order_stats(today_start, month_start)
 
     rating_str = ""
     if s['avg_rating'] > 0:
@@ -3740,49 +3804,56 @@ async def admpanel_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         half = "✨" if s['avg_rating'] - full_stars >= 0.5 else ""
         rating_str = "⭐" * full_stars + half
 
+    products_breakdown_str = ""
+    if s['products_breakdown']:
+        for p in s['products_breakdown']:
+            emoji = p.get('emoji') or '📦'
+            nama = esc(p.get('nama') or p['paket_id'])
+            products_breakdown_str += (
+                f"├ {emoji} *{nama}*\n"
+                f"│  └ {p['cnt']}x terjual · {format_harga(p['total'])}\n"
+            )
+    else:
+        products_breakdown_str = "└ _Belum ada transaksi produk._\n"
+
+    best_product_str = esc(s['best_product']) if s['best_product'] else "_Belum ada produk terlaris_"
+
     text = (
         f"📊 *LAPORAN STATISTIK TOKO*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
 
-        f"📅 *HARI INI*\n"
-        f"├ Transaksi Selesai : *{s['today_orders']}* order\n"
-        f"└ Omzet             : *{format_harga(s['today_revenue'])}*\n\n"
+        f"📅 *HARI INI (WIB)*\n"
+        f"├ Transaksi Selesai : *{s['today_completed']}* order\n"
+        f"└ Omzet Hari Ini    : *{format_harga(s['today_revenue'])}*\n\n"
 
-        f"📆 *BULAN INI*\n"
-        f"├ Transaksi Selesai : *{s['month_orders']}* order\n"
-        f"└ Omzet             : *{format_harga(s['month_revenue'])}*\n\n"
+        f"📆 *BULAN INI (WIB)*\n"
+        f"├ Transaksi Selesai : *{s['month_completed']}* order\n"
+        f"└ Omzet Bulan Ini   : *{format_harga(s['month_revenue'])}*\n\n"
 
-        f"🏆 *ALL TIME*\n"
-        f"├ Total Order Selesai : *{s['total_orders']}*\n"
-        f"├ Total Buyer Unik    : *{s['total_buyers']}* orang\n"
-        f"├ Order Aktif         : *{s['active_count']}*\n"
-        f"├ Dibatalkan          : *{s['cancelled_count']}*\n"
-        f"├ Expired             : *{s['expired_count']}*\n"
-        f"└ Total Omzet         : *{format_harga(s['total_revenue'])}*\n\n"
+        f"🏆 *AKUMULASI ALL TIME*\n"
+        f"├ Total Omzet       : *{format_harga(s['total_revenue'])}*\n"
+        f"├ Total Pembeli Unik: *{s['total_buyers']}* orang\n"
+        f"├ Rata-rata Belanja : *{format_harga(s['aov'])}* (AOV)\n"
+        f"└ Rasio Konversi    : *{s['conversion_rate']}%* (Rasio Lunas)\n\n"
+
+        f"📈 *STATUS TRANSASI* (All Time)\n"
+        f"├ Berhasil (Lunas)  : *{s['total_orders']}*\n"
+        f"├ Sedang Aktif      : *{s['active_count']}*\n"
+        f"├ Kedaluwarsa       : *{s['expired_count']}*\n"
+        f"└ Dibatalkan        : *{s['cancelled_count']}*\n\n"
+
+        f"⭐ *ULASAN & TESTIMONI*\n"
+        f"├ Rating Rata-rata  : *{s['avg_rating']}/5* {rating_str}\n"
+        f"└ Total Testimoni   : *{s['total_testi']}* ulasan disetujui\n\n"
+
+        f"📦 *PENJUALAN PER PRODUK*\n"
+        f"{products_breakdown_str}\n"
+
+        f"🥇 *PRODUK TERLARIS*\n"
+        f"└ {best_product_str}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"_Update: {now.strftime('%H:%M, %d/%m/%Y WIB')}_"
     )
-
-    if s['best_product']:
-        text += f"🥇 *Produk Terlaris:* {esc(s['best_product'])}\n\n"
-
-    if s['avg_rating'] > 0:
-        text += (
-            f"⭐ *KEPUASAN PEMBELI*\n"
-            f"├ Rating Rata-rata : *{s['avg_rating']}/5* {rating_str}\n"
-            f"└ Total Ulasan     : *{s['total_testi']}* ulasan\n\n"
-        )
-
-    if s['products_breakdown']:
-        text += f"📦 *BREAKDOWN PER PRODUK*\n"
-        for p in s['products_breakdown']:
-            emoji = p.get('emoji') or '📦'
-            nama = esc(p.get('nama') or p['paket_id'])
-            text += (
-                f"├ {emoji} *{nama}*\n"
-                f"│  └ {p['cnt']}x terjual · {format_harga(p['total'])}\n"
-            )
-        text += "\n"
-
-    text += f"_Update: {now_wib().strftime('%H:%M, %d/%m/%Y WIB')}_"
 
     await query.edit_message_text(
         text,
@@ -3797,7 +3868,7 @@ async def admpanel_blast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     jumlah = len(buyers)
     if jumlah == 0:
         await query.edit_message_text(
-            "❌ Belum ada buyer yang terdaftar.",
+            "❌ Belum ada buyer aktif terdaftar.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_back")]])
         )
         return
@@ -3805,10 +3876,10 @@ async def admpanel_blast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(
         f"📢 *BROADCAST PESAN*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"Total penerima: *{jumlah} buyer*\n\n"
+        f"Total penerima: *{jumlah} buyer* (Akun memblokir otomatis dilewati)\n\n"
         f"Ketik & kirim pesan yang mau di-blast sekarang.\n"
         f"Pesan kamu akan dikirim dengan header toko secara otomatis\\.\n\n"
-        f"⚠️ Langsung terkirim ke semua buyer setelah kamu send\\.",
+        f"⚠️ Proses pengiriman di latar belakang tanpa mengganggu respons bot\\.",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Batal", callback_data="blast_batal")]])
     )
@@ -4138,14 +4209,17 @@ async def admpanel_setting_link_testi(update: Update, context: ContextTypes.DEFA
 
 async def admpanel_setting_link_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    await query.answer()
+    context.user_data['awaiting_link_admin'] = True
+    current = await get_setting('link_admin') or '-'  # FIXED Bug NameError 'current'
     await query.edit_message_text(
-            f"*💬 UBAH LINK ADMIN/CS*\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"Link saat ini:\n`{esc(current)}`\n\n"
-            f"Kirim link baru (contoh: `https://t.me/username`):",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Batal", callback_data="admpanel_setting")]])
-        )
+        f"*💬 UBAH LINK ADMIN/CS*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"Link saat ini:\n`{esc(current)}`\n\n"
+        f"Kirim link baru (contoh: `https://t.me/username`):",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Batal", callback_data="admpanel_setting")]])
+    )
 
 # =================== ADMIN: BAN / UNBAN ===================
 

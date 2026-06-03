@@ -3061,7 +3061,7 @@ def _build_stats_text(s: dict, now: datetime) -> str:
         "========================",
         "📈 <b>TREN 7 HARI TERAKHIR</b>",
         trend_lines.rstrip('\n'),
-        peak_str.rstrip('\n'b) if peak_str else "",
+        peak_str.rstrip('\n') if peak_str else "",
         "",
         "========================",
         "🏆 <b>ALL TIME</b>",

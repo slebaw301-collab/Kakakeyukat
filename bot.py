@@ -2139,48 +2139,76 @@ async def _handle_payment_success(bot, order_id: str, paket_id: str, user_id: in
     paid_amount = trans.get('amount', amount)
 
     # ── CEK PREREQUISITE ──────────────────────────────────────────────────────
-    requires_str = paket.get("requires_paket_ids") or ""
+    requires_str  = paket.get("requires_paket_ids") or ""
+    required_ids  = [p.strip() for p in requires_str.split(",") if p.strip()]
     missing_prereqs = await check_prerequisites_sync(user_id, requires_str)
 
     if missing_prereqs:
-        # Ambil nama paket yang belum terpenuhi untuk ditampilkan
-        missing_names = []
-        for pid in missing_prereqs:
-            p_obj = await get_product(pid)
-            label = f"{p_obj['emoji']} {p_obj['nama']}" if p_obj else f"<code>{esc(pid)}</code>"
-            missing_names.append(label)
-        missing_list = "\n".join(f"  • {n}" for n in missing_names)
+        done_ids     = set(required_ids) - set(missing_prereqs)
+        total_syarat = len(required_ids)
+        sisa_belum   = len(missing_prereqs)
 
-        # Beritahu buyer — pembayaran diterima tapi link ditahan
+        # Bangun baris checklist + tombol beli untuk yang kurang
+        prereq_lines = []
+        buy_buttons  = []
+        for pid in required_ids:
+            p_obj = await get_product(pid)
+            if p_obj:
+                nama  = f"{p_obj['emoji']} {p_obj['nama']}"
+                harga = format_harga(p_obj['harga'])
+            else:
+                nama  = f"<code>{esc(pid)}</code>"
+                harga = "-"
+
+            if pid in done_ids:
+                prereq_lines.append(f"  ✅ {nama}  <i>(sudah dimiliki)</i>")
+            else:
+                prereq_lines.append(f"  ❌ {nama}  —  {harga}")
+                buy_buttons.append([InlineKeyboardButton(
+                    f"🛒 Beli {p_obj['nama'] if p_obj else pid}",
+                    callback_data=f"pilih_{pid}"
+                )])
+
+        prereq_list = "\n".join(prereq_lines)
+        link_admin  = await get_setting('link_admin', 'https://t.me/Kikukkvd')
+
+        # ── Pesan ke buyer ──────────────────────────────────────────────────
+        buyer_text = (
+            f"✅ <b>Pembayaran Berhasil Diterima</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📦 <b>Paket</b>     : {esc(paket['emoji'])} {esc(paket['nama'])}\n"
+            f"💰 <b>Total</b>     : {format_harga(paid_amount)}\n"
+            f"🔖 <b>Order ID</b>  : <code>{esc(order_id)}</code>\n"
+            f"🕒 <b>Waktu</b>     : {now_wib().strftime('%H:%M, %d %b %Y')}\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔒 <b>Akses Sementara Ditahan</b>\n\n"
+            f"Pembayaran kamu sudah kami terima. Namun, paket "
+            f"<b>{esc(paket['nama'])}</b> memiliki syarat berlangganan "
+            f"yang perlu dipenuhi terlebih dahulu.\n\n"
+            f"<b>Progress Syarat</b>  ({total_syarat - sisa_belum}/{total_syarat} terpenuhi):\n"
+            f"{prereq_list}\n\n"
+            f"Selesaikan pembelian paket yang ditandai ❌ di bawah, "
+            f"lalu hubungi admin — link akses akan segera dikirimkan. 🙏"
+        )
+        keyboard_rows = buy_buttons + [[InlineKeyboardButton("💬 Hubungi Admin", url=link_admin)]]
+
         try:
             await bot.send_message(
                 chat_id=user_id,
-                text=(
-                    f"<b>✅ PEMBAYARAN BERHASIL DITERIMA</b>\n"
-                    f"========================\n\n"
-                    f"📦 Paket: {esc(paket['emoji'])} {esc(paket['nama'])}\n"
-                    f"💰 Total: {format_harga(paid_amount)}\n"
-                    f"🔖 Order ID: <code>{esc(order_id)}</code>\n\n"
-                    f"========================\n"
-                    f"⚠️ <b>Link belum bisa dikirim.</b>\n\n"
-                    f"Untuk mengakses paket ini, kamu harus sudah pernah membeli:\n"
-                    f"{missing_list}\n\n"
-                    f"Setelah kamu menyelesaikan pembelian paket di atas, "
-                    f"hubungi admin dan link akan segera dikirimkan. 🙏"
-                ),
+                text=buyer_text,
                 parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("💬 Hubungi Admin", url=await get_setting('link_admin', 'https://t.me/Kikukkvd'))
-                ]])
+                reply_markup=InlineKeyboardMarkup(keyboard_rows)
             )
         except Exception as e:
             logger.error(f"[PAYMENT] Gagal kirim notif prereq ke buyer {user_id}: {e}")
 
+        # ── Notif ke admin ──────────────────────────────────────────────────
         await hapus_notif_lama(bot, order_id)
         extra_prereq = (
-            f"⏸️ <b>LINK DITAHAN — Syarat belum terpenuhi</b>\n"
-            f"Paket yang belum dibeli:\n{missing_list}\n\n"
-            f"Klik tombol di bawah untuk kirim link setelah syarat terpenuhi."
+            f"⏸️ <b>Link Ditahan — Syarat Belum Terpenuhi</b>\n\n"
+            f"Progress ({total_syarat - sisa_belum}/{total_syarat}):\n"
+            f"{prereq_list}\n\n"
+            f"Klik tombol di bawah setelah semua syarat buyer terpenuhi."
         )
         msg_id = await kirim_notif(
             bot,
@@ -2191,7 +2219,7 @@ async def _handle_payment_success(bot, order_id: str, paket_id: str, user_id: in
                 extra=extra_prereq
             ),
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("📤 Kirim Link VIP (Syarat Terpenuhi)", callback_data=f"admin_kirim_link_prereq|{order_id}")
+                InlineKeyboardButton("📤 Kirim Link (Syarat Terpenuhi)", callback_data=f"admin_kirim_link_prereq|{order_id}")
             ]])
         )
         if msg_id:

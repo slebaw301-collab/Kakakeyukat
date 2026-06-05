@@ -183,6 +183,29 @@ def generate_qr_image(qris_string):
 
 _pool: ThreadedConnectionPool = None
 
+# =================== IN-MEMORY TTL CACHE ===================
+import time as _time
+
+# Cache untuk get_setting: {key: (value, expire_at)}
+_settings_cache: dict = {}
+_SETTINGS_TTL = 60  # detik
+
+# Cache untuk get_all_products: (data_list, expire_at) atau None
+_products_cache: tuple = None
+_PRODUCTS_TTL = 30  # detik
+
+def _settings_cache_get(key):
+    entry = _settings_cache.get(key)
+    if entry and _time.monotonic() < entry[1]:
+        return True, entry[0]
+    return False, None
+
+def _settings_cache_set(key, value):
+    _settings_cache[key] = (value, _time.monotonic() + _SETTINGS_TTL)
+
+def _settings_cache_del(key):
+    _settings_cache.pop(key, None)
+
 def init_pool():
     global _pool
     _pool = ThreadedConnectionPool(2, 20, DATABASE_URL, cursor_factory=RealDictCursor)
@@ -357,15 +380,28 @@ def get_testimonial_by_order(order_id):
 
 # =================== PRODUCT DB FUNCTIONS ===================
 
-@async_wrap
-def get_all_products():
+def _get_all_products_sync():
+    global _products_cache
+    cached = _products_cache
+    if cached and _time.monotonic() < cached[1]:
+        return cached[0]
     conn = get_conn()
     try:
         with conn.cursor() as c:
             c.execute("SELECT * FROM products ORDER BY harga ASC")
-            return [dict(r) for r in c.fetchall()]
+            data = [dict(r) for r in c.fetchall()]
+            _products_cache = (data, _time.monotonic() + _PRODUCTS_TTL)
+            return data
     finally:
         release_conn(conn)
+
+@async_wrap
+def get_all_products():
+    return _get_all_products_sync()
+
+def _invalidate_products_cache():
+    global _products_cache
+    _products_cache = None
 
 def _get_product_sync(paket_id):
     conn = get_conn()
@@ -398,6 +434,7 @@ def add_product(paket_id, nama, emoji, deskripsi, harga, link=None, group_chat_i
             conn.commit()
     finally:
         release_conn(conn)
+    _invalidate_products_cache()
 
 @async_wrap
 def update_product_field(paket_id, field, value):
@@ -411,6 +448,7 @@ def update_product_field(paket_id, field, value):
             conn.commit()
     finally:
         release_conn(conn)
+    _invalidate_products_cache()
 
 @async_wrap
 def delete_product(paket_id):
@@ -421,6 +459,7 @@ def delete_product(paket_id):
             conn.commit()
     finally:
         release_conn(conn)
+    _invalidate_products_cache()
 
 def make_paket_id(nama):
     pid = re.sub(r'[^a-z0-9]+', '_', nama.lower().strip()).strip('_')
@@ -944,12 +983,17 @@ def get_all_banned():
 
 @async_wrap
 def get_setting(key, default=None):
+    hit, cached_val = _settings_cache_get(key)
+    if hit:
+        return cached_val if cached_val is not None else default
     conn = get_conn()
     try:
         with conn.cursor() as c:
             c.execute("SELECT value FROM settings WHERE key=%s", (key,))
             row = c.fetchone()
-            return row['value'] if row else default
+            val = row['value'] if row else None
+            _settings_cache_set(key, val)
+            return val if val is not None else default
     finally:
         release_conn(conn)
 
@@ -969,6 +1013,7 @@ def set_setting(key, value):
             conn.commit()
     finally:
         release_conn(conn)
+    _settings_cache_del(key)
 
 # =================== COOLDOWN DB ===================
 COOLDOWN_MENIT = 5
@@ -2790,7 +2835,7 @@ async def pd_req_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop('editing_prereq', None)
 
     new_val = ",".join(selected) if selected else None
-    await update_product(paket_id, 'requires_paket_ids', new_val)
+    await update_product_field(paket_id, 'requires_paket_ids', new_val)
 
     query.data = f"pd_detail_{paket_id}"
     await produk_detail(update, context)
@@ -3979,7 +4024,7 @@ async def blast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML"
     )
 
-    task = asyncio.create_task(_run_broadcast(query.get_bot(), admin_id, buyers, text_blast))
+    task = asyncio.create_task(_run_broadcast(context.bot, admin_id, buyers, text_blast))
     _blast_tasks[admin_id] = task
 
 async def blast_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):

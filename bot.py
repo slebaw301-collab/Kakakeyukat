@@ -1053,14 +1053,16 @@ COOLDOWN_MENIT = 5
 
 @async_wrap
 def set_cooldown_db(user_id):
-    expires_at = now_wib() + timedelta(minutes=COOLDOWN_MENIT)
+    # Gunakan NOW() PostgreSQL agar tidak ada masalah timezone Python vs server
     conn = get_conn()
     try:
         with conn.cursor() as c:
             c.execute(
-                """INSERT INTO cooldowns (user_id, expires_at) VALUES (%s, %s)
-                   ON CONFLICT (user_id) DO UPDATE SET expires_at=EXCLUDED.expires_at""",
-                (user_id, expires_at)
+                """INSERT INTO cooldowns (user_id, expires_at)
+                   VALUES (%s, NOW() + %s * INTERVAL '1 minute')
+                   ON CONFLICT (user_id) DO UPDATE
+                   SET expires_at = NOW() + %s * INTERVAL '1 minute'""",
+                (user_id, COOLDOWN_MENIT, COOLDOWN_MENIT)
             )
             conn.commit()
     finally:
@@ -1068,22 +1070,20 @@ def set_cooldown_db(user_id):
 
 @async_wrap
 def get_cooldown_sisa_db(user_id):
+    # Selisih dihitung langsung di PostgreSQL — bebas timezone issue Python
     conn = get_conn()
     try:
         with conn.cursor() as c:
-            c.execute("SELECT expires_at FROM cooldowns WHERE user_id=%s", (user_id,))
+            c.execute(
+                """SELECT GREATEST(0, EXTRACT(EPOCH FROM (expires_at - NOW())))::int AS sisa_secs
+                   FROM cooldowns WHERE user_id=%s""",
+                (user_id,)
+            )
             row = c.fetchone()
             if not row:
                 return 0
-            try:
-                until = row['expires_at']
-                if until.tzinfo is None:
-                    until = until.replace(tzinfo=WIB)
-                sisa = (until - now_wib()).total_seconds()
-                return math.ceil(sisa / 60) if sisa > 0 else 0
-            except Exception as e:
-                logger.error(f"[COOLDOWN] Gagal menghitung sisa cooldown: {e}")
-                return 0
+            sisa_secs = row['sisa_secs'] or 0
+            return math.ceil(sisa_secs / 60) if sisa_secs > 0 else 0
     finally:
         release_conn(conn)
 
@@ -1933,8 +1933,8 @@ async def back_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if msg_id:
             await set_admin_msg_id(cancelled_order_id, msg_id)
 
-    # Cooldown selalu di-set saat Batalkan ditekan (termasuk jika QRIS sudah expired timeout)
-    await set_cooldown_db(user_id)
+        # Cooldown hanya di-set saat ada order aktif yang dibatalkan manual
+        await set_cooldown_db(user_id)
 
     # Ambil prereq_ctx SEBELUM clear agar tidak hilang
     prereq_ctx = context.user_data.pop('prereq_ctx', None)
@@ -2234,6 +2234,8 @@ async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
         if amount:
             await cancel_transaction(order_id, amount)
         await update_order_status(order_id, 'expired')
+        # Set cooldown agar buyer tidak langsung beli ulang setelah QRIS auto-expire
+        await set_cooldown_db(user_id)
         await hapus_qris_buyer_lama(bot, order_id, user_id)
 
         try:

@@ -1089,8 +1089,12 @@ def get_cooldown_sisa_db(user_id):
                 return 0
             try:
                 until = row['expires_at']
+                # psycopg2 bisa kembalikan naive datetime (UTC) atau aware datetime.
+                # Jika naive → asumsikan UTC, lalu convert ke WIB.
+                # Jika aware → langsung convert ke WIB.
                 if until.tzinfo is None:
-                    until = until.replace(tzinfo=WIB)
+                    until = until.replace(tzinfo=timezone.utc)
+                until = until.astimezone(WIB)
                 sisa = (until - now_wib()).total_seconds()
                 return math.ceil(sisa / 60) if sisa > 0 else 0
             except Exception as e:
@@ -1474,10 +1478,17 @@ async def pakasir_webhook_handler(request: aio_web.Request) -> aio_web.Response:
 
     # Verifikasi ke Pakasir API — coba dengan amount webhook, lalu dengan DB amount sebagai fallback
     verified_detail = await get_transaction_detail(order_id, amount)
-    if not verified_detail and expected_amount and int(amount) != int(expected_amount):
-        verified_detail = await get_transaction_detail(order_id, expected_amount)
+    if not verified_detail:
+        # Fallback 1: pakai DB amount jika beda dengan webhook amount
+        if expected_amount and int(amount) != int(expected_amount):
+            verified_detail = await get_transaction_detail(order_id, expected_amount)
+    if not verified_detail:
+        # Fallback 2: cari harga langsung dari produk (antisipasi harga_dibayar=0 di DB)
+        paket_fallback = await get_product(order.get('paket_id', ''))
+        if paket_fallback and paket_fallback.get('harga'):
+            verified_detail = await get_transaction_detail(order_id, paket_fallback['harga'])
 
-    _PAID_STATUSES = {'completed', 'paid', 'settlement', 'success', 'capture', 'expire'}
+    _PAID_STATUSES = {'completed', 'paid', 'settlement', 'success', 'capture'}
     if not verified_detail or verified_detail.get('status') not in _PAID_STATUSES:
         logger.warning(
             f"[WEBHOOK] Verifikasi gagal untuk order {order_id}. "
@@ -1495,26 +1506,30 @@ async def pakasir_webhook_handler(request: aio_web.Request) -> aio_web.Response:
 
     _stop_payment_task(user_id)
 
-    if _current_bot:
-        def _on_payment_done(task, _oid=order_id):
-            try:
-                exc = task.exception()
-                if exc:
-                    logger.error(
-                        f"[WEBHOOK] 🚨 _handle_payment_success CRASH untuk order {_oid}: {exc}",
-                        exc_info=exc
-                    )
-            except asyncio.CancelledError:
-                pass
-        # Gunakan amount yang benar: dari verified_detail jika ada, fallback ke DB amount
-        actual_paid = verified_detail.get('amount', expected_amount or amount)
-        task = asyncio.create_task(
-            _handle_payment_success(
-                _current_bot, order_id, paket_id, user_id, user_name,
-                actual_paid, {'amount': actual_paid, 'status': 'completed'}
-            )
+    if not _current_bot:
+        # Bot belum siap — jangan return ok agar Pakasir retry webhook
+        logger.error(f"[WEBHOOK] _current_bot belum siap saat webhook masuk untuk {order_id}. Menolak agar Pakasir retry.")
+        return aio_web.Response(status=503, text='bot not ready')
+
+    def _on_payment_done(task, _oid=order_id):
+        try:
+            exc = task.exception()
+            if exc:
+                logger.error(
+                    f"[WEBHOOK] 🚨 _handle_payment_success CRASH untuk order {_oid}: {exc}",
+                    exc_info=exc
+                )
+        except asyncio.CancelledError:
+            pass
+    # Gunakan amount yang benar: dari verified_detail jika ada, fallback ke DB amount
+    actual_paid = verified_detail.get('amount', expected_amount or amount)
+    task = asyncio.create_task(
+        _handle_payment_success(
+            _current_bot, order_id, paket_id, user_id, user_name,
+            actual_paid, {'amount': actual_paid, 'status': 'completed'}
         )
-        task.add_done_callback(_on_payment_done)
+    )
+    task.add_done_callback(_on_payment_done)
 
     logger.info(f"[WEBHOOK] ✅ Webhook sukses diverifikasi & diproses: {order_id}")
     return aio_web.Response(text='ok')
@@ -1718,7 +1733,13 @@ async def api_cancel_order(request: aio_web.Request) -> aio_web.Response:
     if amount:
         await cancel_transaction(order_id, amount)
     await update_order_status(order_id, "cancelled")
-    _stop_payment_task(order["user_id"])
+    buyer_id = order["user_id"]
+    _stop_payment_task(buyer_id)
+    # Set cooldown agar buyer tidak bisa langsung re-order setelah dibatalkan via API
+    try:
+        await set_cooldown_db(buyer_id)
+    except Exception as e:
+        logger.error(f"[COOLDOWN] GAGAL set cooldown (api cancel) untuk user {buyer_id}: {e}")
     return _json_resp({"ok": True})
 
 async def api_get_testimonials(request: aio_web.Request) -> aio_web.Response:
@@ -2755,15 +2776,23 @@ async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
         await update_order_status(order_id, 'expired')
         await hapus_qris_buyer_lama(bot, order_id, user_id)
 
+        # Set cooldown agar buyer tidak bisa spam order setelah expired
+        try:
+            await set_cooldown_db(user_id)
+            logger.info(f"[COOLDOWN] Set untuk user {user_id} setelah order expired.")
+        except Exception as e:
+            logger.error(f"[COOLDOWN] GAGAL set cooldown (expired) untuk user {user_id}: {e}")
+
         try:
             await bot.send_message(
                 chat_id=user_id,
                 text=(
-                    "<b>⏰ SESI BERAKHIR</b>\n"
-                    "========================\n\n"
-                    "Pesanan telah dibatalkan otomatis.\n\n"
-                    "Alasan: Pembayaran tidak diterima dalam waktu yang ditentukan.\n\n"
-                    "Ketik /start untuk membuat pesanan baru."
+                    f"<b>⏰ SESI BERAKHIR</b>\n"
+                    f"========================\n\n"
+                    f"Pesanan telah dibatalkan otomatis.\n\n"
+                    f"Alasan: Pembayaran tidak diterima dalam waktu yang ditentukan.\n\n"
+                    f"Ketik /start untuk membuat pesanan baru.\n"
+                    f"<i>(Cooldown {COOLDOWN_MENIT} menit berlaku)</i>"
                 ),
                 parse_mode="HTML"
             )
@@ -2878,8 +2907,6 @@ async def _handle_payment_success(bot, order_id: str, paket_id: str, user_id: in
         logger.info(f"[PAYMENT] Order {order_id} sudah diproses sebelumnya, skip.")
         return
 
-    await hapus_qris_buyer_lama(bot, order_id, user_id)
-
     paket = await get_product(paket_id) or {"emoji": "📦", "nama": "Produk", "harga": amount, "link": DEFAULT_LINK}
     paid_amount = trans.get('amount', amount)
 
@@ -2979,30 +3006,51 @@ async def _handle_payment_success(bot, order_id: str, paket_id: str, user_id: in
     link = group_link or (paket.get("link") or DEFAULT_LINK)
     link_section = _build_link_section(group_link, link)
 
+    success_text = (
+        f"<b>✅ PEMBAYARAN BERHASIL</b>\n"
+        f"========================\n\n"
+        f"📦 <b>Detail Pesanan</b>\n"
+        f"- Paket: {esc(paket['emoji'])} {esc(paket['nama'])}\n"
+        f"- Order ID: <code>{esc(order_id)}</code>\n"
+        f"- Total: {format_harga(paid_amount)}\n\n"
+        f"========================\n"
+        f"{link_section}\n\n"
+        f"Terima kasih telah berbelanja! 🙏\n\n"
+        f"Bantu kami berkembang dengan memberikan ulasan di bawah ini:"
+    )
+    success_markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⭐ Beri Ulasan / Testimoni", callback_data=f"rate_start|{order_id}")]
+    ])
+
     kirim_berhasil = False
-    try:
-        await bot.send_message(
-            chat_id=user_id,
-            text=(
-                f"<b>✅ PEMBAYARAN BERHASIL</b>\n"
-                f"========================\n\n"
-                f"📦 <b>Detail Pesanan</b>\n"
-                f"- Paket: {esc(paket['emoji'])} {esc(paket['nama'])}\n"
-                f"- Order ID: <code>{esc(order_id)}</code>\n"
-                f"- Total: {format_harga(paid_amount)}\n\n"
-                f"========================\n"
-                f"{link_section}\n\n"
-                f"Terima kasih telah berbelanja! 🙏\n\n"
-                f"Bantu kami berkembang dengan memberikan ulasan di bawah ini:"
-            ),
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⭐ Beri Ulasan / Testimoni", callback_data=f"rate_start|{order_id}")]
-            ])
-        )
-        kirim_berhasil = True
-    except Exception as e:
-        logger.error(f"[PAYMENT] Gagal kirim link ke buyer {user_id}: {e}")
+    # Coba EDIT pesan QR lama menjadi pesan sukses (lebih andal dari delete+kirim baru)
+    order_for_msg = await get_order_by_id(order_id)
+    buyer_msg_id = order_for_msg.get('buyer_msg_id') if order_for_msg else None
+    if buyer_msg_id:
+        try:
+            await bot.edit_message_caption(
+                chat_id=user_id,
+                message_id=int(buyer_msg_id),
+                caption=success_text,
+                parse_mode="HTML",
+                reply_markup=success_markup
+            )
+            kirim_berhasil = True
+        except Exception as e:
+            logger.warning(f"[PAYMENT] Gagal edit pesan QR (fallback ke send_message): {e}")
+
+    # Fallback: jika edit gagal (pesan tidak ada / bukan foto), kirim pesan baru
+    if not kirim_berhasil:
+        try:
+            await bot.send_message(
+                chat_id=user_id,
+                text=success_text,
+                parse_mode="HTML",
+                reply_markup=success_markup
+            )
+            kirim_berhasil = True
+        except Exception as e:
+            logger.error(f"[PAYMENT] Gagal kirim link ke buyer {user_id}: {e}")
 
     await set_sent_link(order_id, link)
     await hapus_notif_lama(bot, order_id)
@@ -3863,6 +3911,13 @@ async def admin_cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
     _stop_payment_task(target_user_id)
     await hapus_qris_buyer_lama(context.bot, order_id, target_user_id)
     await hapus_notif_lama(context.bot, order_id)
+
+    # Set cooldown agar buyer tidak bisa langsung re-order setelah dibatalkan admin
+    try:
+        await set_cooldown_db(target_user_id)
+        logger.info(f"[COOLDOWN] Set untuk user {target_user_id} setelah dibatalkan admin.")
+    except Exception as e:
+        logger.error(f"[COOLDOWN] GAGAL set cooldown (admin cancel) untuk user {target_user_id}: {e}")
 
     msg_id = await kirim_notif(
         context.bot,

@@ -934,6 +934,23 @@ def get_completed_no_link_orders(user_id: int) -> list:
         release_conn(conn)
 
 @async_wrap
+def atomic_claim_for_delivery(order_id: str) -> bool:
+    """Atomically claim order for link delivery. Returns True only if successfully claimed.
+    Prevents race conditions when multiple webhook callbacks fire simultaneously."""
+    conn = get_conn()
+    try:
+        with conn.cursor() as c:
+            c.execute(
+                """UPDATE orders SET sent_link='pending'
+                   WHERE order_id=%s AND (sent_link IS NULL OR sent_link='')""",
+                (order_id,)
+            )
+            conn.commit()
+            return c.rowcount > 0
+    finally:
+        release_conn(conn)
+
+@async_wrap
 def save_order(user_id, user_name, paket_id, order_id, harga_dibayar=0, order_changes=0):
     conn = get_conn()
     try:
@@ -1809,7 +1826,7 @@ async def _buat_order_baru(update, context, query, user_id, user_name, paket, or
 
     qr_buffer = await asyncio.to_thread(generate_qr_image, qris_string)
 
-    sisa_ganti = 2 - order_changes
+    sisa_ganti = 1 - order_changes
 
     # Tambah catatan konteks prereq jika buyer datang dari flow syarat
     prereq_ctx = context.user_data.get('prereq_ctx') if context else None
@@ -1901,7 +1918,6 @@ async def back_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update_order_status(active["order_id"], "cancelled")
         _stop_payment_task(user_id)
         await hapus_qris_buyer_lama(context.bot, active["order_id"], user_id)
-        await set_cooldown_db(user_id)
 
         cancelled_order_id = active["order_id"]
         await hapus_notif_lama(context.bot, cancelled_order_id)
@@ -1916,6 +1932,9 @@ async def back_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if msg_id:
             await set_admin_msg_id(cancelled_order_id, msg_id)
+
+    # Cooldown selalu di-set saat Batalkan ditekan (termasuk jika QRIS sudah expired timeout)
+    await set_cooldown_db(user_id)
 
     # Ambil prereq_ctx SEBELUM clear agar tidak hilang
     prereq_ctx = context.user_data.pop('prereq_ctx', None)
@@ -1995,15 +2014,15 @@ async def ganti_paket_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     changes_used = active.get('order_changes', 0)
-    if changes_used >= 2:
-        await query.answer("⛔ Batas ganti paket sudah tercapai (2x).", show_alert=True)
+    if changes_used >= 1:
+        await query.answer("⛔ Batas ganti paket sudah tercapai (1x).", show_alert=True)
         return
 
     current_paket_id = active['paket_id']
     products = await get_all_products()
     products = [p for p in products if p.get('aktif', True)]
 
-    sisa = 2 - changes_used
+    sisa = 1 - changes_used
     text = (
         f"<b>🔄 GANTI PAKET</b>\n"
         f"========================\n\n"
@@ -2084,8 +2103,8 @@ async def ganti_paket_exec(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     changes_used = active.get('order_changes', 0)
-    if changes_used >= 2:
-        await query.answer("⛔ Batas ganti paket sudah tercapai (2x).", show_alert=True)
+    if changes_used >= 1:
+        await query.answer("⛔ Batas ganti paket sudah tercapai (1x).", show_alert=True)
         return
 
     new_paket_id = query.data.split("|", 1)[1]
@@ -2130,7 +2149,7 @@ async def ganti_paket_batal(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     changes_used = active.get('order_changes', 0)
-    sisa_ganti = 2 - changes_used
+    sisa_ganti = 1 - changes_used
 
     caption_back = (
         f"<b>{esc(paket['emoji'])} {esc(paket['nama']).upper()}</b>\n"
@@ -2317,8 +2336,8 @@ async def _handle_payment_success(bot, order_id: str, paket_id: str, user_id: in
         await hapus_notif_lama(bot, order_id)
         extra_prereq = (
             f"⏸️ <b>LINK DITAHAN — Syarat belum terpenuhi</b>\n"
-            f"Paket yang belum dibeli:\n{missing_list}\n\n"
-            f"Klik tombol di bawah untuk kirim link setelah syarat terpenuhi."
+            f"Progress ({fulfilled_count}/{total_count} terpenuhi):\n{prereq_status}\n\n"
+            f"Buyer harus beli paket ❌ di atas. Link terkirim otomatis."
         )
         msg_id = await kirim_notif(
             bot,
@@ -2419,7 +2438,11 @@ async def _auto_deliver_pending_prereq_orders(bot, user_id: int, user_name: str)
         if missing:
             continue  # masih ada yang belum terpenuhi
 
-        # Semua prereq sudah terpenuhi! Auto-kirim link.
+        # Semua prereq sudah terpenuhi! Klaim dulu secara atomik sebelum kirim.
+        claimed = await atomic_claim_for_delivery(oid)
+        if not claimed:
+            continue  # proses lain sudah mengklaim, skip
+
         group_link = await generate_group_link(bot, paket, oid)
         link = group_link or (paket.get("link") or DEFAULT_LINK)
         link_section = _build_link_section(group_link, link)

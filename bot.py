@@ -63,6 +63,10 @@ WIB = timezone(timedelta(hours=7))
 def now_wib() -> datetime:
     return datetime.now(WIB)
 
+def now_utc() -> datetime:
+    """Return timezone-aware UTC datetime."""
+    return datetime.now(timezone.utc)
+
 # =================== KONFIGURASI ===================
 TOKEN = os.environ.get("BOT_TOKEN")
 _ADMIN_ID_RAW = os.environ.get("ADMIN_ID", "")
@@ -1048,42 +1052,85 @@ def set_setting(key, value):
         release_conn(conn)
     _settings_cache_del(key)
 
-# =================== COOLDOWN DB ===================
+# =================== COOLDOWN DB + IN-MEMORY CACHE ===================
 COOLDOWN_MENIT = 5
+
+# In-memory cooldown cache: {user_id: expires_at_utc}
+# Used as fast-path validation before hitting DB
+_cooldown_memory_cache: dict = {}
+
+def _get_cooldown_memory(user_id: int) -> datetime:
+    """Get cooldown expiry from in-memory cache. Returns None if not found or expired."""
+    expires = _cooldown_memory_cache.get(user_id)
+    if expires is None:
+        return None
+    if now_utc() >= expires:
+        _cooldown_memory_cache.pop(user_id, None)
+        return None
+    return expires
+
+def _set_cooldown_memory(user_id: int, expires_at: datetime):
+    """Store cooldown expiry in memory cache."""
+    _cooldown_memory_cache[user_id] = expires_at
+
+def _clear_cooldown_memory(user_id: int):
+    """Clear cooldown from memory cache."""
+    _cooldown_memory_cache.pop(user_id, None)
 
 @async_wrap
 def set_cooldown_db(user_id):
-    # Gunakan NOW() PostgreSQL agar tidak ada masalah timezone Python vs server
+    """Store cooldown in DB using UTC timezone."""
+    expires_at = now_utc() + timedelta(minutes=COOLDOWN_MENIT)
     conn = get_conn()
     try:
         with conn.cursor() as c:
             c.execute(
-                """INSERT INTO cooldowns (user_id, expires_at)
-                   VALUES (%s, NOW() + %s * INTERVAL '1 minute')
-                   ON CONFLICT (user_id) DO UPDATE
-                   SET expires_at = NOW() + %s * INTERVAL '1 minute'""",
-                (user_id, COOLDOWN_MENIT, COOLDOWN_MENIT)
+                """INSERT INTO cooldowns (user_id, expires_at) VALUES (%s, %s)
+                   ON CONFLICT (user_id) DO UPDATE SET expires_at=EXCLUDED.expires_at""",
+                (user_id, expires_at)
             )
             conn.commit()
     finally:
         release_conn(conn)
+    # Also update in-memory cache
+    _set_cooldown_memory(user_id, expires_at)
 
 @async_wrap
 def get_cooldown_sisa_db(user_id):
-    # Selisih dihitung langsung di PostgreSQL — bebas timezone issue Python
+    """Get remaining cooldown minutes. Uses UTC consistently."""
+    # Check in-memory cache first (fast path)
+    mem_expires = _get_cooldown_memory(user_id)
+    if mem_expires is not None:
+        sisa = (mem_expires - now_utc()).total_seconds()
+        return math.ceil(sisa / 60) if sisa > 0 else 0
+    
+    # Fallback to DB
     conn = get_conn()
     try:
         with conn.cursor() as c:
-            c.execute(
-                """SELECT GREATEST(0, EXTRACT(EPOCH FROM (expires_at - NOW())))::int AS sisa_secs
-                   FROM cooldowns WHERE user_id=%s""",
-                (user_id,)
-            )
+            c.execute("SELECT expires_at FROM cooldowns WHERE user_id=%s", (user_id,))
             row = c.fetchone()
             if not row:
                 return 0
-            sisa_secs = row['sisa_secs'] or 0
-            return math.ceil(sisa_secs / 60) if sisa_secs > 0 else 0
+            try:
+                until = row['expires_at']
+                # Ensure timezone-aware comparison
+                if until.tzinfo is None:
+                    # If naive, assume it's UTC (PostgreSQL TIMESTAMPTZ should be aware, but handle edge case)
+                    until = until.replace(tzinfo=timezone.utc)
+                
+                # Convert to UTC for consistent comparison
+                until_utc = until.astimezone(timezone.utc)
+                sisa = (until_utc - now_utc()).total_seconds()
+                
+                # Update memory cache for next time
+                if sisa > 0:
+                    _set_cooldown_memory(user_id, until_utc)
+                
+                return math.ceil(sisa / 60) if sisa > 0 else 0
+            except Exception as e:
+                logger.error(f"[COOLDOWN] Gagal menghitung sisa cooldown: {e}")
+                return 0
     finally:
         release_conn(conn)
 
@@ -1096,6 +1143,7 @@ def clear_cooldown_db(user_id):
             conn.commit()
     finally:
         release_conn(conn)
+    _clear_cooldown_memory(user_id)
 
 @async_wrap
 def cleanup_expired_cooldowns():
@@ -1592,6 +1640,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # === COOLDOWN CHECK DI ENTRY POINT /start ===
+    sisa = await get_cooldown_sisa_db(user_id)
+    if sisa > 0:
+        await update.message.reply_text(
+            f"⏳ <b>Cooldown Aktif</b>\n"
+            f"========================\n\n"
+            f"Kamu baru saja membatalkan pesanan. Tunggu <b>{sisa} menit</b> lagi sebelum bisa membuat order baru.\n\n"
+            f"⏰ Cooldown berakhir sekitar pukul <b>{(now_wib() + timedelta(minutes=sisa)).strftime('%H:%M')} WIB</b>",
+            parse_mode="HTML"
+        )
+        return
+
     active = await get_active_order(user_id)
     if active:
         paket = await get_product(active["paket_id"])
@@ -1634,7 +1694,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📝 Order ID: <code>{esc(active['order_id'])}</code>\n\n"
             f"<i>Silakan selesaikan pembayaran atau batalkan pesanan dulu.</i>"
         )
-        keyboard = [[InlineKeyboardButton("❌ Batalkan Pesanan", callback_data="back_start")]]
+        keyboard = [[InlineKeyboardButton("❌ Batalkan Pesanan", callback_data="cancel_order")]]
         msg = await update.message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
         simpan_msg_user(context, user_id, msg.message_id)
         await hapus_msg_user_lama(context, user_id, keep_last=2)
@@ -1679,7 +1739,8 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton(f"{p['emoji']} {p['nama']} - {format_harga(p['harga'])}", callback_data=f"pilih_{p['paket_id']}")]
         for p in aktif
     ]
-    keyboard.append([InlineKeyboardButton("⬅️ Kembali", callback_data="back_start")])
+    # === PISAHKAN CALLBACK: back_to_menu untuk navigasi, bukan back_start ===
+    keyboard.append([InlineKeyboardButton("⬅️ Kembali", callback_data="back_to_menu")])
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def pilih_paket(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1714,7 +1775,7 @@ async def pilih_paket(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📝 Order ID: <code>{esc(active['order_id'])}</code>\n\n"
             f"⚠️ Selesaikan pembayaran atau batalkan dulu."
         )
-        keyboard = [[InlineKeyboardButton("❌ Batalkan", callback_data="back_start")]]
+        keyboard = [[InlineKeyboardButton("❌ Batalkan", callback_data="cancel_order")]]
         await query.edit_message_text(caption, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
@@ -1783,6 +1844,9 @@ async def _buat_order_baru(update, context, query, user_id, user_name, paket, or
 
     rand_suffix = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
     order_id = f"HFB-{user_id}-{now_wib().strftime('%Y%m%d%H%M%S')}-{rand_suffix}"
+
+    # =================== LANJUTAN DARI _buat_order_baru ===================
+# [DESKRIPSI: Lanjutan fungsi _buat_order_baru - tidak ada perubahan di sini]
 
     trans_data = await create_transaction_qris(
         order_id=order_id,
@@ -1862,10 +1926,10 @@ async def _buat_order_baru(update, context, query, user_id, user_name, paket, or
     if sisa_ganti > 0:
         kb = [
             [InlineKeyboardButton(f"🔄 Ganti Paket (sisa {sisa_ganti}x)", callback_data="ganti_paket_list")],
-            [InlineKeyboardButton("❌ Batalkan Pesanan", callback_data="back_start")],
+            [InlineKeyboardButton("❌ Batalkan Pesanan", callback_data="cancel_order")],
         ]
     else:
-        kb = [[InlineKeyboardButton("❌ Batalkan Pesanan", callback_data="back_start")]]
+        kb = [[InlineKeyboardButton("❌ Batalkan Pesanan", callback_data="cancel_order")]]
 
     if query:
         try:
@@ -1904,7 +1968,15 @@ async def _buat_order_baru(update, context, query, user_id, user_name, paket, or
         total_payment, timeout_seconds=timeout_secs
     )
 
-async def back_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# =================== CANCEL ORDER (PISAH DARI back_start) ===================
+# [DESKRIPSI: Handler baru khusus untuk tombol "Batalkan Pesanan"
+#  - Sebelumnya pakai callback_data="back_start" yang dobel fungsi
+#  - Sekarang callback_data="cancel_order" khusus untuk batal, selalu set cooldown
+#  - back_start dihapus dari tombol batal, diganti cancel_order]
+
+async def cancel_order_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler khusus untuk tombol '❌ Batalkan Pesanan'. 
+    Selalu set cooldown ke DB + memory cache."""
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
@@ -1933,8 +2005,8 @@ async def back_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if msg_id:
             await set_admin_msg_id(cancelled_order_id, msg_id)
 
-        # Cooldown hanya di-set saat ada order aktif yang dibatalkan manual
-        await set_cooldown_db(user_id)
+    # === SET COOLDOWN: Selalu aktif saat batal, pakai UTC + memory cache ===
+    await set_cooldown_db(user_id)
 
     # Ambil prereq_ctx SEBELUM clear agar tidak hilang
     prereq_ctx = context.user_data.pop('prereq_ctx', None)
@@ -2002,7 +2074,34 @@ async def back_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     simpan_msg_user(context, user_id, msg.message_id)
     await hapus_msg_user_lama(context, user_id, keep_last=1)
 
+# =================== BACK TO MENU (NAVIGASI BIASA, TIDAK SET COOLDOWN) ===================
+# [DESKRIPSI: Handler baru khusus untuk tombol "⬅️ Kembali" di menu daftar paket
+#  - callback_data="back_to_menu" untuk navigasi biasa
+#  - TIDAK set cooldown, cuma balik ke menu utama
+#  - Pisah dari cancel_order yang set cooldown]
+
+async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler untuk tombol kembali ke menu utama (navigasi biasa, tanpa set cooldown)."""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+
+    msg = await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=await build_main_menu_text(),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(await build_main_menu_keyboard())
+    )
+    simpan_msg_user(context, user_id, msg.message_id)
+    await hapus_msg_user_lama(context, user_id, keep_last=1)
+
 # =================== GANTI PAKET ===================
+# [DESKRIPSI: Tidak ada perubahan signifikan di sini]
 
 async def ganti_paket_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -2130,6 +2229,10 @@ async def ganti_paket_exec(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
+    # === SET COOLDOWN JUGA SAAT GANTI PAKET (karena ini membatalkan order lama) ===
+    # [DESKRIPSI: Tambahan - ganti paket juga set cooldown karena membatalkan order lama]
+    await set_cooldown_db(user_id)
+
     await _buat_order_baru(update, context, None, user_id, user_name,
                            new_paket, order_changes=changes_used + 1)
 
@@ -2160,10 +2263,10 @@ async def ganti_paket_batal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if sisa_ganti > 0:
         kb = [
             [InlineKeyboardButton(f"🔄 Ganti Paket (sisa {sisa_ganti}x)", callback_data="ganti_paket_list")],
-            [InlineKeyboardButton("❌ Batalkan Pesanan", callback_data="back_start")],
+            [InlineKeyboardButton("❌ Batalkan Pesanan", callback_data="cancel_order")],
         ]
     else:
-        kb = [[InlineKeyboardButton("❌ Batalkan Pesanan", callback_data="back_start")]]
+        kb = [[InlineKeyboardButton("❌ Batalkan Pesanan", callback_data="cancel_order")]]
 
     try:
         await query.message.edit_caption(caption_back, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
@@ -2171,6 +2274,7 @@ async def ganti_paket_batal(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 # =================== ASYNCIO PAYMENT TASKS ===================
+# [DESKRIPSI: Timeout QRIS juga set cooldown karena order expired = batal]
 
 _payment_tasks: dict = {}
 _current_bot = None
@@ -2234,9 +2338,12 @@ async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
         if amount:
             await cancel_transaction(order_id, amount)
         await update_order_status(order_id, 'expired')
-        # Set cooldown agar buyer tidak langsung beli ulang setelah QRIS auto-expire
-        await set_cooldown_db(user_id)
         await hapus_qris_buyer_lama(bot, order_id, user_id)
+
+        # === SET COOLDOWN SAAT TIMEOUT/EXPIRED ===
+        # [DESKRIPSI: Buyer yang tidak bayar sampai waktu habis juga kena cooldown
+        #  supaya tidak bisa langsung spam order baru]
+        await set_cooldown_db(user_id)
 
         try:
             await bot.send_message(
@@ -2245,7 +2352,8 @@ async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
                     "<b>⏰ SESI BERAKHIR</b>\n"
                     "========================\n\n"
                     "Pesanan telah dibatalkan otomatis.\n\n"
-                    "Alasan: Pembayaran tidak diterima dalam waktu yang ditentukan.\n\n"
+                    f"Alasan: Pembayaran tidak diterima dalam waktu yang ditentukan.\n\n"
+                    f"⏳ Kamu bisa membuat pesanan baru dalam <b>{COOLDOWN_MENIT} menit</b>.\n\n"
                     "Ketik /start untuk membuat pesanan baru."
                 ),
                 parse_mode="HTML"
@@ -3271,6 +3379,10 @@ async def admin_cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await hapus_qris_buyer_lama(context.bot, order_id, target_user_id)
     await hapus_notif_lama(context.bot, order_id)
 
+    # === SET COOLDOWN JUGA SAAT ADMIN CANCEL ===
+    # [DESKRIPSI: Admin cancel juga set cooldown ke buyer, konsisten dengan batal buyer]
+    await set_cooldown_db(target_user_id)
+
     msg_id = await kirim_notif(
         context.bot,
         _format_order_notif(
@@ -3288,6 +3400,7 @@ async def admin_cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 "<b>❌ PESANAN DIBATALKAN</b>\n"
                 "========================\n\n"
                 "Pesanan kamu telah dibatalkan oleh admin.\n\n"
+                f"⏳ Kamu bisa membuat order baru dalam <b>{COOLDOWN_MENIT} menit</b>.\n\n"
                 "Hubungi admin jika ada pertanyaan.\n"
                 "Ketik /start untuk membuat pesanan baru."
             ),
@@ -4783,7 +4896,7 @@ def _get_pending_order_sync(user_id):
     conn = get_conn()
     try:
         with conn.cursor() as c:
-            c.execute("SELECT * FROM orders WHERE user_id=%s AND status='pending' ORDER BY id DESC LIMIT 1", (user_id,))
+                        c.execute("SELECT * FROM orders WHERE user_id=%s AND status='pending' ORDER BY id DESC LIMIT 1", (user_id,))
             return c.fetchone()
     finally:
         release_conn(conn)
@@ -4940,6 +5053,10 @@ async def admin_konfirmasi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await hapus_qris_buyer_lama(context.bot, order["order_id"], user_id)
         await hapus_notif_lama(context.bot, order["order_id"])
 
+        # === SET COOLDOWN SAAT ADMIN REJECT ORDER ===
+        # [DESKRIPSI: Reject order juga set cooldown ke buyer, konsisten dengan cancel]
+        await set_cooldown_db(user_id)
+
         msg_id = await kirim_notif(
             context.bot,
             _format_order_notif(
@@ -4968,6 +5085,7 @@ async def admin_konfirmasi(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "- Pembayaran tidak valid\n"
                 "- Bukti transfer tidak sesuai\n"
                 "- Produk tidak tersedia\n\n"
+                f"⏳ Kamu bisa membuat order baru dalam <b>{COOLDOWN_MENIT} menit</b>.\n\n"
                 "Ketik /start untuk mencoba lagi atau hubungi admin."
             ),
             parse_mode="HTML"
@@ -5927,6 +6045,12 @@ async def admpanel_admin_del(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 # =================== MAIN ===================
+# [DESKRIPSI: PERUBAHAN PENTING DI SINI - Handler registration diperbarui
+#  1. back_start DIHAPUS (diganti cancel_order + back_to_menu)
+#  2. cancel_order_handler BARU untuk callback_data="cancel_order"
+#  3. back_to_menu BARU untuk callback_data="back_to_menu"
+#  4. Semua tombol "Batalkan Pesanan" sekarang pakai callback_data="cancel_order"
+#  5. Semua tombol "Kembali" di menu daftar paket pakai callback_data="back_to_menu"]
 
 def main():
     init_pool()
@@ -5964,7 +6088,13 @@ def main():
     app.add_handler(CallbackQueryHandler(buy_callback,         pattern="^buy$"))
     app.add_handler(CallbackQueryHandler(pilih_paket,          pattern="^pilih_"))
     app.add_handler(CallbackQueryHandler(prereq_buy_handler,   pattern="^prereq_buy_"))
-    app.add_handler(CallbackQueryHandler(back_start,           pattern="^back_start$"))
+    
+    # === CALLBACK BARU: Pisah antara batal dan navigasi kembali ===
+    # [DESKRIPSI: cancel_order_handler untuk tombol "Batalkan Pesanan" - set cooldown]
+    app.add_handler(CallbackQueryHandler(cancel_order_handler, pattern="^cancel_order$"))
+    # [DESKRIPSI: back_to_menu untuk tombol "Kembali" di menu daftar paket - tanpa set cooldown]
+    app.add_handler(CallbackQueryHandler(back_to_menu,         pattern="^back_to_menu$"))
+    
     app.add_handler(CallbackQueryHandler(ganti_paket_list,     pattern="^ganti_paket_list$"))
     app.add_handler(CallbackQueryHandler(ganti_paket_konfirm,  pattern="^ganti_paket_konfirm\\|"))
     app.add_handler(CallbackQueryHandler(ganti_paket_exec,     pattern="^ganti_paket_exec\\|"))

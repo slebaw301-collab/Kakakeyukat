@@ -12,7 +12,6 @@ import math
 import random
 import string
 import functools
-import time as _time
 from aiohttp import web as aio_web
 import aiohttp
 import qrcode
@@ -24,8 +23,9 @@ from datetime import datetime, timedelta, timezone
 import telegram.error
 from telegram import (
     Update, BotCommand, BotCommandScopeChat, BotCommandScopeDefault,
-    InlineKeyboardButton, InlineKeyboardMarkup
+    InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 )
+from telegram.error import BadRequest as TgBadRequest
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, ChatJoinRequestHandler, filters, ContextTypes
@@ -41,7 +41,6 @@ logger = logging.getLogger("HyperFamilyBot")
 # =================== HELPERS TEKS ===================
 
 def samarkan_nama(nama: str) -> str:
-    """Menyamarkan nama pembeli demi privasi pada publikasi testimoni."""
     if not nama:
         return "Pembeli"
     parts = nama.split()
@@ -56,14 +55,13 @@ def samarkan_nama(nama: str) -> str:
     return " ".join(masked_parts)
 
 def esc(text) -> str:
-    """Escape karakter khusus HTML untuk mode parser HTML Telegram."""
+    """Escape HTML special characters untuk parse_mode=HTML."""
     return html_module.escape(str(text))
 
 # =================== TIMEZONE ===================
 WIB = timezone(timedelta(hours=7))
 
 def now_wib() -> datetime:
-    """Mengambil waktu saat ini dalam zona waktu WIB (Jakarta)."""
     return datetime.now(WIB)
 
 # =================== KONFIGURASI ===================
@@ -72,35 +70,34 @@ _ADMIN_ID_RAW = os.environ.get("ADMIN_ID", "")
 PAKASIR_API_KEY = os.environ.get("PAKASIR_API_KEY")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 PAKASIR_WEBHOOK_SECRET = os.environ.get("PAKASIR_WEBHOOK_SECRET", "")
+WEBAPP_URL = os.environ.get("WEBAPP_URL", "")
 
 PAKASIR_SLUG = "atkikukkvd"
 PAKASIR_BASE_URL = "https://app.pakasir.com"
 DEFAULT_LINK = "https://t.me/Kikukkvd"
 
 if not TOKEN:
-    raise ValueError("BOT_TOKEN tidak ditemukan di environment variable!")
+    raise ValueError("BOT_TOKEN tidak di-set!")
 if not _ADMIN_ID_RAW or not _ADMIN_ID_RAW.strip().isdigit():
-    raise ValueError("ADMIN_ID tidak ditemukan atau formatnya tidak valid!")
+    raise ValueError("ADMIN_ID tidak di-set atau bukan angka valid!")
 ADMIN_ID = int(_ADMIN_ID_RAW.strip())
 if not PAKASIR_API_KEY:
-    raise ValueError("PAKASIR_API_KEY tidak ditemukan di environment variable!")
+    raise ValueError("PAKASIR_API_KEY tidak di-set!")
 if not DATABASE_URL:
-    raise ValueError("DATABASE_URL tidak ditemukan di environment variable!")
+    raise ValueError("DATABASE_URL tidak di-set!")
 
 # =================== SINGLETON HTTP SESSION ===================
 _http_session: aiohttp.ClientSession = None
 
 async def get_http_session() -> aiohttp.ClientSession:
-    """Mengambil session client HTTP global untuk meminimalkan beban pembuatan koneksi baru."""
     global _http_session
     if _http_session is None or _http_session.closed:
         _http_session = aiohttp.ClientSession()
     return _http_session
 
-# =================== INTEGRASI API PAKASIR ===================
+# =================== PAKASIR API ===================
 
 async def create_transaction_qris(order_id, amount, description):
-    """Memanggil API Pakasir hulu untuk mendaftarkan invoice QRIS baru."""
     payload = {
         "project": PAKASIR_SLUG,
         "order_id": order_id,
@@ -119,14 +116,13 @@ async def create_transaction_qris(order_id, amount, description):
             if 'payment' in result:
                 return result['payment']
             safe_info = {k: v for k, v in result.items() if k not in ('api_key', 'token', 'secret', 'key')}
-            logger.error(f"Pakasir error response: {safe_info}")
+            logger.error(f"Pakasir error: {safe_info}")
             return None
     except Exception as e:
-        logger.error(f"Error saat membuat invoice QRIS Pakasir: {e}", exc_info=True)
+        logger.error(f"Error create transaction: {e}", exc_info=True)
         return None
 
 async def cancel_transaction(order_id, amount):
-    """Membatalkan invoice yang tertunda di server Pakasir agar tidak bisa dibayar."""
     if not amount:
         return None
     payload = {
@@ -145,11 +141,10 @@ async def cancel_transaction(order_id, amount):
         ) as response:
             return await response.json()
     except Exception as e:
-        logger.error(f"Error saat membatalkan transaksi Pakasir: {e}", exc_info=True)
+        logger.error(f"Error cancel transaction: {e}", exc_info=True)
         return None
 
 async def get_transaction_detail(order_id, amount):
-    """Melakukan verifikasi detail transaksi langsung ke server hulu Pakasir."""
     try:
         session = await get_http_session()
         async with session.get(
@@ -167,13 +162,12 @@ async def get_transaction_detail(order_id, amount):
                 return result['transaction']
             return None
     except Exception as e:
-        logger.error(f"Error saat mengambil detail transaksi Pakasir: {e}", exc_info=True)
+        logger.error(f"Error get detail: {e}", exc_info=True)
         return None
 
 # =================== QR CODE GENERATOR ===================
 
 def generate_qr_image(qris_string):
-    """Membuat gambar biner QR Code berbasis string data QRIS hulu."""
     qr = qrcode.QRCode(
         version=1,
         error_correction=qrcode.constants.ERROR_CORRECT_L,
@@ -188,15 +182,20 @@ def generate_qr_image(qris_string):
     buf.seek(0)
     return buf
 
-# =================== DATABASE POOL & CACHE CONFIGURATIONS ===================
+# =================== DATABASE POOL ===================
 
 _pool: ThreadedConnectionPool = None
 
-_settings_cache: dict = {}
-_SETTINGS_TTL = 60  # Durasi simpan cache konfigurasi dalam detik
+# =================== IN-MEMORY TTL CACHE ===================
+import time as _time
 
+# Cache untuk get_setting: {key: (value, expire_at)}
+_settings_cache: dict = {}
+_SETTINGS_TTL = 60  # detik
+
+# Cache untuk get_all_products: (data_list, expire_at) atau None
 _products_cache: tuple = None
-_PRODUCTS_TTL = 30  # Durasi simpan cache katalog produk dalam detik
+_PRODUCTS_TTL = 30  # detik
 
 def _settings_cache_get(key):
     entry = _settings_cache.get(key)
@@ -211,43 +210,37 @@ def _settings_cache_del(key):
     _settings_cache.pop(key, None)
 
 def init_pool():
-    """Menginisialisasi pool koneksi PostgreSQL bertipe threaded dengan limit ditingkatkan."""
     global _pool
-    # Batas atas pool ditingkatkan menjadi 50 koneksi demi ketahanan jam sibuk
     _pool = ThreadedConnectionPool(2, 50, DATABASE_URL, cursor_factory=RealDictCursor)
-    logger.info("[DB] Threaded Connection Pool diinisialisasi sukses (min=2, max=50)")
+    logger.info("[DB] Threaded Connection pool diinisialisasi (min=2, max=50)")
 
 def get_conn():
-    """Mengambil koneksi database aktif dengan sistem antrean pintar jika pool penuh."""
-    retries = 5
-    for i in range(retries):
+    import time as _time_retry
+    last_exc = None
+    for attempt in range(5):
         try:
             return _pool.getconn()
-        except psycopg2.pool.PoolError as e:
-            if i == retries - 1:
-                logger.error("[DB CRITICAL] Pool koneksi penuh setelah dicoba ulang 5 kali!")
-                raise e
-            logger.warning(f"[DB] Pool penuh sementara. Mengantre... (Percobaan {i+1}/{retries})")
-            _time.sleep(0.5)
+        except Exception as e:
+            last_exc = e
+            if attempt < 4:
+                _time_retry.sleep(0.3 * (attempt + 1))
+    logger.error(f"[DB] get_conn gagal setelah 5 percobaan: {last_exc}")
+    raise last_exc
 
 def release_conn(conn):
-    """Mengembalikan koneksi database yang selesai digunakan kembali ke pool."""
     if _pool and conn:
         _pool.putconn(conn)
 
 def async_wrap(func):
-    """Dekorator kustom untuk mengalihkan kueri sinkron database agar berjalan asinkron di thread terpisah."""
     @functools.wraps(func)
     async def run(*args, **kwargs):
         return await asyncio.to_thread(func, *args, **kwargs)
     return run
 
 def init_db():
-    """Membuat tabel skema database dan melakukan migrasi kolom-kolom baru jika belum ada."""
     conn = get_conn()
     try:
         with conn.cursor() as c:
-            # 1. Tabel Katalog Produk
             c.execute("""
                 CREATE TABLE IF NOT EXISTS products (
                     paket_id TEXT PRIMARY KEY,
@@ -257,8 +250,7 @@ def init_db():
                     harga INTEGER NOT NULL,
                     link TEXT DEFAULT 'https://t.me/Kikukkvd',
                     group_chat_id TEXT DEFAULT NULL,
-                    aktif BOOLEAN DEFAULT TRUE,
-                    requires_paket_ids TEXT DEFAULT NULL
+                    aktif BOOLEAN DEFAULT TRUE
                 )
             """)
             c.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS link TEXT DEFAULT 'https://t.me/Kikukkvd'")
@@ -266,7 +258,6 @@ def init_db():
             c.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS aktif BOOLEAN DEFAULT TRUE")
             c.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS requires_paket_ids TEXT DEFAULT NULL")
 
-            # 2. Tabel Blacklist Users
             c.execute("""
                 CREATE TABLE IF NOT EXISTS banned_users (
                     user_id BIGINT PRIMARY KEY,
@@ -275,7 +266,6 @@ def init_db():
                 )
             """)
 
-            # 3. Tabel Riwayat Orders Transaksi
             c.execute("""
                 CREATE TABLE IF NOT EXISTS orders (
                     id SERIAL PRIMARY KEY,
@@ -298,12 +288,8 @@ def init_db():
             c.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS sent_link TEXT DEFAULT NULL")
             c.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS harga_dibayar INTEGER DEFAULT 0")
             c.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS order_changes INTEGER DEFAULT 0")
-            
-            # Migrasi kueri pengisian otomatis (backfill) nilai created_at yang kosong
             c.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP")
-            c.execute("UPDATE orders SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL")
 
-            # 4. Tabel Ulasan Testimonial Pembeli
             c.execute("""
                 CREATE TABLE IF NOT EXISTS testimonials (
                     id SERIAL PRIMARY KEY,
@@ -318,7 +304,6 @@ def init_db():
                 )
             """)
 
-            # 5. Tabel Konfigurasi Pengaturan Bot
             c.execute("""
                 CREATE TABLE IF NOT EXISTS settings (
                     key TEXT PRIMARY KEY,
@@ -326,7 +311,6 @@ def init_db():
                 )
             """)
 
-            # 6. Tabel Cooldown Pelanggan
             c.execute("""
                 CREATE TABLE IF NOT EXISTS cooldowns (
                     user_id BIGINT PRIMARY KEY,
@@ -334,7 +318,6 @@ def init_db():
                 )
             """)
 
-            # 7. Tabel Anggota Sub-Admin Bot
             c.execute("""
                 CREATE TABLE IF NOT EXISTS admins (
                     user_id BIGINT PRIMARY KEY,
@@ -344,7 +327,6 @@ def init_db():
                 )
             """)
 
-            # Isi data default pengaturan jika kosong
             for key, val in [
                 ('link_testimoni', 'https://t.me/+7zsdSrwYIG8wOTg1'),
                 ('link_admin', 'https://t.me/Kikukkvd'),
@@ -355,7 +337,6 @@ def init_db():
                     (key, val)
                 )
 
-            # Isi produk awal jika kosong
             c.execute("SELECT COUNT(*) as cnt FROM products")
             row = c.fetchone()
             if row["cnt"] == 0:
@@ -369,7 +350,6 @@ def init_db():
                 )
 
             conn.commit()
-            logger.info("[DB] Sinkronisasi migrasi tabel database selesai sukses.")
     finally:
         release_conn(conn)
 
@@ -377,7 +357,6 @@ def init_db():
 
 @async_wrap
 def save_testimonial(user_id, user_name, paket_id, order_id, rating, review):
-    """Menyimpan ulasan testimonial pembeli dengan status awal pending moderasi."""
     conn = get_conn()
     try:
         with conn.cursor() as c:
@@ -393,7 +372,6 @@ def save_testimonial(user_id, user_name, paket_id, order_id, rating, review):
 
 @async_wrap
 def update_testimonial_status(order_id, status):
-    """Mengubah status persetujuan ulasan pembeli (approved/rejected)."""
     conn = get_conn()
     try:
         with conn.cursor() as c:
@@ -404,7 +382,6 @@ def update_testimonial_status(order_id, status):
 
 @async_wrap
 def get_testimonial_by_order(order_id):
-    """Mengambil data ulasan pembeli berdasarkan ID transaksi khusus."""
     conn = get_conn()
     try:
         with conn.cursor() as c:
@@ -417,7 +394,6 @@ def get_testimonial_by_order(order_id):
 # =================== PRODUCT DB FUNCTIONS ===================
 
 def _get_all_products_sync():
-    """Mengambil seluruh data katalog produk dari database (dengan cache TTL 30s)."""
     global _products_cache
     cached = _products_cache
     if cached and _time.monotonic() < cached[1]:
@@ -437,12 +413,10 @@ def get_all_products():
     return _get_all_products_sync()
 
 def _invalidate_products_cache():
-    """Menghapus cache katalog produk agar sistem segera memperbarui tampilan."""
     global _products_cache
     _products_cache = None
 
 def _get_product_sync(paket_id):
-    """Mengambil satu rincian produk berdasarkan Paket ID."""
     conn = get_conn()
     try:
         with conn.cursor() as c:
@@ -458,7 +432,6 @@ def get_product(paket_id):
 
 @async_wrap
 def add_product(paket_id, nama, emoji, deskripsi, harga, link=None, group_chat_id=None):
-    """Menambah atau memperbarui isi data produk katalog."""
     conn = get_conn()
     try:
         with conn.cursor() as c:
@@ -478,7 +451,6 @@ def add_product(paket_id, nama, emoji, deskripsi, harga, link=None, group_chat_i
 
 @async_wrap
 def update_product_field(paket_id, field, value):
-    """Mengubah nilai satu kolom produk khusus secara dinamis."""
     allowed = {"nama", "emoji", "deskripsi", "harga", "link", "group_chat_id", "aktif", "requires_paket_ids"}
     if field not in allowed:
         return
@@ -493,7 +465,6 @@ def update_product_field(paket_id, field, value):
 
 @async_wrap
 def delete_product(paket_id):
-    """Menghapus produk tertentu secara permanen dari katalog."""
     conn = get_conn()
     try:
         with conn.cursor() as c:
@@ -504,17 +475,13 @@ def delete_product(paket_id):
     _invalidate_products_cache()
 
 def make_paket_id(nama):
-    """Membuat slug Paket ID yang bersih dari input nama produk baru."""
     pid = re.sub(r'[^a-z0-9]+', '_', nama.lower().strip()).strip('_')
     return pid or "produk"
-
-# =================== END OF PART 1 ===================
 
 # =================== ORDER DB FUNCTIONS ===================
 
 @async_wrap
 def get_active_order(user_id):
-    """Mengambil transaksi pembeli yang saat ini masih aktif menunggu pembayaran."""
     conn = get_conn()
     try:
         with conn.cursor() as c:
@@ -529,7 +496,6 @@ def get_active_order(user_id):
 
 @async_wrap
 def get_all_pending():
-    """Mengambil semua pesanan dengan status 'pending' untuk moderasi manual."""
     conn = get_conn()
     try:
         with conn.cursor() as c:
@@ -547,7 +513,6 @@ def get_all_pending():
 
 @async_wrap
 def get_all_waiting():
-    """Mengambil semua pesanan aktif yang statusnya masih 'waiting' pembayaran QRIS."""
     conn = get_conn()
     try:
         with conn.cursor() as c:
@@ -564,7 +529,6 @@ def get_all_waiting():
 
 @async_wrap
 def get_buyer_history_with_products(user_id, limit=10):
-    """Mengambil riwayat transaksi milik pembeli tertentu (maksimal 10 data terakhir)."""
     conn = get_conn()
     try:
         with conn.cursor() as c:
@@ -582,15 +546,16 @@ def get_buyer_history_with_products(user_id, limit=10):
 
 @async_wrap
 def get_all_buyers():
-    """Mengambil semua daftar pembeli terdaftar yang pernah melakukan transaksi sukses dan tidak di-ban."""
     conn = get_conn()
     try:
         with conn.cursor() as c:
+            # Fix 5: hanya kirim blast ke user yang pernah BERHASIL beli (completed),
+            # bukan ke user yang hanya buat order tapi batalkan / expired
             c.execute("""
                 SELECT o.user_id, o.user_name, MAX(o.id) as max_id
                 FROM orders o
                 LEFT JOIN banned_users b ON o.user_id = b.user_id
-                WHERE b.user_id IS NULL
+                WHERE b.user_id IS NULL AND o.status = 'completed'
                 GROUP BY o.user_id, o.user_name
                 ORDER BY max_id DESC
             """)
@@ -600,7 +565,7 @@ def get_all_buyers():
 
 @async_wrap
 def search_buyers_sync(query: str) -> list:
-    """Cari data pembeli berdasarkan nama (case-insensitive) atau User ID Telegram angka."""
+    """Cari buyer berdasarkan nama (case-insensitive) atau user_id angka."""
     conn = get_conn()
     try:
         with conn.cursor() as c:
@@ -613,19 +578,20 @@ def search_buyers_sync(query: str) -> list:
                     LIMIT 10
                 """, (uid,))
             except ValueError:
+                # Fix 8: escape karakter wildcard SQL agar pencarian literal, bukan pattern matching
+                safe_q = query.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
                 c.execute("""
                     SELECT DISTINCT o.user_id, o.user_name
                     FROM orders o
-                    WHERE LOWER(o.user_name) LIKE LOWER(%s)
+                    WHERE LOWER(o.user_name) LIKE LOWER(%s) ESCAPE '\\'
                     ORDER BY o.user_name
                     LIMIT 10
-                """, (f"%{query.strip()}%",))
+                """, (f"%{safe_q}%",))
             return [dict(r) for r in c.fetchall()]
     finally:
         release_conn(conn)
 
 def _get_managed_groups_sync() -> list:
-    """Mengambil daftar Group ID privat premium yang dimoderasi otomatis (sync)."""
     conn = get_conn()
     try:
         with conn.cursor() as c:
@@ -638,7 +604,6 @@ def _get_managed_groups_sync() -> list:
         release_conn(conn)
 
 def _set_managed_groups_sync(groups: list):
-    """Menyimpan daftar Group ID privat premium yang dimoderasi otomatis (sync)."""
     conn = get_conn()
     try:
         with conn.cursor() as c:
@@ -659,7 +624,6 @@ async def set_managed_groups(groups: list):
 
 @async_wrap
 def get_order_stats(today_start: datetime, month_start: datetime):
-    """Menghitung metrik analitik finansial dan performa operasional toko."""
     conn = get_conn()
     try:
         with conn.cursor() as c:
@@ -674,33 +638,25 @@ def get_order_stats(today_start: datetime, month_start: datetime):
                 SELECT COUNT(*) as cnt, COALESCE(SUM(harga_dibayar), 0) as rev
                 FROM orders WHERE status='completed' AND created_at >= %s
             """, (today_start,))
-            r = c.fetchone()
-            today_completed = r['cnt']
-            today_revenue = r['rev']
+            r = c.fetchone(); today_completed = r['cnt']; today_revenue = r['rev']
 
             c.execute("""
                 SELECT COUNT(*) as cnt, COALESCE(SUM(harga_dibayar), 0) as rev
                 FROM orders WHERE status='completed' AND created_at >= %s AND created_at < %s
             """, (yesterday_start, today_start))
-            r = c.fetchone()
-            yesterday_completed = r['cnt']
-            yesterday_revenue = r['rev']
+            r = c.fetchone(); yesterday_completed = r['cnt']; yesterday_revenue = r['rev']
 
             c.execute("""
                 SELECT COUNT(*) as cnt, COALESCE(SUM(harga_dibayar), 0) as rev
                 FROM orders WHERE status='completed' AND created_at >= %s
             """, (month_start,))
-            r = c.fetchone()
-            month_completed = r['cnt']
-            month_revenue = r['rev']
+            r = c.fetchone(); month_completed = r['cnt']; month_revenue = r['rev']
 
             c.execute("""
                 SELECT COUNT(*) as cnt, COALESCE(SUM(harga_dibayar), 0) as rev
                 FROM orders WHERE status='completed' AND created_at >= %s AND created_at < %s
             """, (last_month_start, last_month_end))
-            r = c.fetchone()
-            last_month_completed = r['cnt']
-            last_month_revenue = r['rev']
+            r = c.fetchone(); last_month_completed = r['cnt']; last_month_revenue = r['rev']
 
             c.execute("SELECT COUNT(*) as cnt FROM orders WHERE status='completed'")
             total_orders = c.fetchone()['cnt']
@@ -801,7 +757,7 @@ def get_order_stats(today_start: datetime, month_start: datetime):
                 nama = b.get('nama') or b['paket_id']
                 best_product = f"{emoji} {nama} ({b['cnt']}x)"
 
-            # Statistik Mingguan (Senin s/d Hari ini)
+            # Week stats (Senin s/d hari ini)
             week_start = today_start - timedelta(days=today_start.weekday())
             last_week_start = week_start - timedelta(days=7)
             last_week_end = week_start
@@ -810,17 +766,13 @@ def get_order_stats(today_start: datetime, month_start: datetime):
                 SELECT COUNT(*) as cnt, COALESCE(SUM(harga_dibayar), 0) as rev
                 FROM orders WHERE status='completed' AND created_at >= %s
             """, (week_start,))
-            r = c.fetchone()
-            week_completed = r['cnt']
-            week_revenue = r['rev']
+            r = c.fetchone(); week_completed = r['cnt']; week_revenue = r['rev']
 
             c.execute("""
                 SELECT COUNT(*) as cnt, COALESCE(SUM(harga_dibayar), 0) as rev
                 FROM orders WHERE status='completed' AND created_at >= %s AND created_at < %s
             """, (last_week_start, last_week_end))
-            r = c.fetchone()
-            last_week_completed = r['cnt']
-            last_week_revenue = r['rev']
+            r = c.fetchone(); last_week_completed = r['cnt']; last_week_revenue = r['rev']
 
             # Produk terlaris bulan ini
             c.execute("""
@@ -877,7 +829,6 @@ def get_order_stats(today_start: datetime, month_start: datetime):
         'repeat_buyers': repeat_buyers,
         'new_buyers_month': new_buyers_month,
         'trend_7d': trend_7d,
-        'order_stats_raw': trend_7d,
         'peak_hour': peak_hour,
         'peak_count': peak_count,
         'avg_rating': avg_rating,
@@ -891,7 +842,6 @@ def get_order_stats(today_start: datetime, month_start: datetime):
 
 @async_wrap
 def update_order_status(order_id, status):
-    """Mengubah status order tertentu secara manual."""
     conn = get_conn()
     try:
         with conn.cursor() as c:
@@ -901,7 +851,7 @@ def update_order_status(order_id, status):
         release_conn(conn)
 
 def _mark_order_completed_sync(order_id) -> bool:
-    """Atomic: Mengubah status order menjadi completed hanya jika status aslinya masih 'waiting'."""
+    """Atomic: set completed hanya jika masih 'waiting'. Return True jika berhasil."""
     conn = get_conn()
     try:
         with conn.cursor() as c:
@@ -920,7 +870,6 @@ async def mark_order_completed(order_id) -> bool:
 
 @async_wrap
 def get_order_by_id(order_id):
-    """Mengambil detail satu order transaksi berdasarkan Order ID."""
     conn = get_conn()
     try:
         with conn.cursor() as c:
@@ -932,7 +881,11 @@ def get_order_by_id(order_id):
 
 @async_wrap
 def check_prerequisites_sync(user_id: int, requires_paket_ids_str: str) -> list:
-    """Mengembalikan daftar Paket ID prasyarat yang BELUM dipenuhi secara lunas oleh pembeli."""
+    """
+    Cek apakah user sudah pernah COMPLETED semua paket yang ada di requires_paket_ids_str.
+    Mengembalikan list paket_id yang BELUM terpenuhi (kosong = semua sudah).
+    requires_paket_ids_str: CSV string, contoh: "gb_biasa,gb_standar"
+    """
     if not requires_paket_ids_str:
         return []
     required_ids = [p.strip() for p in requires_paket_ids_str.split(",") if p.strip()]
@@ -953,7 +906,6 @@ def check_prerequisites_sync(user_id: int, requires_paket_ids_str: str) -> list:
 
 @async_wrap
 def set_admin_msg_id(order_id, msg_id):
-    """Menyimpan ID pesan notifikasi admin di channel/DM untuk keperluan pembersihan/edit status."""
     conn = get_conn()
     try:
         with conn.cursor() as c:
@@ -964,7 +916,6 @@ def set_admin_msg_id(order_id, msg_id):
 
 @async_wrap
 def set_buyer_msg_id(order_id, msg_id):
-    """Menyimpan ID pesan berisi QRIS buyer untuk dibersihkan ketika lunas/expired."""
     conn = get_conn()
     try:
         with conn.cursor() as c:
@@ -975,7 +926,6 @@ def set_buyer_msg_id(order_id, msg_id):
 
 @async_wrap
 def set_sent_link(order_id, link):
-    """Menyimpan tautan grup/konten yang sudah dikirim ke buyer."""
     conn = get_conn()
     try:
         with conn.cursor() as c:
@@ -985,7 +935,11 @@ def set_sent_link(order_id, link):
         release_conn(conn)
 
 def get_prereq_pending_orders_sync(user_id: int) -> list:
-    """Mengambil seluruh daftar pesanan milik buyer yang ditahan tautan pengirimannya akibat syarat prasyarat."""
+    """
+    Ambil semua order milik user_id yang sudah completed tapi belum terkirim link,
+    dan produknya memiliki syarat prerequisite (kemungkinan link ditahan karena prereq).
+    Kondisi: status='completed' AND sent_link IS NULL AND requires_paket_ids tidak kosong.
+    """
     conn = get_conn()
     try:
         with conn.cursor() as c:
@@ -1009,7 +963,6 @@ def get_prereq_pending_orders_sync(user_id: int) -> list:
 
 @async_wrap
 def save_order(user_id, user_name, paket_id, order_id, harga_dibayar=0, order_changes=0):
-    """Merekam pesanan transaksi baru yang dibuat buyer (status default 'waiting')."""
     conn = get_conn()
     try:
         with conn.cursor() as c:
@@ -1027,7 +980,6 @@ def save_order(user_id, user_name, paket_id, order_id, harga_dibayar=0, order_ch
 
 @async_wrap
 def is_banned(user_id):
-    """Memeriksa apakah User ID Telegram pembeli terdaftar di tabel banned."""
     conn = get_conn()
     try:
         with conn.cursor() as c:
@@ -1038,7 +990,6 @@ def is_banned(user_id):
 
 @async_wrap
 def ban_user(user_id, reason=""):
-    """Memasukkan pembeli nakal secara permanen ke daftar cek ban harian."""
     conn = get_conn()
     try:
         with conn.cursor() as c:
@@ -1054,7 +1005,6 @@ def ban_user(user_id, reason=""):
 
 @async_wrap
 def unban_user(user_id):
-    """Menghapus pembeli dari daftar blokir."""
     conn = get_conn()
     try:
         with conn.cursor() as c:
@@ -1065,7 +1015,6 @@ def unban_user(user_id):
 
 @async_wrap
 def get_all_banned():
-    """Mengambil seluruh daftar pembeli yang diblokir saat ini."""
     conn = get_conn()
     try:
         with conn.cursor() as c:
@@ -1078,7 +1027,6 @@ def get_all_banned():
 
 @async_wrap
 def get_setting(key, default=None):
-    """Mengambil parameter konfigurasi dari tabel settings (dengan dukungan cache)."""
     hit, cached_val = _settings_cache_get(key)
     if hit:
         return cached_val if cached_val is not None else default
@@ -1095,7 +1043,6 @@ def get_setting(key, default=None):
 
 @async_wrap
 def set_setting(key, value):
-    """Menyimpan/memperbarui isi data konfigurasi sistem bot."""
     conn = get_conn()
     try:
         with conn.cursor() as c:
@@ -1117,7 +1064,6 @@ COOLDOWN_MENIT = 5
 
 @async_wrap
 def set_cooldown_db(user_id):
-    """Mendaftarkan limitasi batas tunggu pembatalan order (cooldown) buyer."""
     expires_at = now_wib() + timedelta(minutes=COOLDOWN_MENIT)
     conn = get_conn()
     try:
@@ -1133,7 +1079,6 @@ def set_cooldown_db(user_id):
 
 @async_wrap
 def get_cooldown_sisa_db(user_id):
-    """Mengembalikan sisa durasi menit cooldown milik user_id (0 jika tidak ada)."""
     conn = get_conn()
     try:
         with conn.cursor() as c:
@@ -1148,14 +1093,13 @@ def get_cooldown_sisa_db(user_id):
                 sisa = (until - now_wib()).total_seconds()
                 return math.ceil(sisa / 60) if sisa > 0 else 0
             except Exception as e:
-                logger.error(f"[COOLDOWN] Gagal memproses hitungan sisa cooldown: {e}")
+                logger.error(f"[COOLDOWN] Gagal menghitung sisa cooldown: {e}")
                 return 0
     finally:
         release_conn(conn)
 
 @async_wrap
 def clear_cooldown_db(user_id):
-    """Membatalkan batasan cooldown buyer secara paksa."""
     conn = get_conn()
     try:
         with conn.cursor() as c:
@@ -1166,7 +1110,6 @@ def clear_cooldown_db(user_id):
 
 @async_wrap
 def cleanup_expired_cooldowns():
-    """Tugas pembersih: menghapus seluruh baris cooldown lama yang sudah kedaluwarsa."""
     conn = get_conn()
     try:
         with conn.cursor() as c:
@@ -1179,7 +1122,6 @@ def cleanup_expired_cooldowns():
 
 @async_wrap
 def get_all_admins():
-    """Mengambil seluruh daftar sub-admin terdaftar di database."""
     conn = get_conn()
     try:
         with conn.cursor() as c:
@@ -1190,7 +1132,6 @@ def get_all_admins():
 
 @async_wrap
 def add_admin(user_id, nama, added_by):
-    """Mendaftarkan sub-admin baru dengan otorisasi."""
     conn = get_conn()
     try:
         with conn.cursor() as c:
@@ -1206,7 +1147,6 @@ def add_admin(user_id, nama, added_by):
 
 @async_wrap
 def remove_admin(user_id):
-    """Mencabut hak admin dari database."""
     conn = get_conn()
     try:
         with conn.cursor() as c:
@@ -1217,7 +1157,6 @@ def remove_admin(user_id):
 
 @async_wrap
 def is_admin_in_db(user_id):
-    """Memeriksa keberadaan otorisasi admin di dalam database."""
     conn = get_conn()
     try:
         with conn.cursor() as c:
@@ -1229,7 +1168,6 @@ def is_admin_in_db(user_id):
 # =================== ADMIN CHECK WITH SESSION CACHE ===================
 
 async def is_admin(user_id: int, context=None) -> bool:
-    """Fungsi gerbang cek status admin (Super Admin atau Sub-Admin DB) dengan cache context."""
     if user_id == ADMIN_ID:
         return True
     if context is not None:
@@ -1242,24 +1180,20 @@ async def is_admin(user_id: int, context=None) -> bool:
     return result
 
 def invalidate_admin_cache(context, user_id: int = None):
-    """Mereset cache admin agar perubahan status di database langsung terbaca."""
     if user_id is not None:
         context.bot_data.get('_admin_cache', {}).pop(user_id, None)
     else:
         context.bot_data['_admin_cache'] = {}
 
 def is_super_admin(user_id: int) -> bool:
-    """Memeriksa apakah user adalah pemilik bot utama (Super Admin)."""
     return user_id == ADMIN_ID
 
 # =================== HELPERS ===================
 
 def format_harga(harga):
-    """Mengubah format angka bulat menjadi string Rupiah standar (contoh: Rp 15.000)."""
     return f"Rp {int(harga):,}".replace(",", ".")
 
 def hitung_durasi(waktu_str):
-    """Menghitung waktu berjalan secara asinkron dari format string waktu transaksi."""
     try:
         parts = re.split(r'\s*[-\-]\s*', waktu_str, maxsplit=1)
         if len(parts) != 2:
@@ -1299,7 +1233,6 @@ def _build_link_section(group_link: str, fallback_link: str) -> str:
 # =================== GENERATE GROUP LINK ===================
 
 async def generate_group_link(bot, paket, order_id):
-    """Membangun tautan invite sekali pakai secara asinkron menggunakan Telegram API."""
     group_id = paket.get('group_chat_id')
     if not group_id:
         return None
@@ -1347,7 +1280,6 @@ def _format_order_notif(judul: str, user_name: str, user_id: int,
     return "\n".join(lines)
 
 async def kirim_notif(bot, text: str, reply_markup=None):
-    """Mengirim update order sukses/pending ke channel notifikasi khusus."""
     channel_id = await get_setting('notif_channel_id')
     target = int(channel_id) if channel_id else ADMIN_ID
     try:
@@ -1364,7 +1296,6 @@ async def kirim_notif(bot, text: str, reply_markup=None):
     return None
 
 async def hapus_notif_lama(bot, order_id):
-    """Menghapus notif pending lama dari channel/grup ketika order sudah diselesaikan manual."""
     order = await get_order_by_id(order_id)
     if not order:
         return
@@ -1383,7 +1314,6 @@ async def hapus_notif_lama(bot, order_id):
                 pass
 
 async def hapus_qris_buyer_lama(bot, order_id, user_id):
-    """Membersihkan pesan instruksi QRIS lama buyer agar obrolan privat tidak kotor."""
     order = await get_order_by_id(order_id)
     if order and order.get('buyer_msg_id'):
         try:
@@ -1394,7 +1324,6 @@ async def hapus_qris_buyer_lama(bot, order_id, user_id):
 # =================== MAIN MENU ===================
 
 async def build_main_menu_text():
-    """Mengambil katalog produk aktif untuk disusun sebagai caption menu utama."""
     products = await get_all_products()
     aktif_products = [p for p in products if p.get('aktif', True)]
     text = (
@@ -1415,7 +1344,6 @@ async def build_main_menu_text():
     return text
 
 async def build_main_menu_keyboard():
-    """Membuat tombol navigasi di bawah pesan start buyer."""
     link_testi = await get_setting('link_testimoni', 'https://t.me/+7zsdSrwYIG8wOTg1')
     link_cs = await get_setting('link_admin', 'https://t.me/Kikukkvd')
     return [
@@ -1445,7 +1373,6 @@ def simpan_msg_user(context, user_id, message_id):
     context.bot_data['user_messages'][user_id].append(message_id)
 
 async def hapus_msg_user_lama(context, user_id, keep_last=1):
-    """Membatasi tumpukan pesan bot di dalam inbox buyer agar tidak spam."""
     msgs = context.bot_data.get('user_messages', {}).get(user_id, [])
     if len(msgs) > keep_last:
         to_delete = msgs[:-keep_last]
@@ -1457,12 +1384,10 @@ async def hapus_msg_user_lama(context, user_id, keep_last=1):
                 pass
 
 async def kirim_link_ke_buyer(context, user_id, paket, order_id, amount):
-    """Mengirim pesan sukses pembayaran lunas beserta tombol Kirim Ulang Link & CS Admin."""
     group_link = await generate_group_link(context.bot, paket, order_id)
     link = group_link or (paket.get("link") or DEFAULT_LINK)
     link_section = _build_link_section(group_link, link)
 
-    # == PERBAIKAN: Tombol Kirim Ulang Link selalu disertakan saat pengiriman sukses ==
     msg = await context.bot.send_message(
         chat_id=user_id,
         text=(
@@ -1493,11 +1418,10 @@ async def kirim_link_ke_buyer(context, user_id, paket, order_id, amount):
 # =================== WEBHOOK SERVER (PAKASIR) ===================
 
 async def pakasir_webhook_handler(request: aio_web.Request) -> aio_web.Response:
-    # == PERBAIKAN: PAKASIR_WEBHOOK_SECRET wajib tervalidasi untuk menghindari pemalsuan request ==
+    # Tolak semua webhook jika secret belum dikonfigurasi — mencegah pemalsuan konfirmasi bayar
     if not PAKASIR_WEBHOOK_SECRET:
-        logger.error("[SECURITY CRITICAL] PAKASIR_WEBHOOK_SECRET tidak dikonfigurasi! Menolak semua webhook.")
-        return aio_web.Response(status=500, text='Server misconfiguration')
-
+        logger.error("[WEBHOOK] PAKASIR_WEBHOOK_SECRET tidak dikonfigurasi — semua webhook ditolak!")
+        return aio_web.Response(status=500, text='webhook secret not configured')
     try:
         body = await request.read()
         sig = request.headers.get("X-Pakasir-Signature", "")
@@ -1572,21 +1496,22 @@ async def pakasir_webhook_handler(request: aio_web.Request) -> aio_web.Response:
 
 _webhook_runner = None
 
+async def admin_dashboard_handler(request: aio_web.Request) -> aio_web.Response:
+    import os as _os
+    html_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), 'admin.html')
+    try:
+        with open(html_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        return aio_web.Response(text=content, content_type='text/html', charset='utf-8')
+    except FileNotFoundError:
+        return aio_web.Response(status=404, text='admin.html tidak ditemukan di direktori bot.')
+
 async def _start_webhook_server():
     global _webhook_runner
     webhook_app = aio_web.Application()
     webhook_app.router.add_post('/webhook/pakasir', pakasir_webhook_handler)
     webhook_app.router.add_get('/health', lambda r: aio_web.Response(text='ok'))
-    
-    # == PENINGKATAN: Sajikan Dasbor Web App Admin Control Panel secara asinkron ==
-    async def serve_dashboard(request):
-        try:
-            with open('admin_dashboard.html', 'r', encoding='utf-8') as f:
-                return aio_web.Response(text=f.read(), content_type='text/html')
-        except Exception:
-            return aio_web.Response(text="Berkas admin_dashboard.html tidak ditemukan!", status=404)
-
-    webhook_app.router.add_get('/admin-panel', serve_dashboard)
+    webhook_app.router.add_get('/admin', admin_dashboard_handler)
     webhook_app.router.add_get('/', lambda r: aio_web.Response(text='Hyper Family Store Bot - OK'))
 
     runner = aio_web.AppRunner(webhook_app)
@@ -1595,7 +1520,7 @@ async def _start_webhook_server():
     port = int(os.environ.get('PORT', 8080))
     site = aio_web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
-    logger.info(f"[WEBHOOK] Server berjalan di port {port}. Dashboard admin: http://localhost:{port}/admin-panel")
+    logger.info(f"[WEBHOOK] Server berjalan di port {port}")
 
 # =================== POST INIT ===================
 
@@ -1711,6 +1636,40 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 _stop_payment_task(user_id)
                 await hapus_qris_buyer_lama(context.bot, active["order_id"], user_id)
                 paid_amount = trans.get("amount", paket["harga"])
+
+                # Fix 1: Cek prerequisite sebelum kirim link (sama seperti alur webhook)
+                requires_str = paket.get("requires_paket_ids") or ""
+                missing = await asyncio.to_thread(check_prerequisites_sync, user_id, requires_str)
+                if missing:
+                    missing_names = []
+                    for pid in missing:
+                        mp = await get_product(pid)
+                        missing_names.append(f"{mp['emoji']} {mp['nama']}" if mp else pid)
+                    await context.bot.send_message(
+                        chat_id=user_id,
+                        text=(
+                            f"✅ <b>Pembayaran diterima!</b>\n\n"
+                            f"Namun link belum bisa dikirim karena kamu belum memiliki:\n"
+                            + "\n".join(f"• {n}" for n in missing_names) +
+                            f"\n\nBeli paket tersebut terlebih dahulu, link akan otomatis terkirim."
+                        ),
+                        parse_mode="HTML"
+                    )
+                    await hapus_notif_lama(context.bot, active['order_id'])
+                    msg_id = await kirim_notif(
+                        context.bot,
+                        f"⏸️ <b>ORDER LUNAS - LINK DITAHAN (PREREQ)</b>\n"
+                        f"========================\n\n"
+                        f"👤 Pembeli: {esc(active.get('user_name', 'User'))} (<code>{user_id}</code>)\n"
+                        f"📦 Paket: {esc(paket['emoji'])} {esc(paket['nama'])}\n"
+                        f"📝 Order ID: <code>{esc(active['order_id'])}</code>\n"
+                        f"💰 Total: {format_harga(paid_amount)}\n"
+                        f"🔒 Menunggu prereq: {', '.join(missing)}"
+                    )
+                    if msg_id:
+                        await set_admin_msg_id(active['order_id'], msg_id)
+                    return
+
                 link = await kirim_link_ke_buyer(context, user_id, paket, active["order_id"], paid_amount)
                 await set_sent_link(active['order_id'], link)
                 await hapus_notif_lama(context.bot, active['order_id'])
@@ -1727,6 +1686,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 if msg_id:
                     await set_admin_msg_id(active['order_id'], msg_id)
+                # Fix 2: Trigger auto-deliver untuk order lain yang mungkin sedang menunggu prereq ini
+                asyncio.create_task(auto_deliver_pending_prereq_orders(
+                    context.bot, user_id, active.get("user_name", "")
+                ))
             return
 
         total = (trans.get("amount", paket["harga"]) + trans.get("fee", 0)) if trans else (active.get("harga_dibayar") or paket["harga"])
@@ -1991,7 +1954,7 @@ async def back_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-    # ── Cek order pending prereq setelah cancel ──
+    # ── Cek order pending prereq setelah cancel ──────────────────────────────
     pending_prereq_orders = await asyncio.to_thread(get_prereq_pending_orders_sync, user_id)
 
     if pending_prereq_orders:
@@ -2056,7 +2019,7 @@ async def back_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         simpan_msg_user(context, user_id, msg.message_id)
         await hapus_msg_user_lama(context, user_id, keep_last=1)
         return
-    # ── END cek pending prereq ──
+    # ── END cek pending prereq ───────────────────────────────────────────────
 
     msg = await context.bot.send_message(
         chat_id=update.effective_chat.id,
@@ -2386,10 +2349,7 @@ async def auto_deliver_pending_prereq_orders(bot, user_id: int, user_name: str):
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("⭐ Beri Ulasan / Testimoni", callback_data=f"rate_start|{order_id}")],
-                    [
-                        InlineKeyboardButton("🔄 Kirim Ulang Link", callback_data=f"resendlink|{order_id}"),
-                        InlineKeyboardButton("💬 Chat Admin", url=await get_setting('link_admin', 'https://t.me/Kikukkvd'))
-                    ]
+                    [InlineKeyboardButton("🔄 Kirim Ulang Link", callback_data=f"resendlink|{order_id}")]
                 ])
             )
             kirim_berhasil = True
@@ -2432,26 +2392,26 @@ async def _handle_payment_success(bot, order_id: str, paket_id: str, user_id: in
     paket = await get_product(paket_id) or {"emoji": "📦", "nama": "Produk", "harga": amount, "link": DEFAULT_LINK}
     paid_amount = trans.get('amount', amount)
 
-    # ── CEK PREREQUISITE ──
+    # ── CEK PREREQUISITE ──────────────────────────────────────────────────────
     requires_str  = paket.get("requires_paket_ids") or ""
     required_ids  = [p.strip() for p in requires_str.split(",") if p.strip()]
     missing_prereqs = await check_prerequisites_sync(user_id, requires_str)
 
     if missing_prereqs:
-        done_ids = set(required_ids) - set(missing_prereqs)
+        done_ids     = set(required_ids) - set(missing_prereqs)
         total_syarat = len(required_ids)
-        sisa_belum = len(missing_prereqs)
+        sisa_belum   = len(missing_prereqs)
 
         # Bangun baris checklist + tombol beli untuk yang kurang
         prereq_lines = []
-        buy_buttons = []
+        buy_buttons  = []
         for pid in required_ids:
             p_obj = await get_product(pid)
             if p_obj:
-                nama = f"{p_obj['emoji']} {p_obj['nama']}"
+                nama  = f"{p_obj['emoji']} {p_obj['nama']}"
                 harga = format_harga(p_obj['harga'])
             else:
-                nama = f"<code>{esc(pid)}</code>"
+                nama  = f"<code>{esc(pid)}</code>"
                 harga = "-"
 
             if pid in done_ids:
@@ -2464,9 +2424,9 @@ async def _handle_payment_success(bot, order_id: str, paket_id: str, user_id: in
                 )])
 
         prereq_list = "\n".join(prereq_lines)
-        link_admin = await get_setting('link_admin', 'https://t.me/Kikukkvd')
+        link_admin  = await get_setting('link_admin', 'https://t.me/Kikukkvd')
 
-        # ── Pesan ke buyer ──
+        # ── Pesan ke buyer ──────────────────────────────────────────────────
         buyer_text = (
             f"✅ <b>Pembayaran Berhasil Diterima</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -2496,7 +2456,7 @@ async def _handle_payment_success(bot, order_id: str, paket_id: str, user_id: in
         except Exception as e:
             logger.error(f"[PAYMENT] Gagal kirim notif prereq ke buyer {user_id}: {e}")
 
-        # ── Notif ke admin ──
+        # ── Notif ke admin ──────────────────────────────────────────────────
         await hapus_notif_lama(bot, order_id)
         extra_prereq = (
             f"⏸️ <b>Link Ditahan — Syarat Belum Terpenuhi</b>\n\n"
@@ -2522,7 +2482,7 @@ async def _handle_payment_success(bot, order_id: str, paket_id: str, user_id: in
         # Cek apakah order lain milik user ini bisa di-deliver sekarang
         asyncio.create_task(auto_deliver_pending_prereq_orders(bot, user_id, user_name))
         return
-    # ── END CEK PREREQUISITE ──
+    # ── END CEK PREREQUISITE ──────────────────────────────────────────────────
 
     group_link = await generate_group_link(bot, paket, order_id)
     link = group_link or (paket.get("link") or DEFAULT_LINK)
@@ -2530,7 +2490,6 @@ async def _handle_payment_success(bot, order_id: str, paket_id: str, user_id: in
 
     kirim_berhasil = False
     try:
-        # == PERBAIKAN: Pasang tombol Kirim Ulang Link & Hubungi Admin secara dinamis ==
         await bot.send_message(
             chat_id=user_id,
             text=(
@@ -2547,11 +2506,7 @@ async def _handle_payment_success(bot, order_id: str, paket_id: str, user_id: in
             ),
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⭐ Beri Ulasan / Testimoni", callback_data=f"rate_start|{order_id}")],
-                [
-                    InlineKeyboardButton("🔄 Kirim Ulang Link", callback_data=f"resendlink|{order_id}"),
-                    InlineKeyboardButton("💬 Chat Admin", url=await get_setting('link_admin', 'https://t.me/Kikukkvd'))
-                ]
+                [InlineKeyboardButton("⭐ Beri Ulasan / Testimoni", callback_data=f"rate_start|{order_id}")]
             ])
         )
         kirim_berhasil = True
@@ -2591,8 +2546,6 @@ async def _handle_payment_success(bot, order_id: str, paket_id: str, user_id: in
     # Order baru selesai → cek order lain yang tertahan prereq, mungkin bisa deliver sekarang
     asyncio.create_task(auto_deliver_pending_prereq_orders(bot, user_id, user_name))
 
-# =================== END OF PART 2 ===================
-
 # =================== ADMIN: KIRIM LINK PREREQ MANUAL ===================
 
 async def admin_kirim_link_prereq(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2614,7 +2567,7 @@ async def admin_kirim_link_prereq(update: Update, context: ContextTypes.DEFAULT_
     paket_id = order['paket_id']
     paket = await get_product(paket_id) or {"emoji": "📦", "nama": "Produk", "harga": 0, "link": DEFAULT_LINK}
 
-    # Re-check prerequisite sebelum mengirimkan link
+    # ── Re-check prerequisite sebelum kirim link ──────────────────────────────
     requires_str = paket.get("requires_paket_ids") or ""
     if requires_str.strip():
         missing_prereqs = await check_prerequisites_sync(user_id, requires_str)
@@ -2648,6 +2601,7 @@ async def admin_kirim_link_prereq(update: Update, context: ContextTypes.DEFAULT_
             except Exception:
                 pass
             return
+    # ── END re-check prerequisite ─────────────────────────────────────────────
 
     group_link = await generate_group_link(context.bot, paket, order_id)
     link = group_link or (paket.get("link") or DEFAULT_LINK)
@@ -2669,11 +2623,7 @@ async def admin_kirim_link_prereq(update: Update, context: ContextTypes.DEFAULT_
             ),
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⭐ Beri Ulasan / Testimoni", callback_data=f"rate_start|{order_id}")],
-                [
-                    InlineKeyboardButton("🔄 Kirim Ulang Link", callback_data=f"resendlink|{order_id}"),
-                    InlineKeyboardButton("💬 Chat Admin", url=await get_setting('link_admin', 'https://t.me/Kikukkvd'))
-                ]
+                [InlineKeyboardButton("⭐ Beri Ulasan / Testimoni", callback_data=f"rate_start|{order_id}")]
             ])
         )
         kirim_berhasil = True
@@ -2692,8 +2642,26 @@ async def admin_kirim_link_prereq(update: Update, context: ContextTypes.DEFAULT_
 
 # =================== AUTO-APPROVE & REVOKE JOIN REQUEST ===================
 
+def _check_join_request_sync(user_id, chat_id):
+    conn = get_conn()
+    try:
+        with conn.cursor() as c:
+            c.execute("SELECT user_id FROM banned_users WHERE user_id = %s", (user_id,))
+            if c.fetchone():
+                logger.info(f"[JOIN] User {user_id} dalam daftar banned — tolak join request.")
+                return None
+            c.execute("""
+                SELECT o.id FROM orders o
+                JOIN products p ON o.paket_id = p.paket_id
+                WHERE o.user_id = %s AND o.status = 'completed'
+                AND p.group_chat_id = %s
+                ORDER BY o.id DESC LIMIT 1
+            """, (user_id, chat_id))
+            return c.fetchone()
+    finally:
+        release_conn(conn)
+
 async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Menyetujui permintaan gabung otomatis bagi user lunas yang tidak diblacklist."""
     join_req = update.chat_join_request
     if not join_req:
         return
@@ -2701,7 +2669,6 @@ async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE
     user_id = join_req.from_user.id
     chat_id = str(join_req.chat.id)
 
-    # Memanggil sync helper database dengan join ke banned_users yang aman
     row = await asyncio.to_thread(_check_join_request_sync, user_id, chat_id)
 
     if row:
@@ -2834,6 +2801,7 @@ async def handle_rate_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text("🙏 Terima kasih! Anda selalu dapat memberikan ulasan nanti di riwayat order.")
 
 async def handle_rate_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Kembali ke pesan sukses dengan link produk dari mana saja di flow review."""
     query = update.callback_query
     await query.answer()
 
@@ -2858,7 +2826,7 @@ async def handle_rate_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📋 <b>Cara gabung:</b>\n"
             f"1. Klik link di atas\n"
             f"2. Pencet <b>\"Minta Bergabung\"</b>\n"
-            f"3. Bot langsung approve otomatis ✅\n\n"
+            f"3. Bot langsung <b>approve otomatis</b> ✅\n\n"
             f"⚠️ <i>Link ini sekali pakai, jangan dishare!</i>"
         )
     else:
@@ -2884,6 +2852,7 @@ async def handle_rate_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def handle_rate_back_stars(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Kembali ke layar pilih bintang dari layar input teks ulasan."""
     query = update.callback_query
     await query.answer()
 
@@ -2930,7 +2899,7 @@ async def admin_testi_approve(update: Update, context: ContextTypes.DEFAULT_TYPE
     channel_id = await get_setting('testimoni_channel_id')
     if not channel_id or channel_id.strip() == "":
         await query.edit_message_text(
-            "✅ <b>Testimoni Disetujui</b>\n"
+            "✅ <b>Testimoni Disetujui</b>\n\n"
             "⚠️ ID Channel Testimoni belum diset. Ulasan tersimpan di DB tapi tidak dikirim ke channel publik.",
             parse_mode="HTML"
         )
@@ -3102,14 +3071,17 @@ async def produk_toggle_aktif(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     status_str = "diaktifkan" if new_aktif else "dinonaktifkan"
     await query.answer(f"✅ Produk berhasil {status_str}.", show_alert=True)
+    # Refresh detail
     p['aktif'] = new_aktif
     await produk_detail(update, context)
 
 async def _show_prereq_selector(query, context, paket_id: str, p: dict):
+    """Tampilkan selector prerequisite paket dengan tombol toggle."""
     all_products = await get_all_products()
     current_str = p.get('requires_paket_ids') or ""
     current_ids = [x.strip() for x in current_str.split(",") if x.strip()]
 
+    # Simpan state sementara di user_data
     if 'editing_prereq' not in context.user_data or context.user_data['editing_prereq'].get('paket_id') != paket_id:
         context.user_data['editing_prereq'] = {'paket_id': paket_id, 'selected': list(current_ids)}
 
@@ -3118,7 +3090,7 @@ async def _show_prereq_selector(query, context, paket_id: str, p: dict):
     buttons = []
     for prod in all_products:
         if prod['paket_id'] == paket_id:
-            continue
+            continue  # skip diri sendiri
         is_selected = prod['paket_id'] in selected
         mark = "✅ " if is_selected else "⬜ "
         label = f"{mark}{prod.get('emoji', '')} {prod['nama']}"
@@ -3219,6 +3191,7 @@ async def produk_edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Produk tidak ditemukan.", show_alert=True)
         return
 
+    # requires_paket_ids: gunakan UI selector tombol, bukan text input
     if field == 'requires_paket_ids':
         await _show_prereq_selector(query, context, paket_id, p)
         return
@@ -3464,6 +3437,7 @@ async def admin_manual_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     await hapus_qris_buyer_lama(context.bot, order_id, target_user_id)
 
+    # ── Cek prerequisite sebelum kirim link ──────────────────────────────────
     requires_str = paket.get("requires_paket_ids") or ""
     required_ids = [p.strip() for p in requires_str.split(",") if p.strip()]
     missing_prereqs = await check_prerequisites_sync(target_user_id, requires_str) if requires_str.strip() else []
@@ -3482,6 +3456,7 @@ async def admin_manual_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
                 prereq_lines.append(f"  ❌ {nama}")
         prereq_list = "\n".join(prereq_lines)
 
+        # Notif buyer: bayar diterima tapi link ditahan
         user_name_notif = order.get('user_name', '-')
         link_admin = await get_setting('link_admin', 'https://t.me/Kikukkvd')
         try:
@@ -3505,6 +3480,7 @@ async def admin_manual_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
         except Exception as e:
             logger.error(f"[KONFIRMASI MANUAL] Gagal kirim notif prereq ke buyer {target_user_id}: {e}")
 
+        # Notif admin: link ditahan
         await hapus_notif_lama(context.bot, order_id)
         extra_prereq = (
             f"⏸️ <b>Link Ditahan — Syarat Belum Terpenuhi</b>\n\n"
@@ -3526,8 +3502,6 @@ async def admin_manual_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
         if msg_id:
             await set_admin_msg_id(order_id, msg_id)
 
-        asyncio.create_task(auto_deliver_pending_prereq_orders(context.bot, target_user_id, order.get('user_name', 'User')))
-
         await query.edit_message_text(
             f"✅ <b>Pembayaran Dikonfirmasi — Link Ditahan</b>\n\n"
             f"👤 Buyer: {esc(order.get('user_name', '-'))}\n"
@@ -3539,6 +3513,7 @@ async def admin_manual_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali ke Orders", callback_data="admpanel_orders")]])
         )
         return
+    # ── END cek prerequisite ──────────────────────────────────────────────────
 
     group_link = await generate_group_link(context.bot, paket, order_id)
     link = group_link or (paket.get("link") or DEFAULT_LINK)
@@ -3577,8 +3552,6 @@ async def admin_manual_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
     )
     if msg_id:
         await set_admin_msg_id(order_id, msg_id)
-
-    asyncio.create_task(auto_deliver_pending_prereq_orders(context.bot, target_user_id, order.get('user_name', 'User')))
 
     await query.edit_message_text(
         f"✅ <b>Pembayaran Dikonfirmasi Manual</b>\n\n"
@@ -3669,6 +3642,7 @@ def _build_stats_text(s: dict, now: datetime) -> str:
     else:
         prod_lines = "- <i>Belum ada transaksi produk.</i>\n"
 
+    # Produk terlaris bulan ini
     prod_month_lines = ""
     if s.get('products_month'):
         for pm in s['products_month']:
@@ -3678,6 +3652,7 @@ def _build_stats_text(s: dict, now: datetime) -> str:
     else:
         prod_month_lines = "  <i>Belum ada penjualan bulan ini.</i>\n"
 
+    # Top 3 buyer bulan ini
     top_buyer_lines = ""
     for i, b in enumerate(s.get('top_buyers_month', []), 1):
         name = esc(b.get('user_name') or str(b['user_id']))
@@ -3685,12 +3660,14 @@ def _build_stats_text(s: dict, now: datetime) -> str:
     if not top_buyer_lines:
         top_buyer_lines = "  <i>Belum ada data.</i>\n"
 
+    # Estimasi omzet akhir bulan
     days_elapsed = s.get('days_elapsed', 1)
     est_str = ""
     if days_elapsed > 0 and s['month_revenue'] > 0:
         estimated = round(s['month_revenue'] / days_elapsed * 30)
         est_str = f"- Estimasi Akhir Bulan  :  <b>~{_format_short(estimated)}</b>  <i>(pace {days_elapsed}hr)</i>"
 
+    # Repeat buyers %
     repeat_pct = round(s['repeat_buyers'] / s['total_buyers'] * 100) if s['total_buyers'] > 0 else 0
 
     pend = s.get('pending_testi', 0)
@@ -3809,6 +3786,7 @@ async def cmd_riwayat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =================== BACKUP & EXPORT ===================
 
 def _generate_full_export_sync():
+    """Eksport semua tabel penting ke dict. Satu fungsi untuk backup & export."""
     conn = get_conn()
     try:
         with conn.cursor() as c:
@@ -3856,55 +3834,48 @@ async def _generate_json_export():
         len(products), len(orders), len(banned)
     )
 
-def _build_zip_in_thread(products, orders, banned, testimonials, settings, admins, timestamp_str) -> bytes:
-    import io as _io
-    def _rows_to_csv_bytes(rows: list) -> bytes:
-        if not rows:
-            return b""
-        text_buf = _io.StringIO()
-        writer = csv.DictWriter(text_buf, fieldnames=list(rows[0].keys()), extrasaction='ignore')
-        writer.writeheader()
-        writer.writerows([{k: str(v) if v is not None else '' for k, v in row.items()} for row in rows])
-        return text_buf.getvalue().encode("utf-8")
-
-    payload = {
-        "export_time": timestamp_str,
-        "version": "3.0",
-        "products": products,
-        "orders": orders,
-        "banned_users": banned,
-        "testimonials": testimonials,
-        "settings": settings,
-        "admins": admins,
-    }
-    json_bytes = json.dumps(payload, ensure_ascii=False, indent=2, default=str).encode("utf-8")
-
-    zip_buf = BytesIO()
-    with zipfile.ZipFile(zip_buf, mode='w', compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("backup.json",        json_bytes)
-        zf.writestr("orders.csv",         _rows_to_csv_bytes(orders))
-        zf.writestr("products.csv",       _rows_to_csv_bytes(products))
-        zf.writestr("banned_users.csv",   _rows_to_csv_bytes(banned))
-        zf.writestr("testimonials.csv",   _rows_to_csv_bytes(testimonials))
-        zf.writestr("admins.csv",         _rows_to_csv_bytes(admins))
-    zip_buf.seek(0)
-    return zip_buf.getvalue()
-
 async def _kirim_backup(bot):
     ts = now_wib().strftime('%Y%m%d_%H%M%S')
-    pretty_ts = now_wib().strftime('%H:%M, %d/%m/%Y')
     zip_name = f"backup_{ts}.zip"
     try:
         products, orders, banned, testimonials, settings, admins = await asyncio.to_thread(_generate_full_export_sync)
 
-        # == PERBAIKAN: Pembuatan file ZIP dialihkan ke thread pool secara asinkron ==
-        zip_bytes = await asyncio.to_thread(
-            _build_zip_in_thread,
-            products, orders, banned, testimonials, settings, admins, pretty_ts
-        )
+        def _build_zip_in_thread() -> BytesIO:
+            import io as _io
+            payload = {
+                "export_time": now_wib().strftime('%H:%M, %d/%m/%Y'),
+                "version": "3.0",
+                "products": products,
+                "orders": orders,
+                "banned_users": banned,
+                "testimonials": testimonials,
+                "settings": settings,
+                "admins": admins,
+            }
+            json_bytes = json.dumps(payload, ensure_ascii=False, indent=2, default=str).encode("utf-8")
 
-        zip_buf = BytesIO(zip_bytes)
-        zip_buf.name = zip_name
+            def _rows_to_csv_bytes(rows: list) -> bytes:
+                if not rows:
+                    return b""
+                text_buf = _io.StringIO()
+                writer = csv.DictWriter(text_buf, fieldnames=list(rows[0].keys()), extrasaction='ignore')
+                writer.writeheader()
+                writer.writerows([{k: str(v) if v is not None else '' for k, v in row.items()} for row in rows])
+                return text_buf.getvalue().encode("utf-8")
+
+            buf = BytesIO()
+            with zipfile.ZipFile(buf, mode='w', compression=zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("backup.json",        json_bytes)
+                zf.writestr("orders.csv",         _rows_to_csv_bytes(orders))
+                zf.writestr("products.csv",       _rows_to_csv_bytes(products))
+                zf.writestr("banned_users.csv",   _rows_to_csv_bytes(banned))
+                zf.writestr("testimonials.csv",   _rows_to_csv_bytes(testimonials))
+                zf.writestr("admins.csv",         _rows_to_csv_bytes(admins))
+            buf.seek(0)
+            buf.name = zip_name
+            return buf
+
+        zip_buf = await asyncio.to_thread(_build_zip_in_thread)
 
         await bot.send_document(
             chat_id=ADMIN_ID,
@@ -3912,7 +3883,7 @@ async def _kirim_backup(bot):
             filename=zip_name,
             caption=(
                 f"📦 <b>Backup Database (ZIP)</b>\n"
-                f"🕒 {pretty_ts}\n"
+                f"🕒 {now_wib().strftime('%H:%M, %d/%m/%Y')}\n"
                 f"📋 {len(orders)} orders | {len(products)} produk | {len(banned)} banned | "
                 f"{len(testimonials)} testimoni | {len(admins)} admin\n\n"
                 f"<i>Isi ZIP: backup.json · orders.csv · products.csv · banned_users.csv · "
@@ -3986,8 +3957,8 @@ def _import_json_data_sync(data: dict):
     conn = get_conn()
     try:
         with conn.cursor() as c:
-            valid_products = [p for p in products if isinstance(p, dict)]
-            if valid_products:
+            # Products
+            if products:
                 try:
                     c.executemany(
                         """INSERT INTO products (paket_id, nama, emoji, deskripsi, harga, link, group_chat_id, aktif)
@@ -4006,16 +3977,15 @@ def _import_json_data_sync(data: dict):
                             "link":          p.get("link", DEFAULT_LINK),
                             "group_chat_id": p.get("group_chat_id"),
                             "aktif":         p.get("aktif", True),
-                        } for p in valid_products]
+                        } for p in products]
                     )
-                    ok_p = len(valid_products)
+                    ok_p = len(products)
                 except Exception as e:
                     logger.error(f"[IMPORT] products batch gagal: {e}")
                     fail_p = len(products)
 
+            # Orders
             for o in orders:
-                if not isinstance(o, dict):
-                    continue
                 try:
                     c.execute(
                         """INSERT INTO orders
@@ -4040,8 +4010,8 @@ def _import_json_data_sync(data: dict):
                     logger.error(f"[IMPORT] order gagal: {e}")
                     fail_o += 1
 
-            valid_banned = [b for b in banned if isinstance(b, dict)]
-            if valid_banned:
+            # Banned
+            if banned:
                 try:
                     c.executemany(
                         """INSERT INTO banned_users (user_id, reason, banned_at)
@@ -4051,16 +4021,15 @@ def _import_json_data_sync(data: dict):
                             "user_id":   b.get("user_id"),
                             "reason":    b.get("reason", ""),
                             "banned_at": b.get("banned_at", now_wib().strftime("%H:%M - %d/%m/%Y")),
-                        } for b in valid_banned]
+                        } for b in banned]
                     )
-                    ok_b = len(valid_banned)
+                    ok_b = len(banned)
                 except Exception as e:
                     logger.error(f"[IMPORT] banned batch gagal: {e}")
                     fail_b = len(banned)
 
+            # Testimonials
             for t in testimonials:
-                if not isinstance(t, dict):
-                    continue
                 try:
                     c.execute(
                         """INSERT INTO testimonials (user_id, user_name, paket_id, order_id, rating, review, status)
@@ -4081,9 +4050,8 @@ def _import_json_data_sync(data: dict):
                     logger.error(f"[IMPORT] testimonial gagal: {e}")
                     fail_t += 1
 
+            # Settings (hanya yang bukan managed_groups, dengan konfirmasi overwrite)
             for s in settings:
-                if not isinstance(s, dict):
-                    continue
                 if s.get('key') in ('managed_groups',):
                     continue
                 try:
@@ -4096,9 +4064,8 @@ def _import_json_data_sync(data: dict):
                     logger.error(f"[IMPORT] setting gagal: {e}")
                     fail_s += 1
 
+            # Admins
             for a in admins:
-                if not isinstance(a, dict):
-                    continue
                 try:
                     c.execute(
                         """INSERT INTO admins (user_id, nama, added_by, added_at)
@@ -4180,6 +4147,13 @@ def _get_completed_order_sync(order_id, user_id):
 _resend_cooldowns: dict = {}
 _RESEND_COOLDOWN_SECS = 60
 
+def _cleanup_resend_cooldowns():
+    """Fix 7: Hapus entri cooldown yang sudah kadaluarsa agar dict tidak tumbuh selamanya."""
+    cutoff = _time.monotonic() - (_RESEND_COOLDOWN_SECS * 2)
+    expired_keys = [k for k, ts in _resend_cooldowns.items() if ts < cutoff]
+    for k in expired_keys:
+        _resend_cooldowns.pop(k, None)
+
 async def resend_group_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -4191,15 +4165,11 @@ async def resend_group_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("⚠️ Order ID tidak valid.")
         return
 
+    # Rate limit: 1 resend per 60 detik per user per order
+    _cleanup_resend_cooldowns()  # Fix 7: bersihkan entri lama agar dict tidak leak
     cooldown_key = f"{user_id}:{order_id}"
-    now_ts = asyncio.get_event_loop().time()
-
-    # == PERBAIKAN: Bersihkan data cooldown lama yang sudah expired agar RAM tidak bocor ==
-    expired_keys = [k for k, ts in list(_resend_cooldowns.items()) if now_ts - ts > _RESEND_COOLDOWN_SECS]
-    for k in expired_keys:
-        _resend_cooldowns.pop(k, None)
-
     last_resend = _resend_cooldowns.get(cooldown_key, 0)
+    now_ts = asyncio.get_event_loop().time()
     sisa_cooldown = int(_RESEND_COOLDOWN_SECS - (now_ts - last_resend))
     if sisa_cooldown > 0:
         await query.answer(
@@ -4252,8 +4222,12 @@ def _get_buyers_for_reminder_sync(hari: int):
     conn = get_conn()
     try:
         with conn.cursor() as c:
+            # Fix 4: DISTINCT ON (user_id) agar user yang ganti nama tidak muncul dobel
             c.execute(
-                "SELECT DISTINCT user_id, user_name FROM orders WHERE status='completed' AND created_at >= %s AND created_at < %s",
+                """SELECT DISTINCT ON (user_id) user_id, user_name
+                   FROM orders
+                   WHERE status='completed' AND created_at >= %s AND created_at < %s
+                   ORDER BY user_id, id DESC""",
                 (target_day_start, target_day_end)
             )
             return [dict(r) for r in c.fetchall()]
@@ -4329,6 +4303,7 @@ async def _auto_backup_loop():
             await asyncio.sleep(3600)
 
 async def _cleanup_cooldowns_loop():
+    """Bersihkan cooldown yang sudah expired setiap 1 jam."""
     while True:
         try:
             await asyncio.sleep(3600)
@@ -4358,6 +4333,7 @@ async def _run_broadcast(bot, admin_id: int, buyers: list, text_blast: str):
 
     try:
         for index, b in enumerate(buyers):
+            # Cek apakah task di-cancel
             if asyncio.current_task().cancelled():
                 break
 
@@ -4370,6 +4346,7 @@ async def _run_broadcast(bot, admin_id: int, buyers: list, text_blast: str):
                 )
                 sent += 1
             except telegram.error.Forbidden:
+                # User blokir bot: lewati saja, JANGAN ban
                 skipped += 1
                 logger.info(f"[BLAST] User {target_id} memblokir bot, dilewati.")
             except telegram.error.RetryAfter as e:
@@ -4466,6 +4443,7 @@ async def blast_batal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def blast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin konfirmasi blast setelah preview."""
     query = update.callback_query
     await query.answer("⏳ Memulai broadcast di background...")
 
@@ -4489,6 +4467,7 @@ async def blast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _blast_tasks[admin_id] = task
 
 async def blast_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin stop broadcast yang sedang berjalan."""
     query = update.callback_query
     await query.answer("⛔ Menghentikan broadcast...")
 
@@ -4510,9 +4489,14 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.from_user:
         return
 
+    # Fix 6: hanya proses state di private chat — cegah admin state ter-trigger dari grup
+    if update.message.chat.type != "private":
+        return
+
     user_id = update.message.from_user.id
     text = update.message.text.strip() if update.message.text else ""
 
+    # --- STATE: BUYER MENGETIK TESTIMONI ---
     if context.user_data.get('awaiting_review_text'):
         context.user_data.pop('awaiting_review_text', None)
         temp = context.user_data.pop('temp_rating', None)
@@ -4557,7 +4541,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🙏 Terima kasih banyak! Ulasan Anda telah berhasil dikirim dan saat ini sedang ditinjau oleh admin.")
         return
 
+    # --- ADMIN STATES ---
     if await is_admin(user_id, context):
+
+        # --- State: blast - mengetik pesan ---
         blast_state = context.user_data.get('blast_state')
         if blast_state and blast_state.get('step') == 'typing':
             if not text:
@@ -4565,45 +4552,44 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             buyers = blast_state.get('buyers', [])
+            # Simpan teks & ganti step ke preview
             context.user_data['blast_state'] = {
                 'step': 'preview',
                 'text': text,
                 'buyers': buyers,
             }
 
-            preview_text = (
-                f"📋 <b>PREVIEW PESAN BLAST</b>\n"
-                f"========================\n\n"
-                f"{text}\n\n"
-                f"========================\n"
-                f"Target: <b>{len(buyers)} buyer</b>\n\n"
-                f"Apakah pesan ini sudah benar?"
-            )
-            kb_preview = InlineKeyboardMarkup([
+            blast_keyboard = InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton("✅ Kirim Sekarang", callback_data="blast_confirm"),
                     InlineKeyboardButton("✍️ Ubah Pesan", callback_data="blast_retype"),
                 ],
                 [InlineKeyboardButton("❌ Batalkan", callback_data="blast_batal")],
             ])
-
             try:
-                await update.message.reply_text(preview_text, parse_mode="HTML", reply_markup=kb_preview)
-            except telegram.error.BadRequest as e:
-                logger.warning(f"[BLAST] Gagal parsing HTML pada preview: {e}")
-                error_info = (
-                    f"⚠️ <b>HTML SINTAKS ERROR!</b>\n"
-                    f"Format teks HTML yang Anda kirimkan tidak valid.\n"
-                    f"Error detail: <code>{esc(str(e))}</code>\n\n"
-                    f"Silakan ketik ulang pesan siaran Anda dengan format HTML yang benar (atau kirim tanpa tag HTML)."
-                )
                 await update.message.reply_text(
-                    error_info,
+                    f"📋 <b>PREVIEW PESAN BLAST</b>\n"
+                    f"========================\n\n"
+                    f"{text}\n\n"
+                    f"========================\n"
+                    f"Target: <b>{len(buyers)} buyer</b>\n\n"
+                    f"Apakah pesan ini sudah benar?",
                     parse_mode="HTML",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Batal", callback_data="blast_batal")]])
+                    reply_markup=blast_keyboard
+                )
+            except TgBadRequest as e:
+                context.user_data['blast_state'] = {'step': 'typing', 'buyers': buyers}
+                await update.message.reply_text(
+                    f"❌ <b>HTML tidak valid!</b>\n\n"
+                    f"Error: <code>{esc(str(e))}</code>\n\n"
+                    f"Kirim ulang pesan dengan format HTML yang benar.\n"
+                    f"<i>Contoh: &lt;b&gt;bold&lt;/b&gt;, &lt;i&gt;italic&lt;/i&gt;</i>",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Batalkan", callback_data="blast_batal")]])
                 )
             return
 
+        # --- State: awaiting cari order ---
         if context.user_data.get('awaiting_cari'):
             context.user_data.pop('awaiting_cari', None)
             order_id = text.strip()
@@ -4639,6 +4625,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        # --- State: awaiting ban user ---
         if context.user_data.get('awaiting_ban'):
             context.user_data.pop('awaiting_ban', None)
             parts = text.split(None, 1)
@@ -4661,6 +4648,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        # --- State: awaiting unban user ---
         if context.user_data.get('awaiting_unban'):
             context.user_data.pop('awaiting_unban', None)
             try:
@@ -4679,6 +4667,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        # --- State: awaiting kick search (name or user_id) ---
         if context.user_data.get('awaiting_kick_search'):
             context.user_data.pop('awaiting_kick_search', None)
             query_str = text.strip()
@@ -4710,6 +4699,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        # --- State: awaiting tambah grup ---
         if context.user_data.get('awaiting_add_group'):
             context.user_data.pop('awaiting_add_group', None)
             gid_str = text.strip()
@@ -4730,6 +4720,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        # --- State: awaiting channel ID ---
         if context.user_data.get('awaiting_channel_id'):
             context.user_data.pop('awaiting_channel_id', None)
             val = text.strip()
@@ -4772,6 +4763,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
             return
 
+        # --- State: awaiting testi channel ID ---
         if context.user_data.get('awaiting_testi_channel_id'):
             context.user_data.pop('awaiting_testi_channel_id', None)
             val = text.strip()
@@ -4805,6 +4797,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
             return
 
+        # --- State: tambah admin via forward ---
         if context.user_data.get('awaiting_add_admin'):
             context.user_data.pop('awaiting_add_admin', None)
             if not is_super_admin(user_id):
@@ -4835,6 +4828,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        # --- State: ubah link testimoni ---
         if context.user_data.get('awaiting_link_testi'):
             context.user_data.pop('awaiting_link_testi', None)
             val = text.strip()
@@ -4846,6 +4840,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        # --- State: ubah link admin/CS ---
         if context.user_data.get('awaiting_link_admin'):
             context.user_data.pop('awaiting_link_admin', None)
             val = text.strip()
@@ -4857,6 +4852,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        # --- State: tambah produk ---
         adding = context.user_data.get('adding_product')
         if adding:
             step = adding.get('step')
@@ -4941,6 +4937,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await _send_produk_menu(context, chat_id=user_id)
                 return
 
+        # --- State: edit field produk ---
         editing = context.user_data.get('editing_product')
         if editing:
             paket_id = editing['paket_id']
@@ -5033,7 +5030,9 @@ async def admin_proses_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     order = dict(order)
     paket = await get_product(order["paket_id"]) or {"emoji": "📦", "nama": order["paket_id"], "harga": 0, "deskripsi": "-"}
-    trans = await get_transaction_detail(order["order_id"], paket["harga"]) if order["order_id"] else None
+    # Fix 3: pakai harga_dibayar (sudah termasuk fee) bukan harga dasar paket
+    actual_amount = order.get("harga_dibayar") or paket["harga"]
+    trans = await get_transaction_detail(order["order_id"], actual_amount) if order["order_id"] else None
     durasi = hitung_durasi(order["waktu"])
 
     caption = (
@@ -5139,11 +5138,7 @@ async def admin_konfirmasi(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ),
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⭐ Beri Ulasan / Testimoni", callback_data=f"rate_start|{order['order_id']}")],
-                [
-                    InlineKeyboardButton("🔄 Kirim Ulang Link", callback_data=f"resendlink|{order['order_id']}"),
-                    InlineKeyboardButton("💬 Chat Admin", url=await get_setting('link_admin', 'https://t.me/Kikukkvd'))
-                ]
+                [InlineKeyboardButton("⭐ Beri Ulasan / Testimoni", callback_data=f"rate_start|{order['order_id']}")]
             ])
         )
         simpan_msg_user(context, user_id, msg.message_id)
@@ -5235,6 +5230,8 @@ def build_admin_panel_keyboard(user_id: int = None):
     ]
     if user_id and is_super_admin(user_id):
         rows.append([InlineKeyboardButton("👥 Kelola Admin", callback_data="admpanel_admins")])
+    if WEBAPP_URL:
+        rows.append([InlineKeyboardButton("🌐 Buka Dashboard Web", web_app=WebAppInfo(url=WEBAPP_URL))])
     return InlineKeyboardMarkup(rows)
 
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5395,6 +5392,7 @@ async def admpanel_blast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def blast_retype(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ubah pesan blast setelah preview."""
     query = update.callback_query
     await query.answer()
 
@@ -5492,435 +5490,801 @@ async def admpanel_data_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
     for p in products:
         grp = p.get('group_chat_id')
         if grp:
-            text += f"{esc(p['emoji'])} <b>{esc(p['nama'])}</b>\n- 🏢 Group: <code>{esc(grp)}</code>\n- 🔗 Fallback: <code>{esc(p['link'])}</code>\n\n"
+            text += f"{esc(p['emoji'])} <b>{esc(p['nama'])}</b>\n- 🏢 Group: <code>{esc(grp)}</code>\n\n"
         else:
             text += f"{esc(p['emoji'])} <b>{esc(p['nama'])}</b>\n- <code>{esc(p['link'])}</code>\n\n"
-    text += "<i>Ketik /produk untuk mengubah link atau Group ID.</i>"
     await query.edit_message_text(
         text, parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_data")]])
     )
 
-# =================== ADMIN: KELOLA USER (BLACKLIST) ===================
-
 async def admpanel_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    banned = await get_all_banned()
-    text = (
-        "<b>🚫 KELOLA USER (BLACKLIST)</b>\n"
-        "========================\n\n"
-        f"Total diblokir: <b>{len(banned)} user</b>\n\n"
-        "Pilih tindakan di bawah ini untuk mengelola blacklist:"
-    )
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🚫 Ban User", callback_data="admpanel_user_ban"),
-            InlineKeyboardButton("✅ Unban User", callback_data="admpanel_user_unban"),
+            InlineKeyboardButton("🚫 Ban User",      callback_data="admpanel_user_ban"),
+            InlineKeyboardButton("✅ Unban User",    callback_data="admpanel_user_unban"),
         ],
-        [InlineKeyboardButton("📋 Lihat Daftar Ban", callback_data="admpanel_user_list")],
-        [InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_back")]
+        [InlineKeyboardButton("📋 Daftar Ban",    callback_data="admpanel_user_daftar")],
+        [InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_back")],
     ])
-    await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
+    await query.edit_message_text(
+        "<b>🚫 KELOLA USER</b>\n"
+        "========================\n\n"
+        "Pilih aksi:",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
 
 async def admpanel_user_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    context.user_data['awaiting_ban'] = True
     await query.edit_message_text(
-        "<b>🚫 BAN USER BARU</b>\n"
+        "<b>🚫 BAN USER</b>\n"
         "========================\n\n"
-        "Kirim <b>User ID Telegram</b> dan <b>alasan</b> (opsional) yang ingin dibanned.\n"
-        "Format: <code>[user_id] [alasan]</code>\n"
-        "Contoh: <code>123456789 menyebarkan spam</code>",
+        "Ketik User ID dan alasan (opsional):\n"
+        "Format: <code>user_id alasan</code>\n"
+        "Contoh: <code>123456789 spam</code>",
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Batal", callback_data="admpanel_user")]])
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Batal", callback_data="admpanel_user")]])
     )
+    context.user_data['awaiting_ban'] = True
 
 async def admpanel_user_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    context.user_data['awaiting_unban'] = True
     await query.edit_message_text(
         "<b>✅ UNBAN USER</b>\n"
         "========================\n\n"
-        "Kirim <b>User ID Telegram</b> yang ingin di-unban.\n"
+        "Ketik User ID yang mau di-unban:\n"
         "Contoh: <code>123456789</code>",
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Batal", callback_data="admpanel_user")]])
-   )
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Batal", callback_data="admpanel_user")]])
+    )
+    context.user_data['awaiting_unban'] = True
 
-async def admpanel_user_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admpanel_user_daftar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     banned = await get_all_banned()
-    text = "<b>📋 DAFTAR HITAM (BANNED LIST)</b>\n========================\n\n"
-    if banned:
-        for b in banned:
-            text += f"- <code>{b['user_id']}</code>\n  Alasan: {esc(b['reason'])}\n  Waktu: {b['banned_at']}\n\n"
-    else:
-        text += "<i>Tidak ada user yang dibanned saat ini.</i>"
-    
+    if not banned:
+        await query.edit_message_text(
+            "<b>🚫 DAFTAR BAN</b>\n========================\n\nBelum ada user yang dibanned.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_user")]])
+        )
+        return
+    text = f"<b>🚫 DAFTAR BAN ({len(banned)} user)</b>\n========================\n\n"
+    for b in banned:
+        text += (
+            f"👤 ID: <code>{b['user_id']}</code>\n"
+            f"📝 Alasan: {esc(b['reason'] or '-')}\n"
+            f"🕒 Dibanned: {b['banned_at']}\n\n"
+        )
     await query.edit_message_text(
         text, parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_user")]])
     )
 
-# =================== ADMIN: KICK & SCAN USER GRUP ===================
+# =================== ADMIN: CEK & KICK USER DI GRUP ===================
 
 async def admpanel_kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    if not await is_admin(query.from_user.id, context):
+        await query.answer("⛔ Akses ditolak.", show_alert=True)
+        return
+
     managed_groups = await get_managed_groups()
-    text = (
-        "<b>👢 CEK & KICK GRUP</b>\n"
-        "========================\n\n"
-        f"Total grup terdaftar: <b>{len(managed_groups)} grup</b>\n"
-        "Grup terdaftar: " + (", ".join(f"<code>{g}</code>" for g in managed_groups) if managed_groups else "<i>Belum ada</i>") + "\n\n"
-        "Menu ini berfungsi untuk memindai keanggotaan user di grup privat premium Anda dan mengeluarkannya jika tidak memiliki pesanan lunas."
-    )
+
+    group_lines = ""
+    if managed_groups:
+        for i, gid in enumerate(managed_groups, 1):
+            try:
+                chat = await context.bot.get_chat(int(gid))
+                nama_grup = esc(chat.title or str(gid))
+            except Exception:
+                nama_grup = "⚠️ Tidak dapat diakses"
+            group_lines += f"  {i}. <b>{nama_grup}</b>\n     <code>{gid}</code>\n"
+    else:
+        group_lines = "  <i>Belum ada grup terdaftar.</i>\n"
+
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔍 Pindai / Kick User", callback_data="kick_cek_user")],
-        [InlineKeyboardButton("➕ Tambah Grup ke Daftar", callback_data="kick_tambah_grup")],
-        [InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_back")]
+        [
+            InlineKeyboardButton("🔍 Cek User di Grup", callback_data="kick_cek_user"),
+            InlineKeyboardButton("➕ Tambah Grup",      callback_data="kick_add_group"),
+        ],
+        [InlineKeyboardButton("🗑️ Hapus Grup",          callback_data="kick_del_group")],
+        [InlineKeyboardButton("⬅️ Kembali",              callback_data="admpanel_back")],
     ])
-    await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+    await query.edit_message_text(
+        f"<b>👢 CEK &amp; KICK USER DI GRUP</b>\n"
+        f"========================\n\n"
+        f"Fitur ini memungkinkan kamu mengecek keberadaan user di grup dan mengeluarkannya.\n\n"
+        f"<b>Grup Terdaftar ({len(managed_groups)}):</b>\n"
+        f"{group_lines}\n"
+        f"<i>Pastikan bot sudah menjadi admin di semua grup tersebut.</i>",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
 
 async def kick_cek_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     context.user_data['awaiting_kick_search'] = True
     await query.edit_message_text(
-        "<b>🔍 CEK & KICK USER</b>\n"
+        "<b>🔍 CEK USER DI GRUP</b>\n"
         "========================\n\n"
-        "Kirim <b>User ID</b> atau <b>Nama Lengkap</b> buyer yang ingin dicek di grup premium:",
+        "Kirim <b>nama</b> atau <b>User ID</b> yang ingin dicek.\n\n"
+        "<i>Contoh nama: Budi  ·  Contoh ID: 123456789</i>",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Batal", callback_data="admpanel_kick")]])
     )
 
-async def kick_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def kick_select_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Tampilkan status user di tiap grup + tombol kick per grup dan kick semua."""
     query = update.callback_query
-    await query.answer()
-    target_id = int(query.data.split("|")[1])
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    if not await is_admin(query.from_user.id, context):
+        return
+    target_id = int(query.data.split("|", 1)[1])
     managed_groups = await get_managed_groups()
-
     if not managed_groups:
-        await query.edit_message_text(
-            "❌ Belum ada grup privat premium terdaftar di pengaturan kick.\nKetik /admin -> Cek & Kick -> Tambah Grup.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_kick")]])
-        )
+        await query.answer("Tidak ada grup terdaftar.", show_alert=True)
         return
 
-    text = (
-        f"👤 <b>Hasil Pemindaian Keanggotaan</b>\n"
-        f"User ID: <code>{target_id}</code>\n"
-        f"========================\n\n"
-    )
+    lines = []
+    group_names = {}
+    for gid in managed_groups:
+        try:
+            chat = await context.bot.get_chat(int(gid))
+            group_names[str(gid)] = chat.title or str(gid)
+        except Exception:
+            group_names[str(gid)] = str(gid)
+
     buttons = []
     for gid in managed_groups:
         try:
-            member = await context.bot.get_chat_member(chat_id=gid, user_id=target_id)
+            member = await context.bot.get_chat_member(chat_id=int(gid), user_id=target_id)
             status = member.status
-            is_in_group = status in ('member', 'administrator', 'creator', 'restricted')
-        except Exception:
-            is_in_group = False
-            status = "unknown"
+            if status in ('member', 'administrator', 'creator', 'restricted'):
+                icon = "✅"
+                status_label = status
+            else:
+                icon = "❌"
+                status_label = status
+        except Exception as e:
+            icon = "⚠️"
+            status_label = "error"
+        nama_grup = esc(group_names.get(str(gid), str(gid)))
+        lines.append(f"  {icon} <b>{nama_grup}</b>  <i>({status_label})</i>")
+        if icon == "✅":
+            buttons.append([InlineKeyboardButton(
+                f"👢 Kick dari {group_names.get(str(gid), str(gid))}",
+                callback_data=f"kick_one|{target_id}|{gid}"
+            )])
 
-        if is_in_group:
-            text += f"🏢 Grup <code>{gid}</code>: <b>Terdaftar ({esc(status)})</b> 🟢\n"
-            buttons.append([InlineKeyboardButton(f"👢 Kick dari {gid}", callback_data=f"kick_execute|{target_id}|{gid}")])
-        else:
-            text += f"🏢 Grup <code>{gid}</code>: <i>Tidak Terdaftar</i> <i>({esc(status)})</i> ⚪\n"
-
-    text += "\nPilih tombol di bawah untuk mengeluarkan user dari grup:"
+    result_text = (
+        f"🔍 <b>Status User</b> <code>{target_id}</code>\n"
+        f"========================\n\n"
+        + "\n".join(lines)
+        + "\n\n<i>Pilih aksi di bawah:</i>"
+    )
+    buttons.append([InlineKeyboardButton(f"👢 Kick dari Semua Grup + Ban", callback_data=f"kick_do_kick|{target_id}")])
     buttons.append([InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_kick")])
-    await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
+    await query.edit_message_text(result_text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
 
-async def kick_execute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def kick_one(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Kick user hanya dari 1 grup tertentu."""
     query = update.callback_query
+    if not await is_admin(query.from_user.id, context):
+        await query.answer("⛔ Akses ditolak.", show_alert=True)
+        return
     parts = query.data.split("|")
     target_id = int(parts[1])
-    chat_id = int(parts[2])
-
+    gid = int(parts[2])
     try:
-        await context.bot.ban_chat_member(chat_id=chat_id, user_id=target_id)
-        await context.bot.unban_chat_member(chat_id=chat_id, user_id=target_id)
-        await query.answer("✅ Berhasil menendang user dari grup!", show_alert=True)
+        await context.bot.ban_chat_member(chat_id=gid, user_id=target_id)
+        await context.bot.unban_chat_member(chat_id=gid, user_id=target_id, only_if_banned=True)
+        try:
+            chat = await context.bot.get_chat(gid)
+            nama_grup = chat.title or str(gid)
+        except Exception:
+            nama_grup = str(gid)
+        await query.answer(f"✅ Berhasil kick dari {nama_grup}", show_alert=True)
     except Exception as e:
-        await query.answer(f"❌ Gagal kick: {str(e)}", show_alert=True)
-
+        await query.answer(f"❌ Gagal: {str(e)[:80]}", show_alert=True)
+    # Refresh view — set data ke kick_select|{target_id} agar kick_select_user bisa baca target_id
     query.data = f"kick_select|{target_id}"
-    await kick_select(update, context)
+    await kick_select_user(update, context)
 
-async def kick_tambah_grup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def kick_add_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     context.user_data['awaiting_add_group'] = True
     await query.edit_message_text(
-        "<b>➕ TAMBAH GRUP PREMIUM</b>\n"
+        "<b>➕ TAMBAH GRUP</b>\n"
         "========================\n\n"
-        "Kirim <b>Group Chat ID</b> privat premium yang ingin ditambahkan ke sistem otomatis kick.\n"
-        "Contoh: <code>-1001234567890</code>\n\n"
-        "<i>Pastikan bot sudah dijadikan Administrator di grup tersebut agar bisa melakukan kick anggota!</i>",
+        "Kirim <b>Chat ID grup</b> yang ingin ditambahkan.\n"
+        "Contoh: <code>-1001234567890</code>",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Batal", callback_data="admpanel_kick")]])
     )
 
-# =================== ADMIN: CONFIGURATION & SETTINGS ===================
+async def kick_del_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    managed_groups = await get_managed_groups()
+    if not managed_groups:
+        await query.answer("Belum ada grup terdaftar.", show_alert=True)
+        return
+    buttons = []
+    for gid in managed_groups:
+        try:
+            chat = await context.bot.get_chat(int(gid))
+            label = f"🗑️ {chat.title or gid}  ({gid})"
+        except Exception:
+            label = f"🗑️ {gid}"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"kick_del_confirm|{gid}")])
+    buttons.append([InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_kick")])
+    await query.edit_message_text(
+        "<b>🗑️ HAPUS GRUP</b>\n========================\n\nPilih grup yang ingin dihapus:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+async def kick_del_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    gid_str = query.data.split("|", 1)[1]
+    managed_groups = await get_managed_groups()
+    new_groups = [g for g in managed_groups if str(g) != gid_str]
+    await set_managed_groups(new_groups)
+    await query.answer(f"✅ Grup {gid_str} dihapus.", show_alert=True)
+    await admpanel_kick(update, context)
+
+async def kick_do_kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not await is_admin(query.from_user.id, context):
+        return
+    target_id = int(query.data.split("|", 1)[1])
+    managed_groups = await get_managed_groups()
+    if not managed_groups:
+        await query.answer("Tidak ada grup terdaftar.", show_alert=True)
+        return
+    kicked = []
+    failed = []
+    for gid in managed_groups:
+        try:
+            chat = await context.bot.get_chat(int(gid))
+            nama_grup = chat.title or str(gid)
+        except Exception:
+            nama_grup = str(gid)
+        try:
+            await context.bot.ban_chat_member(chat_id=int(gid), user_id=target_id)
+            await context.bot.unban_chat_member(chat_id=int(gid), user_id=target_id, only_if_banned=True)
+            kicked.append(esc(nama_grup))
+        except Exception as e:
+            failed.append(f"{esc(nama_grup)}: {esc(str(e)[:60])}")
+
+    # Auto-ban di DB
+    await ban_user(target_id, "Dikick dari grup oleh admin")
+
+    # Kirim notif ke user bahwa akses dinonaktifkan
+    try:
+        await context.bot.send_message(
+            chat_id=target_id,
+            text=(
+                "🚫 <b>Akses Dinonaktifkan</b>\n\n"
+                "Akses kamu ke <b>Hyper Family Store</b> telah dinonaktifkan oleh admin.\n\n"
+                "<i>Jika merasa ini kesalahan, hubungi admin untuk informasi lebih lanjut.</i>"
+            ),
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
+
+    result_text = (
+        f"✅ <b>User <code>{target_id}</code> berhasil dikick + di-ban</b>\n"
+        f"========================\n\n"
+        f"🗑️ Dikick dari grup:\n"
+        + "\n".join(f"  - {g}" for g in kicked)
+    )
+    if failed:
+        result_text += "\n\n❌ Gagal di:\n" + "\n".join(f"  - {f}" for f in failed)
+    result_text += "\n\n🚫 User sudah di-ban dari bot dan menerima notifikasi."
+    await query.edit_message_text(
+        result_text, parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_kick")]])
+    )
+
+# =================== ADMIN: PENGATURAN ===================
 
 async def admpanel_setting(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    notif_id = await get_setting('notif_channel_id', 'Tidak di-set')
-    testi_id = await get_setting('testimoni_channel_id', 'Tidak di-set')
-    link_testi = await get_setting('link_testimoni', 'https://t.me/+7zsdSrwYIG8wOTg1')
-    link_cs = await get_setting('link_admin', 'https://t.me/Kikukkvd')
-    maintenance_val = await get_setting('maintenance', '0')
-    mt_status = "🔴 AKTIF (Maintenance)" if maintenance_val == '1' else "Double processing disabled 🟢 (Normal)"
+    channel_id = await get_setting('notif_channel_id')
+    ch_status = f"✅ ID: <code>{esc(channel_id)}</code>" if channel_id else "🔕 Nonaktif"
+
+    testi_channel_id = await get_setting('testimoni_channel_id')
+    testi_ch_status = f"✅ ID: <code>{esc(testi_channel_id)}</code>" if testi_channel_id else "🔕 Nonaktif"
+
+    maint_on = await is_maintenance()
+    maint_status = "⚙️ ON - bot maintenance" if maint_on else "✅ OFF - bot normal"
+    maint_btn_label = "🟢 Matikan Maintenance" if maint_on else "⚙️ Aktifkan Maintenance"
+
+    link_testi = await get_setting('link_testimoni') or '-'
+    link_admin = await get_setting('link_admin')     or '-'
 
     text = (
-        "<b>⚙️ PENGATURAN BOT</b>\n"
+        "<b>⚙️ PENGATURAN</b>\n"
         "========================\n\n"
-        f"🔔 Channel Notif ID : <code>{esc(notif_id)}</code>\n"
-        f"⭐ Channel Testi ID : <code>{esc(testi_id)}</code>\n"
-        f"🔗 Link Testi Button : <code>{esc(link_testi)}</code>\n"
-        f"💬 Link CS Admin    : <code>{esc(link_cs)}</code>\n"
-        f"🛠️ Mode Perbaikan   : <b>{mt_status}</b>\n\n"
-        "Pilih konfigurasi yang ingin Anda ubah:"
+        "<b>📢 Channel Notifikasi Order</b>\n"
+        f"{ch_status}\n\n"
+        "<b>⭐ Channel Testimoni Pembeli</b>\n"
+        f"{testi_ch_status}\n\n"
+        "<b>⚙️ Maintenance Mode</b>\n"
+        f"{maint_status}\n\n"
+        "<b>⭐ Link Button Testimoni</b>\n"
+        f"<code>{esc(link_testi)}</code>\n\n"
+        "<b>💬 Link Admin/CS</b>\n"
+        f"<code>{esc(link_admin)}</code>"
     )
+
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🔔 Set Channel Notif", callback_data="admpanel_setting_notif"),
-            InlineKeyboardButton("⭐ Set Channel Testi", callback_data="admpanel_setting_testi"),
+            InlineKeyboardButton("📢 Set Channel Notif", callback_data="admpanel_setting_channel_set"),
+            InlineKeyboardButton("🔕 Matikan Notif",    callback_data="admpanel_setting_channel_off"),
         ],
         [
-            InlineKeyboardButton("🔗 Set Link Testi", callback_data="admpanel_setting_link_testi"),
-            InlineKeyboardButton("💬 Set Link CS/Admin", callback_data="admpanel_setting_link_admin"),
+            InlineKeyboardButton("⭐ Set Channel Testi", callback_data="admpanel_setting_testich_set"),
+            InlineKeyboardButton("🔕 Matikan Testi",    callback_data="admpanel_setting_testich_off"),
         ],
-        [InlineKeyboardButton("🛠️ Toggle Maintenance Mode", callback_data="admpanel_setting_mt")],
-        [InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_back")]
+        [InlineKeyboardButton("📨 Test Notifikasi Order", callback_data="admpanel_setting_channel_test")],
+        [InlineKeyboardButton(maint_btn_label,            callback_data="admpanel_setting_maintenance")],
+        [
+            InlineKeyboardButton("⭐ Ubah Link Testimoni", callback_data="admpanel_setting_link_testi"),
+            InlineKeyboardButton("💬 Ubah Link Admin/CS",  callback_data="admpanel_setting_link_admin"),
+        ],
+        [InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_back")],
     ])
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
 
-async def admpanel_setting_notif(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admpanel_setting_maintenance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    was_on = await is_maintenance()
+    await set_setting('maintenance', '0' if was_on else '1')
+    if was_on:
+        msg = "✅ <b>Maintenance mode dinonaktifkan.</b>\n\nBot kembali normal - buyer bisa akses."
+    else:
+        msg = "⚙️ <b>Maintenance mode diaktifkan.</b>\n\nBuyer tidak bisa akses bot sampai maintenance dimatikan."
+    await query.edit_message_text(
+        msg, parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali ke Pengaturan", callback_data="admpanel_setting")]])
+    )
+
+async def admpanel_setting_channel_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     context.user_data['awaiting_channel_id'] = True
     await query.edit_message_text(
-        "<b>🔔 SET CHANNEL NOTIFIKASI ORDER</b>\n"
+        "<b>✍️ SET CHANNEL ID</b>\n"
         "========================\n\n"
-        "Kirim <b>ID Channel</b> yang ingin dijadikan pusat pengiriman notifikasi order baru.\n"
+        "Ketik Channel ID tujuan notifikasi:\n"
         "Contoh: <code>-1001234567890</code>\n\n"
-        "Ketik <code>hapus</code> untuk mengembalikan notifikasi langsung ke DM Admin utama.\n"
-        "<i>Pastikan bot sudah dijadikan Administrator di channel tersebut!</i>",
+        "Ketik <code>hapus</code> untuk menonaktifkan channel.",
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Batal", callback_data="admpanel_setting")]])
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Batal", callback_data="admpanel_setting")]])
     )
 
-async def admpanel_setting_testi(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admpanel_setting_channel_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await set_setting('notif_channel_id', None)
+    await query.edit_message_text(
+        "🔕 <b>Channel notifikasi dinonaktifkan.</b>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali ke Pengaturan", callback_data="admpanel_setting")]])
+    )
+
+async def admpanel_setting_testich_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     context.user_data['awaiting_testi_channel_id'] = True
     await query.edit_message_text(
-        "<b>⭐ SET CHANNEL PUBLIKASI TESTIMONI</b>\n"
+        "<b>✍️ SET CHANNEL TESTIMONI</b>\n"
         "========================\n\n"
-        "Kirim <b>ID Channel</b> yang akan digunakan untuk memposting otomatis ulasan bintang buyer yang sudah Anda setujui.\n"
-        "Contoh: <code>-1009876543210</code>\n\n"
-        "Ketik <code>hapus</code> untuk menonaktifkan fitur posting otomatis.\n"
-        "<i>Pastikan bot sudah dijadikan Administrator di channel tersebut!</i>",
+        "Ketik Channel ID tujuan ulasan testimoni:\n"
+        "Contoh: <code>-1001234567890</code>\n\n"
+        "Ketik <code>hapus</code> untuk menonaktifkan channel.",
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Batal", callback_data="admpanel_setting")]])
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Batal", callback_data="admpanel_setting")]])
     )
+
+async def admpanel_setting_testich_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await set_setting('testimoni_channel_id', None)
+    await query.edit_message_text(
+        "🔕 <b>Channel testimoni otomatis dinonaktifkan.</b>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali ke Pengaturan", callback_data="admpanel_setting")]])
+    )
+
+async def admpanel_setting_channel_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    channel_id = await get_setting('notif_channel_id')
+    if not channel_id:
+        await query.answer("❌ Channel ID belum diset!", show_alert=True)
+        return
+    try:
+        await context.bot.send_message(
+            chat_id=int(channel_id),
+            text=(
+                f"📨 <b>Test Notifikasi</b>\n"
+                f"========================\n\n"
+                f"✅ Bot berhasil mengirim pesan ke channel ini.\n"
+                f"🕒 {now_wib().strftime('%H:%M, %d/%m/%Y')}"
+            ),
+            parse_mode="HTML"
+        )
+        await query.answer("✅ Pesan test berhasil dikirim!", show_alert=True)
+    except Exception as e:
+        await query.answer(f"❌ Gagal: {str(e)[:100]}", show_alert=True)
 
 async def admpanel_setting_link_testi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     context.user_data['awaiting_link_testi'] = True
+    current = await get_setting('link_testimoni') or '-'
     await query.edit_message_text(
-        "<b>🔗 SET LINK TESTIMONI BUTTON</b>\n"
-        "========================\n\n"
-        "Kirim tautan lengkap (URL) eksternal/grup untuk tombol 'Testimoni' di menu utama buyer:\n"
-        "Contoh: <code>https://t.me/+7zsdSrwYIG8wOTg1</code>",
+        f"<b>⭐ UBAH LINK TESTIMONI</b>\n"
+        f"========================\n\n"
+        f"Link saat ini:\n<code>{esc(current)}</code>\n\n"
+        f"Kirim link baru:",
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Batal", callback_data="admpanel_setting")]])
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Batal", callback_data="admpanel_setting")]])
     )
 
 async def admpanel_setting_link_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     context.user_data['awaiting_link_admin'] = True
+    current = await get_setting('link_admin') or '-'
     await query.edit_message_text(
-        "<b>💬 SET LINK CS / ADMIN BUTTON</b>\n"
-        "========================\n\n"
-        "Kirim tautan lengkap (URL) Telegram CS/Admin utama untuk tombol 'Admin' di menu buyer:\n"
-        "Contoh: <code>https://t.me/Kikukkvd</code>",
+        f"<b>💬 UBAH LINK ADMIN/CS</b>\n"
+        f"========================\n\n"
+        f"Link saat ini:\n<code>{esc(current)}</code>\n\n"
+        f"Kirim link baru:",
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Batal", callback_data="admpanel_setting")]])
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Batal", callback_data="admpanel_setting")]])
     )
 
-async def admpanel_setting_mt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    curr = await get_setting('maintenance', '0')
-    new_val = '1' if curr != '1' else '0'
-    await set_setting('maintenance', new_val)
-    status = "AKTIF (Maintenance)" if new_val == '1' else "NONAKTIF (Normal)"
-    await query.answer(f"✅ Mode perbaikan berhasil diubah menjadi: {status}", show_alert=True)
-    await admpanel_setting(update, context)
+# =================== ADMIN: BAN / UNBAN (command) ===================
 
-# =================== ADMIN: SUB-ADMIN MANAGEMENT ===================
+async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update.message.from_user.id, context):
+        return
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "⚠️ Cara pakai: <code>/ban &lt;user_id&gt; [alasan]</code>\n\nContoh: <code>/ban 123456789 spam</code>",
+            parse_mode="HTML"
+        )
+        return
+    try:
+        target_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ User ID harus berupa angka.", parse_mode="HTML")
+        return
+    if await is_admin(target_id, context):
+        await update.message.reply_text("❌ Tidak bisa ban sesama admin.")
+        return
+    reason = " ".join(args[1:]) if len(args) > 1 else "Tidak ada alasan"
+    await ban_user(target_id, reason)
+    await update.message.reply_text(
+        f"🚫 <b>User Berhasil Dibanned</b>\n\n"
+        f"👤 User ID: <code>{target_id}</code>\n"
+        f"📝 Alasan: {esc(reason)}",
+        parse_mode="HTML"
+    )
+
+async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update.message.from_user.id, context):
+        return
+    args = context.args
+    if not args:
+        await update.message.reply_text("⚠️ Cara pakai: <code>/unban &lt;user_id&gt;</code>", parse_mode="HTML")
+        return
+    try:
+        target_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ User ID harus berupa angka.", parse_mode="HTML")
+        return
+    if not await is_banned(target_id):
+        await update.message.reply_text(f"⚠️ User <code>{target_id}</code> tidak ada dalam daftar ban.", parse_mode="HTML")
+        return
+    await unban_user(target_id)
+    await update.message.reply_text(
+        f"✅ <b>User Berhasil Di-unban</b>\n\n👤 User ID: <code>{target_id}</code>",
+        parse_mode="HTML"
+    )
+
+async def cmd_daftar_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update.message.from_user.id, context):
+        return
+    banned = await get_all_banned()
+    if not banned:
+        await update.message.reply_text("✅ Tidak ada user yang dibanned saat ini.")
+        return
+    text = f"<b>🚫 DAFTAR BAN ({len(banned)} user)</b>\n========================\n\n"
+    for b in banned:
+        text += f"- ID: <code>{b['user_id']}</code> | Alasan: {esc(b['reason'] or '-')}\n"
+    await update.message.reply_text(text, parse_mode="HTML")
+
+async def cmd_cari(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update.message.from_user.id, context):
+        return
+    args = context.args
+    if not args:
+        await update.message.reply_text("⚠️ Cara pakai: <code>/cari &lt;order_id&gt;</code>", parse_mode="HTML")
+        return
+    order_id = args[0].strip()
+    order = await get_order_by_id(order_id)
+    if not order:
+        await update.message.reply_text(f"❌ Order tidak ditemukan: <code>{esc(order_id)}</code>", parse_mode="HTML")
+        return
+    paket = await get_product(order['paket_id']) or {"emoji": "📦", "nama": order['paket_id'], "harga": 0}
+    STATUS_LABEL = {
+        'completed': '✅ Selesai / Lunas', 'waiting': '⏳ Menunggu Bayar',
+        'pending': '🔄 Diproses Manual', 'cancelled': '❌ Dibatalkan',
+        'expired': '⏰ Kedaluwarsa', 'rejected': '🚫 Ditolak',
+    }
+    status = STATUS_LABEL.get(order['status'], order['status'])
+    sent_link = order.get('sent_link') or '-'
+    await update.message.reply_text(
+        f"<b>🔍 DETAIL ORDER</b>\n"
+        f"========================\n\n"
+        f"📝 Order ID: <code>{esc(order['order_id'])}</code>\n"
+        f"👤 Buyer: {esc(order.get('user_name', '-'))} (<code>{order['user_id']}</code>)\n"
+        f"📦 Paket: {esc(paket['emoji'])} {esc(paket['nama'])}\n"
+        f"💰 Harga Dibayar: {format_harga(order.get('harga_dibayar') or paket['harga'])}\n"
+        f"📊 Status: {status}\n"
+        f"🕒 Dibuat: {order.get('waktu', '-')}\n"
+        f"🔗 Link terkirim: {esc(sent_link)}",
+        parse_mode="HTML"
+    )
+
+# =================== ADMIN: KELOLA ADMIN (SUPER ADMIN ONLY) ===================
 
 async def admpanel_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     if not is_super_admin(query.from_user.id):
-        await query.answer("⛔ Hanya Super Admin yang bisa mengakses menu ini.", show_alert=True)
+        await query.answer("❌ Hanya super admin.", show_alert=True)
         return
 
     admins = await get_all_admins()
-    text = "<b>👥 KELOLA SUB-ADMIN BOT</b>\n========================\n\n"
-    keyboard = []
-    if admins:
-        for a in admins:
-            text += f"👤 <b>{esc(a['nama'])}</b>\n  ID: <code>{a['user_id']}</code>\n  Waktu bergabung: {a['added_at']}\n\n"
-            keyboard.append([InlineKeyboardButton(f"🗑️ Hapus: {a['nama']}", callback_data=f"admpanel_admin_del_{a['user_id']}")])
-    else:
-        text += "<i>Belum ada sub-admin tambahan yang terdaftar.</i>"
+    lines = []
+    for a in admins:
+        lines.append(f"- {esc(a['nama'])} (<code>{a['user_id']}</code>)")
+    admin_list = "\n".join(lines) if lines else "<i>Belum ada admin tambahan.</i>"
 
-    keyboard.append([InlineKeyboardButton("➕ Tambah Admin Baru", callback_data="admpanel_admin_add")])
-    keyboard.append([InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_back")])
-
-    await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+    text = (
+        "<b>👥 KELOLA ADMIN</b>\n"
+        "========================\n\n"
+        "<b>Daftar Admin Saat Ini:</b>\n"
+        f"{admin_list}\n\n"
+        "<i>Admin tambahan bisa akses semua fitur panel kecuali menu Kelola Admin.</i>"
+    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Tambah Admin", callback_data="admpanel_admin_add")],
+        [InlineKeyboardButton("➖ Hapus Admin",  callback_data="admpanel_admin_remove")],
+        [InlineKeyboardButton("⬅️ Kembali",       callback_data="admpanel_back")],
+    ])
+    await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
 
 async def admpanel_admin_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    if not is_super_admin(query.from_user.id):
+        await query.answer("❌ Hanya super admin.", show_alert=True)
+        return
     context.user_data['awaiting_add_admin'] = True
     await query.edit_message_text(
-        "<b>➕ TAMBAH ADMIN BARU</b>\n"
+        "<b>➕ TAMBAH ADMIN</b>\n"
         "========================\n\n"
-        "Silakan <b>forward pesan</b> dari user yang ingin dijadikan admin ke obrolan bot ini.\n"
-        "Atau kirim langsung <b>User ID Telegram</b> (berupa angka) milik user tersebut.",
+        "Forward pesan dari user yang ingin dijadikan admin,\n"
+        "atau ketik <b>User ID</b>-nya langsung.\n\n"
+        "<i>Pastikan user sudah pernah start bot.</i>",
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Batal", callback_data="admpanel_admins")]])
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Batal", callback_data="admpanel_admins")]])
     )
 
 async def admpanel_admin_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await admpanel_admins(update, context)
+    query = update.callback_query
+    await query.answer()
+    if not is_super_admin(query.from_user.id):
+        await query.answer("❌ Hanya super admin.", show_alert=True)
+        return
+
+    admins = await get_all_admins()
+    if not admins:
+        await query.edit_message_text(
+            "ℹ️ Belum ada admin tambahan yang bisa dihapus.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_admins")]])
+        )
+        return
+
+    buttons = []
+    for a in admins:
+        buttons.append([InlineKeyboardButton(
+            f"🗑️ {a['nama']} ({a['user_id']})",
+            callback_data=f"admpanel_admin_del_{a['user_id']}"
+        )])
+    buttons.append([InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_admins")])
+    await query.edit_message_text(
+        "<b>➖ HAPUS ADMIN</b>\n========================\n\nPilih admin yang ingin dihapus:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
 
 async def admpanel_admin_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    target_id = int(query.data.replace("admpanel_admin_del_", ""))
+    if not is_super_admin(query.from_user.id):
+        await query.answer("❌ Hanya super admin.", show_alert=True)
+        return
+
+    try:
+        target_id = int(query.data.split("admpanel_admin_del_")[1])
+    except (IndexError, ValueError):
+        await query.answer("❌ ID tidak valid.", show_alert=True)
+        return
+
     await remove_admin(target_id)
     invalidate_admin_cache(context, target_id)
-    await query.answer("✅ Akses admin berhasil dicabut!", show_alert=True)
-    await admpanel_admins(update, context)
+    await query.edit_message_text(
+        f"✅ Admin <code>{target_id}</code> berhasil dihapus.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_admins")]])
+    )
 
-# =================== MAIN RUNNER PROGRAM ===================
+# =================== MAIN ===================
 
 def main():
     init_pool()
     init_db()
 
-    app = Application.builder().token(TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
+    app = (
+        Application.builder()
+        .token(TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
 
-    # Commands
+    # User commands
     app.add_handler(CommandHandler("start",   start))
-    app.add_handler(CommandHandler("admin",   cmd_admin))
-    app.add_handler(CommandHandler("produk",  cmd_produk))
-    app.add_handler(CommandHandler("aktif",   cmd_aktif))
     app.add_handler(CommandHandler("riwayat", cmd_riwayat))
-    app.add_handler(CommandHandler("stats",   cmd_stats))
-    app.add_handler(CommandHandler("backup",  cmd_backup))
-    app.add_handler(CommandHandler("export",  cmd_export))
+
+    # Admin commands
+    app.add_handler(CommandHandler("admin",       cmd_admin))
+    app.add_handler(CommandHandler("produk",      cmd_produk))
+    app.add_handler(CommandHandler("pending",     admin_pending))
+    app.add_handler(CommandHandler("aktif",       cmd_aktif))
+    app.add_handler(CommandHandler("stats",       cmd_stats))
+    app.add_handler(CommandHandler("blast",       cmd_blast))
+    app.add_handler(CommandHandler("backup",      cmd_backup))
+    app.add_handler(CommandHandler("export",      cmd_export))
     app.add_handler(CommandHandler("import_json", cmd_import_json))
-    app.add_handler(CommandHandler("link",    cmd_link))
-    app.add_handler(CommandHandler("pending", admin_pending))
-    app.add_handler(CommandHandler("blast",   cmd_blast))
+    app.add_handler(CommandHandler("link",        cmd_link))
+    app.add_handler(CommandHandler("ban",         cmd_ban))
+    app.add_handler(CommandHandler("unban",       cmd_unban))
+    app.add_handler(CommandHandler("daftar_ban",  cmd_daftar_ban))
+    app.add_handler(CommandHandler("cari",        cmd_cari))
 
-    # User Callbacks
-    app.add_handler(CallbackQueryHandler(buy_callback,       pattern="^buy$"))
-    app.add_handler(CallbackQueryHandler(pilih_paket,       pattern="^pilih_"))
-    app.add_handler(CallbackQueryHandler(back_start,        pattern="^back_start$"))
-    app.add_handler(CallbackQueryHandler(ganti_paket_list,  pattern="^ganti_paket_list$"))
-    app.add_handler(CallbackQueryHandler(ganti_paket_konfirm, pattern="^ganti_paket_konfirm|"))
-    app.add_handler(CallbackQueryHandler(ganti_paket_exec,  pattern="^ganti_paket_exec|"))
-    app.add_handler(CallbackQueryHandler(ganti_paket_batal, pattern="^ganti_paket_batal$"))
+    # User callbacks
+    app.add_handler(CallbackQueryHandler(buy_callback,         pattern="^buy$"))
+    app.add_handler(CallbackQueryHandler(pilih_paket,          pattern="^pilih_"))
+    app.add_handler(CallbackQueryHandler(back_start,           pattern="^back_start$"))
+    app.add_handler(CallbackQueryHandler(ganti_paket_list,     pattern="^ganti_paket_list$"))
+    app.add_handler(CallbackQueryHandler(ganti_paket_konfirm,  pattern="^ganti_paket_konfirm\\|"))
+    app.add_handler(CallbackQueryHandler(ganti_paket_exec,     pattern="^ganti_paket_exec\\|"))
+    app.add_handler(CallbackQueryHandler(ganti_paket_batal,    pattern="^ganti_paket_batal$"))
 
-    # Testimonial Flow Callbacks
-    app.add_handler(CallbackQueryHandler(handle_rate_start,     pattern="^rate_start|"))
-    app.add_handler(CallbackQueryHandler(handle_rate_val,       pattern="^rate_val|"))
-    app.add_handler(CallbackQueryHandler(handle_rate_text_skip, pattern="^rate_text_skip|"))
-    app.add_handler(CallbackQueryHandler(handle_rate_skip,      pattern="^rate_skip$"))
-    app.add_handler(CallbackQueryHandler(handle_rate_back,      pattern="^rate_back|"))
-    app.add_handler(CallbackQueryHandler(handle_rate_back_stars,pattern="^rate_back_stars|"))
+    # Kirim ulang link
+    app.add_handler(CallbackQueryHandler(resend_group_link, pattern="^resendlink\\|"))
 
-    # Testimonial Moderation Callbacks (Admin)
-    app.add_handler(CallbackQueryHandler(admin_testi_approve, pattern="^adm_testi_approve|"))
-    app.add_handler(CallbackQueryHandler(admin_testi_reject,  pattern="^adm_testi_reject|"))
+    # Testimoni user callbacks
+    app.add_handler(CallbackQueryHandler(handle_rate_start,      pattern="^rate_start\\|"))
+    app.add_handler(CallbackQueryHandler(handle_rate_val,        pattern="^rate_val\\|"))
+    app.add_handler(CallbackQueryHandler(handle_rate_text_skip,  pattern="^rate_text_skip\\|"))
+    app.add_handler(CallbackQueryHandler(handle_rate_skip,       pattern="^rate_skip$"))
+    app.add_handler(CallbackQueryHandler(handle_rate_back,       pattern="^rate_back\\|"))
+    app.add_handler(CallbackQueryHandler(handle_rate_back_stars, pattern="^rate_back_stars\\|"))
 
-    # Admin Panel Navigation Callbacks
-    app.add_handler(CallbackQueryHandler(admpanel_back,     pattern="^admpanel_back$"))
-    app.add_handler(CallbackQueryHandler(admpanel_produk,   pattern="^admpanel_produk$"))
-    app.add_handler(CallbackQueryHandler(admpanel_orders,   pattern="^admpanel_orders$"))
-    app.add_handler(CallbackQueryHandler(admpanel_stats,    pattern="^admpanel_stats$"))
-    app.add_handler(CallbackQueryHandler(admpanel_blast,    pattern="^admpanel_blast$"))
-    app.add_handler(CallbackQueryHandler(admpanel_data,     pattern="^admpanel_data$"))
-    app.add_handler(CallbackQueryHandler(admpanel_user,     pattern="^admpanel_user$"))
-    app.add_handler(CallbackQueryHandler(admpanel_kick,     pattern="^admpanel_kick$"))
-    app.add_handler(CallbackQueryHandler(admpanel_setting,  pattern="^admpanel_setting$"))
+    # Admin kirim link setelah prerequisite terpenuhi
+    app.add_handler(CallbackQueryHandler(admin_kirim_link_prereq, pattern="^admin_kirim_link_prereq\\|"))
 
-    # Admin Order Action Callbacks
-    app.add_handler(CallbackQueryHandler(admpanel_orders_aktif,   pattern="^admpanel_orders_aktif$"))
-    app.add_handler(CallbackQueryHandler(admpanel_orders_pending, pattern="^admpanel_orders_pending$"))
-    app.add_handler(CallbackQueryHandler(admpanel_orders_cari,    pattern="^admpanel_orders_cari$"))
-    app.add_handler(CallbackQueryHandler(admin_proses_order,      pattern="^proses_"))
-    app.add_handler(CallbackQueryHandler(back_orders,             pattern="^back_orders$"))
-    app.add_handler(CallbackQueryHandler(admin_konfirmasi,        pattern="^(confirm|reject)_"))
-    app.add_handler(CallbackQueryHandler(admin_manual_confirm,    pattern="^adm_konfirm|"))
-    app.add_handler(CallbackQueryHandler(admin_cancel_order,      pattern="^adm_cancel|"))
-    app.add_handler(CallbackQueryHandler(admin_kirim_link_prereq, pattern="^admin_kirim_link_prereq|"))
+    # Admin ulasan moderasi
+    app.add_handler(CallbackQueryHandler(admin_testi_approve, pattern="^adm_testi_approve\\|"))
+    app.add_handler(CallbackQueryHandler(admin_testi_reject,  pattern="^adm_testi_reject\\|"))
 
-    # Admin Product Callbacks
-    app.add_handler(CallbackQueryHandler(pd_back,                pattern="^pd_back$"))
-    app.add_handler(CallbackQueryHandler(produk_detail,          pattern="^pd_detail_"))
-    app.add_handler(CallbackQueryHandler(produk_edit_field,      pattern="^pd_edit_"))
-    app.add_handler(CallbackQueryHandler(produk_toggle_aktif,    pattern="^pd_toggle_"))
-    app.add_handler(CallbackQueryHandler(produk_hapus_confirm,   pattern="^pd_hapus_"))
-    app.add_handler(CallbackQueryHandler(produk_hapus_exec,      pattern="^pd_hapus_ok_"))
-    app.add_handler(CallbackQueryHandler(produk_tambah_start,    pattern="^pd_tambah$"))
-    app.add_handler(CallbackQueryHandler(produk_tambah_batal,    pattern="^pd_tambah_batal$"))
-    app.add_handler(CallbackQueryHandler(pd_req_toggle,          pattern="^pd_req_toggle|"))
-    app.add_handler(CallbackQueryHandler(pd_req_clear,           pattern="^pd_req_clear|"))
-    app.add_handler(CallbackQueryHandler(pd_req_save,            pattern="^pd_req_save|"))
+    # Produk management
+    app.add_handler(CallbackQueryHandler(produk_detail,        pattern="^pd_detail_"))
+    app.add_handler(CallbackQueryHandler(produk_edit_field,    pattern="^pd_edit_"))
+    app.add_handler(CallbackQueryHandler(produk_toggle_aktif,  pattern="^pd_toggle_"))
+    app.add_handler(CallbackQueryHandler(produk_hapus_confirm, pattern="^pd_hapus_(?!ok_)"))
+    app.add_handler(CallbackQueryHandler(produk_hapus_exec,    pattern="^pd_hapus_ok_"))
+    app.add_handler(CallbackQueryHandler(produk_tambah_start,  pattern="^pd_tambah$"))
+    app.add_handler(CallbackQueryHandler(produk_tambah_batal,  pattern="^pd_tambah_batal$"))
+    app.add_handler(CallbackQueryHandler(pd_back,              pattern="^pd_back$"))
 
-    # Admin Backup & Import Callbacks
-    app.add_handler(CallbackQueryHandler(admpanel_data_backup, pattern="^admpanel_data_backup$"))
-    app.add_handler(CallbackQueryHandler(admpanel_data_export, pattern="^admpanel_data_export$"))
-    app.add_handler(CallbackQueryHandler(admpanel_data_import, pattern="^admpanel_data_import$"))
-    app.add_handler(CallbackQueryHandler(admpanel_data_link,   pattern="^admpanel_data_link$"))
+    # Admin order callbacks
+    app.add_handler(CallbackQueryHandler(admin_proses_order,   pattern="^proses_"))
+    app.add_handler(CallbackQueryHandler(admin_konfirmasi,     pattern="^(confirm|reject)_"))
+    app.add_handler(CallbackQueryHandler(back_orders,          pattern="^back_orders$"))
+    app.add_handler(CallbackQueryHandler(admin_cancel_order,   pattern="^adm_cancel\\|"))
+    app.add_handler(CallbackQueryHandler(admin_manual_confirm, pattern="^adm_konfirm\\|"))
 
-    # Admin Settings Callbacks
-    app.add_handler(CallbackQueryHandler(admpanel_setting_notif,      pattern="^admpanel_setting_notif$"))
-    app.add_handler(CallbackQueryHandler(admpanel_setting_testi,      pattern="^admpanel_setting_testi$"))
-    app.add_handler(CallbackQueryHandler(admpanel_setting_mt,         pattern="^admpanel_setting_mt$"))
-    app.add_handler(CallbackQueryHandler(admpanel_setting_link_testi, pattern="^admpanel_setting_link_testi$"))
-    app.add_handler(CallbackQueryHandler(admpanel_setting_link_admin, pattern="^admpanel_setting_link_admin$"))
+    # Admin panel callbacks
+    app.add_handler(CallbackQueryHandler(admpanel_back,            pattern="^admpanel_back$"))
+    app.add_handler(CallbackQueryHandler(admpanel_produk,          pattern="^admpanel_produk$"))
+    app.add_handler(CallbackQueryHandler(admpanel_orders,          pattern="^admpanel_orders$"))
+    app.add_handler(CallbackQueryHandler(admpanel_orders_aktif,    pattern="^admpanel_orders_aktif$"))
+    app.add_handler(CallbackQueryHandler(admpanel_orders_pending,  pattern="^admpanel_orders_pending$"))
+    app.add_handler(CallbackQueryHandler(admpanel_orders_cari,     pattern="^admpanel_orders_cari$"))
+    app.add_handler(CallbackQueryHandler(admpanel_stats,           pattern="^admpanel_stats$"))
+    app.add_handler(CallbackQueryHandler(admpanel_blast,           pattern="^admpanel_blast$"))
+    app.add_handler(CallbackQueryHandler(admpanel_data,            pattern="^admpanel_data$"))
+    app.add_handler(CallbackQueryHandler(admpanel_data_backup,     pattern="^admpanel_data_backup$"))
+    app.add_handler(CallbackQueryHandler(admpanel_data_export,     pattern="^admpanel_data_export$"))
+    app.add_handler(CallbackQueryHandler(admpanel_data_import,     pattern="^admpanel_data_import$"))
+    app.add_handler(CallbackQueryHandler(admpanel_data_link,       pattern="^admpanel_data_link$"))
+    app.add_handler(CallbackQueryHandler(admpanel_user,            pattern="^admpanel_user$"))
+    app.add_handler(CallbackQueryHandler(admpanel_user_ban,        pattern="^admpanel_user_ban$"))
+    app.add_handler(CallbackQueryHandler(admpanel_user_unban,      pattern="^admpanel_user_unban$"))
+    app.add_handler(CallbackQueryHandler(admpanel_user_daftar,     pattern="^admpanel_user_daftar$"))
+
+    # Kick feature callbacks
+    app.add_handler(CallbackQueryHandler(admpanel_kick,    pattern="^admpanel_kick$"))
+    app.add_handler(CallbackQueryHandler(kick_cek_user,    pattern="^kick_cek_user$"))
+    app.add_handler(CallbackQueryHandler(kick_select_user, pattern="^kick_select\\|"))
+    app.add_handler(CallbackQueryHandler(kick_one,         pattern="^kick_one\\|"))
+    app.add_handler(CallbackQueryHandler(pd_req_toggle,    pattern="^pd_req_toggle\\|"))
+    app.add_handler(CallbackQueryHandler(pd_req_save,      pattern="^pd_req_save\\|"))
+    app.add_handler(CallbackQueryHandler(pd_req_clear,     pattern="^pd_req_clear\\|"))
+    app.add_handler(CallbackQueryHandler(kick_add_group,   pattern="^kick_add_group$"))
+    app.add_handler(CallbackQueryHandler(kick_del_group,   pattern="^kick_del_group$"))
+    app.add_handler(CallbackQueryHandler(kick_del_confirm, pattern="^kick_del_confirm\\|"))
+    app.add_handler(CallbackQueryHandler(kick_do_kick,     pattern="^kick_do_kick\\|"))
+
+    # Pengaturan callbacks
+    app.add_handler(CallbackQueryHandler(admpanel_setting,              pattern="^admpanel_setting$"))
+    app.add_handler(CallbackQueryHandler(admpanel_setting_channel_set,  pattern="^admpanel_setting_channel_set$"))
+    app.add_handler(CallbackQueryHandler(admpanel_setting_channel_off,  pattern="^admpanel_setting_channel_off$"))
+    app.add_handler(CallbackQueryHandler(admpanel_setting_testich_set,  pattern="^admpanel_setting_testich_set$"))
+    app.add_handler(CallbackQueryHandler(admpanel_setting_testich_off,  pattern="^admpanel_setting_testich_off$"))
+    app.add_handler(CallbackQueryHandler(admpanel_setting_channel_test, pattern="^admpanel_setting_channel_test$"))
+    app.add_handler(CallbackQueryHandler(admpanel_setting_maintenance,  pattern="^admpanel_setting_maintenance$"))
+    app.add_handler(CallbackQueryHandler(admpanel_setting_link_testi,   pattern="^admpanel_setting_link_testi$"))
+    app.add_handler(CallbackQueryHandler(admpanel_setting_link_admin,   pattern="^admpanel_setting_link_admin$"))
 
     # Admin management (super admin only)
     app.add_handler(CallbackQueryHandler(admpanel_admins,       pattern="^admpanel_admins$"))
     app.add_handler(CallbackQueryHandler(admpanel_admin_add,    pattern="^admpanel_admin_add$"))
     app.add_handler(CallbackQueryHandler(admpanel_admin_remove, pattern="^admpanel_admin_remove$"))
     app.add_handler(CallbackQueryHandler(admpanel_admin_del,    pattern="^admpanel_admin_del_"))
-
-    # Kick Management Callbacks
-    app.add_handler(CallbackQueryHandler(kick_cek_user,    pattern="^kick_cek_user$"))
-    app.add_handler(CallbackQueryHandler(kick_tambah_grup, pattern="^kick_tambah_grup$"))
-    app.add_handler(CallbackQueryHandler(kick_select,      pattern="^kick_select|"))
-    app.add_handler(CallbackQueryHandler(kick_execute,     pattern="^kick_execute|"))
 
     # Blast callbacks
     app.add_handler(CallbackQueryHandler(blast_batal,   pattern="^blast_batal$"))
@@ -5939,13 +6303,12 @@ def main():
 
     # General Message Handler
     app.add_handler(MessageHandler(
-        (filters.TEXT | filters.FORWARDED) & filters.ChatType.PRIVATE,
+        (filters.TEXT | filters.FORWARDED) & ~filters.COMMAND & filters.ChatType.PRIVATE,
         message_handler
     ))
 
-    # Start bot
-    logger.info("Bot starting...")
+    logger.info("Bot berjalan...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

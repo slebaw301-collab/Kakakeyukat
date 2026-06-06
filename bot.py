@@ -71,6 +71,7 @@ PAKASIR_API_KEY = os.environ.get("PAKASIR_API_KEY")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 PAKASIR_WEBHOOK_SECRET = os.environ.get("PAKASIR_WEBHOOK_SECRET", "")
 WEBAPP_URL = os.environ.get("WEBAPP_URL", "")
+ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "")
 
 PAKASIR_SLUG = "atkikukkvd"
 PAKASIR_BASE_URL = "https://app.pakasir.com"
@@ -1484,17 +1485,30 @@ async def pakasir_webhook_handler(request: aio_web.Request) -> aio_web.Response:
     _stop_payment_task(user_id)
 
     if _current_bot:
-        asyncio.create_task(
+        def _on_payment_done(task, _oid=order_id):
+            try:
+                exc = task.exception()
+                if exc:
+                    logger.error(
+                        f"[WEBHOOK] 🚨 _handle_payment_success CRASH untuk order {_oid}: {exc}",
+                        exc_info=exc
+                    )
+            except asyncio.CancelledError:
+                pass
+        task = asyncio.create_task(
             _handle_payment_success(
                 _current_bot, order_id, paket_id, user_id, user_name,
                 paket['harga'], {'amount': amount, 'status': 'completed'}
             )
         )
+        task.add_done_callback(_on_payment_done)
 
     logger.info(f"[WEBHOOK] ✅ Webhook sukses diverifikasi & diproses: {order_id}")
     return aio_web.Response(text='ok')
 
 _webhook_runner = None
+
+# =================== ADMIN DASHBOARD HANDLER ===================
 
 async def admin_dashboard_handler(request: aio_web.Request) -> aio_web.Response:
     import os as _os
@@ -1502,9 +1516,422 @@ async def admin_dashboard_handler(request: aio_web.Request) -> aio_web.Response:
     try:
         with open(html_path, 'r', encoding='utf-8') as f:
             content = f.read()
+        content = content.replace('__ADMIN_API_KEY__', ADMIN_API_KEY)
         return aio_web.Response(text=content, content_type='text/html', charset='utf-8')
     except FileNotFoundError:
         return aio_web.Response(status=404, text='admin.html tidak ditemukan di direktori bot.')
+
+# =================== ADMIN REST API HANDLERS ===================
+
+def _validate_tma_initdata(init_data: str) -> bool:
+    """Validasi initData dari Telegram Mini App menggunakan HMAC-SHA256."""
+    try:
+        import hashlib as _hashlib, hmac as _hmac, urllib.parse as _urlparse
+        params = dict(_urlparse.parse_qsl(init_data, keep_blank_values=True))
+        hash_val = params.pop('hash', None)
+        if not hash_val or not TOKEN:
+            return False
+        # user harus ada di params dan harus merupakan admin
+        user_raw = params.get('user', '')
+        if user_raw:
+            import json as _json
+            user_obj = _json.loads(user_raw)
+            uid = int(user_obj.get('id', 0))
+            # Validasi bahwa user ini admin (sync check via DB langsung)
+            conn = get_conn()
+            try:
+                with conn.cursor() as c:
+                    c.execute("SELECT 1 FROM admins WHERE user_id=%s", (uid,))
+                    is_adm = c.fetchone() is not None or uid == ADMIN_ID
+            finally:
+                release_conn(conn)
+            if not is_adm:
+                return False
+        data_check = '\n'.join(f"{k}={v}" for k, v in sorted(params.items()))
+        secret_key = _hmac.new(key=b"WebAppData", msg=TOKEN.encode(), digestmod=_hashlib.sha256).digest()
+        computed   = _hmac.new(key=secret_key, msg=data_check.encode(), digestmod=_hashlib.sha256).hexdigest()
+        return _hmac.compare_digest(computed, hash_val)
+    except Exception as e:
+        logger.warning(f"[TMA_AUTH] initData validation error: {e}")
+        return False
+
+def _check_admin_auth(request: aio_web.Request) -> bool:
+    auth      = request.headers.get("Authorization", "")
+    key_param = request.rel_url.query.get("key", "")
+
+    # 1. Bearer token (ADMIN_API_KEY dari browser)
+    if ADMIN_API_KEY and (auth == f"Bearer {ADMIN_API_KEY}" or key_param == ADMIN_API_KEY):
+        return True
+
+    # 2. Telegram Mini App initData
+    if auth.startswith("tma "):
+        return _validate_tma_initdata(auth[4:])
+
+    return False
+
+def _json_resp(data, status: int = 200) -> aio_web.Response:
+    return aio_web.Response(
+        text=json.dumps(data, default=str),
+        content_type="application/json",
+        status=status
+    )
+
+async def api_stats(request: aio_web.Request) -> aio_web.Response:
+    if not _check_admin_auth(request):
+        return _json_resp({"error": "unauthorized"}, 401)
+    today = now_wib().replace(hour=0, minute=0, second=0, microsecond=0)
+    month = today.replace(day=1)
+    stats = await get_order_stats(today, month)
+    return _json_resp(stats)
+
+async def api_get_products(request: aio_web.Request) -> aio_web.Response:
+    if not _check_admin_auth(request):
+        return _json_resp({"error": "unauthorized"}, 401)
+    products = await get_all_products()
+    return _json_resp(products)
+
+async def api_add_product(request: aio_web.Request) -> aio_web.Response:
+    if not _check_admin_auth(request):
+        return _json_resp({"error": "unauthorized"}, 401)
+    try:
+        data = await request.json()
+    except Exception:
+        return _json_resp({"error": "invalid json"}, 400)
+    paket_id = (data.get("paket_id") or "").strip()
+    nama = (data.get("nama") or "").strip()
+    emoji = (data.get("emoji") or "📦").strip()
+    deskripsi = (data.get("deskripsi") or "").strip()
+    harga = int(data.get("harga") or 0)
+    link = data.get("link") or DEFAULT_LINK
+    group_chat_id = data.get("group_chat_id") or None
+    requires = data.get("requires_paket_ids") or None
+    if not paket_id or not nama or not harga:
+        return _json_resp({"error": "paket_id, nama, harga wajib diisi"}, 400)
+    await add_product(paket_id, nama, emoji, deskripsi, harga, link, group_chat_id)
+    if requires is not None:
+        await update_product_field(paket_id, "requires_paket_ids", requires or None)
+    return _json_resp({"ok": True})
+
+async def api_update_product(request: aio_web.Request) -> aio_web.Response:
+    if not _check_admin_auth(request):
+        return _json_resp({"error": "unauthorized"}, 401)
+    paket_id = request.match_info["paket_id"]
+    try:
+        data = await request.json()
+    except Exception:
+        return _json_resp({"error": "invalid json"}, 400)
+    allowed = {"nama", "emoji", "deskripsi", "harga", "link", "group_chat_id", "aktif", "requires_paket_ids"}
+    for field, value in data.items():
+        if field in allowed:
+            await update_product_field(paket_id, field, value if value != "" else None)
+    return _json_resp({"ok": True})
+
+async def api_delete_product(request: aio_web.Request) -> aio_web.Response:
+    if not _check_admin_auth(request):
+        return _json_resp({"error": "unauthorized"}, 401)
+    paket_id = request.match_info["paket_id"]
+    await delete_product(paket_id)
+    return _json_resp({"ok": True})
+
+async def api_get_orders(request: aio_web.Request) -> aio_web.Response:
+    if not _check_admin_auth(request):
+        return _json_resp({"error": "unauthorized"}, 401)
+    status_filter = request.rel_url.query.get("status", "")
+    search = request.rel_url.query.get("q", "")
+
+    def _fetch():
+        conn = get_conn()
+        try:
+            with conn.cursor() as c:
+                qry = """
+                    SELECT o.*, p.nama as paket_nama, p.emoji as paket_emoji
+                    FROM orders o
+                    LEFT JOIN products p ON o.paket_id = p.paket_id
+                    WHERE 1=1
+                """
+                params = []
+                if status_filter == "cancelled":
+                    qry += " AND o.status IN ('cancelled','expired')"
+                elif status_filter:
+                    qry += " AND o.status = %s"
+                    params.append(status_filter)
+                if search:
+                    qry += " AND (o.order_id ILIKE %s OR o.user_name ILIKE %s OR o.user_id::text = %s)"
+                    params += [f"%{search}%", f"%{search}%", search]
+                qry += " ORDER BY o.id DESC LIMIT 300"
+                c.execute(qry, params)
+                return [dict(r) for r in c.fetchall()]
+        finally:
+            release_conn(conn)
+
+    result = await asyncio.to_thread(_fetch)
+    return _json_resp(result)
+
+async def api_confirm_order(request: aio_web.Request) -> aio_web.Response:
+    if not _check_admin_auth(request):
+        return _json_resp({"error": "unauthorized"}, 401)
+    order_id = request.match_info["order_id"]
+    order = await get_order_by_id(order_id)
+    if not order:
+        return _json_resp({"error": "order tidak ditemukan"}, 404)
+    success = await mark_order_completed(order_id)
+    if success and _current_bot:
+        paket = await get_product(order["paket_id"])
+        if paket:
+            def _cb(t, _oid=order_id):
+                try:
+                    exc = t.exception()
+                    if exc:
+                        logger.error(f"[API_CONFIRM] _handle_payment_success error {_oid}: {exc}")
+                except asyncio.CancelledError:
+                    pass
+            t = asyncio.create_task(_handle_payment_success(
+                _current_bot, order_id, order["paket_id"],
+                order["user_id"], order.get("user_name", ""),
+                order.get("harga_dibayar", 0),
+                {"amount": order.get("harga_dibayar", 0), "status": "completed"}
+            ))
+            t.add_done_callback(_cb)
+    return _json_resp({"ok": True, "was_new": success})
+
+async def api_cancel_order(request: aio_web.Request) -> aio_web.Response:
+    if not _check_admin_auth(request):
+        return _json_resp({"error": "unauthorized"}, 401)
+    order_id = request.match_info["order_id"]
+    order = await get_order_by_id(order_id)
+    if not order:
+        return _json_resp({"error": "order tidak ditemukan"}, 404)
+    amount = order.get("harga_dibayar", 0)
+    if amount:
+        await cancel_transaction(order_id, amount)
+    await update_order_status(order_id, "cancelled")
+    _stop_payment_task(order["user_id"])
+    return _json_resp({"ok": True})
+
+async def api_get_testimonials(request: aio_web.Request) -> aio_web.Response:
+    if not _check_admin_auth(request):
+        return _json_resp({"error": "unauthorized"}, 401)
+
+    def _fetch():
+        conn = get_conn()
+        try:
+            with conn.cursor() as c:
+                c.execute("SELECT * FROM testimonials ORDER BY id DESC LIMIT 100")
+                return [dict(r) for r in c.fetchall()]
+        finally:
+            release_conn(conn)
+
+    result = await asyncio.to_thread(_fetch)
+    return _json_resp(result)
+
+async def api_testimonial_action(request: aio_web.Request) -> aio_web.Response:
+    if not _check_admin_auth(request):
+        return _json_resp({"error": "unauthorized"}, 401)
+    order_id = request.match_info["order_id"]
+    try:
+        data = await request.json()
+    except Exception:
+        return _json_resp({"error": "invalid json"}, 400)
+    action = data.get("action")
+    if action not in ("approve", "reject"):
+        return _json_resp({"error": "action harus 'approve' atau 'reject'"}, 400)
+    status = "approved" if action == "approve" else "rejected"
+    await update_testimonial_status(order_id, status)
+    return _json_resp({"ok": True})
+
+async def api_get_banned(request: aio_web.Request) -> aio_web.Response:
+    if not _check_admin_auth(request):
+        return _json_resp({"error": "unauthorized"}, 401)
+    banned = await get_all_banned()
+    return _json_resp(banned)
+
+async def api_ban_user(request: aio_web.Request) -> aio_web.Response:
+    if not _check_admin_auth(request):
+        return _json_resp({"error": "unauthorized"}, 401)
+    try:
+        data = await request.json()
+    except Exception:
+        return _json_resp({"error": "invalid json"}, 400)
+    try:
+        uid = int(data.get("user_id", 0))
+    except (ValueError, TypeError):
+        return _json_resp({"error": "user_id harus angka"}, 400)
+    if not uid:
+        return _json_resp({"error": "user_id wajib diisi"}, 400)
+    reason = data.get("reason", "")
+    await ban_user(uid, reason)
+    return _json_resp({"ok": True})
+
+async def api_unban_user(request: aio_web.Request) -> aio_web.Response:
+    if not _check_admin_auth(request):
+        return _json_resp({"error": "unauthorized"}, 401)
+    try:
+        uid = int(request.match_info["user_id"])
+    except (ValueError, KeyError):
+        return _json_resp({"error": "user_id tidak valid"}, 400)
+    await unban_user(uid)
+    return _json_resp({"ok": True})
+
+async def api_get_admins(request: aio_web.Request) -> aio_web.Response:
+    if not _check_admin_auth(request):
+        return _json_resp({"error": "unauthorized"}, 401)
+    admins = await get_all_admins()
+    return _json_resp(admins)
+
+async def api_add_admin(request: aio_web.Request) -> aio_web.Response:
+    if not _check_admin_auth(request):
+        return _json_resp({"error": "unauthorized"}, 401)
+    try:
+        data = await request.json()
+    except Exception:
+        return _json_resp({"error": "invalid json"}, 400)
+    try:
+        uid = int(data.get("user_id", 0))
+    except (ValueError, TypeError):
+        return _json_resp({"error": "user_id harus angka"}, 400)
+    if not uid:
+        return _json_resp({"error": "user_id wajib diisi"}, 400)
+    nama = (data.get("nama") or "").strip()
+    await add_admin(uid, nama, ADMIN_ID)
+    return _json_resp({"ok": True})
+
+async def api_remove_admin(request: aio_web.Request) -> aio_web.Response:
+    if not _check_admin_auth(request):
+        return _json_resp({"error": "unauthorized"}, 401)
+    try:
+        uid = int(request.match_info["user_id"])
+    except (ValueError, KeyError):
+        return _json_resp({"error": "user_id tidak valid"}, 400)
+    await remove_admin(uid)
+    return _json_resp({"ok": True})
+
+async def api_get_settings(request: aio_web.Request) -> aio_web.Response:
+    if not _check_admin_auth(request):
+        return _json_resp({"error": "unauthorized"}, 401)
+    keys = ["link_testimoni", "link_admin", "notif_channel_id", "testimoni_channel_id", "maintenance"]
+    result = {}
+    for k in keys:
+        result[k] = await get_setting(k, "")
+    return _json_resp(result)
+
+async def api_save_settings(request: aio_web.Request) -> aio_web.Response:
+    if not _check_admin_auth(request):
+        return _json_resp({"error": "unauthorized"}, 401)
+    try:
+        data = await request.json()
+    except Exception:
+        return _json_resp({"error": "invalid json"}, 400)
+    allowed = {"link_testimoni", "link_admin", "notif_channel_id", "testimoni_channel_id", "maintenance"}
+    for k, v in data.items():
+        if k in allowed:
+            await set_setting(k, v if v else None)
+    return _json_resp({"ok": True})
+
+async def api_broadcast(request: aio_web.Request) -> aio_web.Response:
+    if not _check_admin_auth(request):
+        return _json_resp({"error": "unauthorized"}, 401)
+    try:
+        data = await request.json()
+    except Exception:
+        return _json_resp({"error": "invalid json"}, 400)
+    text = (data.get("text") or "").strip()
+    if not text:
+        return _json_resp({"error": "text wajib diisi"}, 400)
+    if not _current_bot:
+        return _json_resp({"error": "bot belum siap"}, 503)
+    buyers = await get_all_buyers()
+
+    async def _do_broadcast():
+        sent = 0
+        failed = 0
+        for buyer in buyers:
+            try:
+                await _current_bot.send_message(
+                    chat_id=buyer["user_id"], text=text, parse_mode="HTML"
+                )
+                sent += 1
+                await asyncio.sleep(0.05)
+            except Exception:
+                failed += 1
+        logger.info(f"[API_BROADCAST] Selesai: {sent} terkirim, {failed} gagal dari {len(buyers)} buyer")
+
+    asyncio.create_task(_do_broadcast())
+    return _json_resp({"ok": True, "total_buyers": len(buyers)})
+
+async def api_backup_json(request: aio_web.Request) -> aio_web.Response:
+    if not _check_admin_auth(request):
+        return _json_resp({"error": "unauthorized"}, 401)
+    products = await get_all_products()
+    banned = await get_all_banned()
+    admins = await get_all_admins()
+
+    def _fetch():
+        conn = get_conn()
+        try:
+            with conn.cursor() as c:
+                c.execute("SELECT * FROM orders ORDER BY id DESC LIMIT 5000")
+                orders = [dict(r) for r in c.fetchall()]
+                c.execute("SELECT * FROM testimonials ORDER BY id DESC")
+                testi = [dict(r) for r in c.fetchall()]
+                return orders, testi
+        finally:
+            release_conn(conn)
+
+    orders, testi = await asyncio.to_thread(_fetch)
+    payload = {
+        "exported_at": now_wib().isoformat(),
+        "products": products,
+        "orders": orders,
+        "testimonials": testi,
+        "banned_users": banned,
+        "admins": admins,
+    }
+    fname = f"backup_{now_wib().strftime('%Y%m%d_%H%M%S')}.json"
+    return aio_web.Response(
+        text=json.dumps(payload, default=str, indent=2),
+        content_type="application/json",
+        headers={"Content-Disposition": f"attachment; filename={fname}"}
+    )
+
+async def api_send_link(request: aio_web.Request) -> aio_web.Response:
+    """Admin kirim link produk manual ke buyer via API."""
+    if not _check_admin_auth(request):
+        return _json_resp({"error": "unauthorized"}, 401)
+    order_id = request.match_info["order_id"]
+    order = await get_order_by_id(order_id)
+    if not order:
+        return _json_resp({"error": "order tidak ditemukan"}, 404)
+    if order["status"] != "completed":
+        return _json_resp({"error": "order belum completed"}, 400)
+    paket = await get_product(order["paket_id"])
+    if not paket:
+        return _json_resp({"error": "produk tidak ditemukan"}, 404)
+    if not _current_bot:
+        return _json_resp({"error": "bot belum siap"}, 503)
+
+    group_link = await generate_group_link(_current_bot, paket, order_id)
+    link = group_link or (paket.get("link") or DEFAULT_LINK)
+    link_section = _build_link_section(group_link, link)
+    try:
+        await _current_bot.send_message(
+            chat_id=order["user_id"],
+            text=(
+                f"<b>✅ LINK PRODUK KAMU SUDAH SIAP (Admin)</b>\n"
+                f"========================\n\n"
+                f"📦 Paket: {esc(paket['emoji'])} {esc(paket['nama'])}\n"
+                f"🔖 Order ID: <code>{esc(order_id)}</code>\n\n"
+                f"========================\n"
+                f"{link_section}\n\n"
+                f"Terima kasih! 🙏"
+            ),
+            parse_mode="HTML"
+        )
+        await set_sent_link(order_id, link)
+        return _json_resp({"ok": True, "link": link})
+    except Exception as e:
+        return _json_resp({"error": str(e)}, 500)
+
+# =================== WEBHOOK SERVER ===================
 
 async def _start_webhook_server():
     global _webhook_runner
@@ -1513,6 +1940,28 @@ async def _start_webhook_server():
     webhook_app.router.add_get('/health', lambda r: aio_web.Response(text='ok'))
     webhook_app.router.add_get('/admin', admin_dashboard_handler)
     webhook_app.router.add_get('/', lambda r: aio_web.Response(text='Hyper Family Store Bot - OK'))
+
+    webhook_app.router.add_get('/api/stats', api_stats)
+    webhook_app.router.add_get('/api/products', api_get_products)
+    webhook_app.router.add_post('/api/products', api_add_product)
+    webhook_app.router.add_put('/api/products/{paket_id}', api_update_product)
+    webhook_app.router.add_delete('/api/products/{paket_id}', api_delete_product)
+    webhook_app.router.add_get('/api/orders', api_get_orders)
+    webhook_app.router.add_post('/api/orders/{order_id}/confirm', api_confirm_order)
+    webhook_app.router.add_post('/api/orders/{order_id}/cancel', api_cancel_order)
+    webhook_app.router.add_post('/api/orders/{order_id}/send-link', api_send_link)
+    webhook_app.router.add_get('/api/testimonials', api_get_testimonials)
+    webhook_app.router.add_post('/api/testimonials/{order_id}/action', api_testimonial_action)
+    webhook_app.router.add_get('/api/banned', api_get_banned)
+    webhook_app.router.add_post('/api/banned', api_ban_user)
+    webhook_app.router.add_delete('/api/banned/{user_id}', api_unban_user)
+    webhook_app.router.add_get('/api/admins', api_get_admins)
+    webhook_app.router.add_post('/api/admins', api_add_admin)
+    webhook_app.router.add_delete('/api/admins/{user_id}', api_remove_admin)
+    webhook_app.router.add_get('/api/settings', api_get_settings)
+    webhook_app.router.add_post('/api/settings', api_save_settings)
+    webhook_app.router.add_post('/api/broadcast', api_broadcast)
+    webhook_app.router.add_get('/api/backup/json', api_backup_json)
 
     runner = aio_web.AppRunner(webhook_app)
     await runner.setup()
@@ -2152,6 +2601,8 @@ async def ganti_paket_exec(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _stop_payment_task(user_id)
     await hapus_qris_buyer_lama(context.bot, old_order_id, user_id)
     await hapus_notif_lama(context.bot, old_order_id)
+    # Tidak set cooldown di sini karena user langsung buat order baru (ganti paket).
+    # Cooldown akan di-set di back_start ketika user benar-benar membatalkan.
 
     try:
         await query.message.delete()
@@ -5231,7 +5682,10 @@ def build_admin_panel_keyboard(user_id: int = None):
     if user_id and is_super_admin(user_id):
         rows.append([InlineKeyboardButton("👥 Kelola Admin", callback_data="admpanel_admins")])
     if WEBAPP_URL:
-        rows.append([InlineKeyboardButton("🌐 Buka Dashboard Web", web_app=WebAppInfo(url=WEBAPP_URL))])
+        _admin_url = WEBAPP_URL.rstrip('/')
+        if not _admin_url.endswith('/admin'):
+            _admin_url += '/admin'
+        rows.append([InlineKeyboardButton("🌐 Buka Dashboard Web", web_app=WebAppInfo(url=_admin_url))])
     return InlineKeyboardMarkup(rows)
 
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):

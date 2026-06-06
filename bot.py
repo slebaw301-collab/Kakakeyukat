@@ -4896,7 +4896,7 @@ def _get_pending_order_sync(user_id):
     conn = get_conn()
     try:
         with conn.cursor() as c:
-                        c.execute("SELECT * FROM orders WHERE user_id=%s AND status='pending' ORDER BY id DESC LIMIT 1", (user_id,))
+            c.execute("SELECT * FROM orders WHERE user_id=%s AND status='pending' ORDER BY id DESC LIMIT 1", (user_id,))
             return c.fetchone()
     finally:
         release_conn(conn)

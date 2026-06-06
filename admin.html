@@ -1,0 +1,1642 @@
+<!DOCTYPE html>
+<html lang="id" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HyperFamily - Premium Admin Dashboard</title>
+    <!-- Google Fonts Inter -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Chart.js untuk Data Analitik -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+    
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['Inter', 'sans-serif'],
+                        mono: ['JetBrains Mono', 'monospace'],
+                    },
+                    colors: {
+                        neutral: {
+                            950: '#0a0a0a',
+                            900: '#121212',
+                            850: '#1a1a1a',
+                            800: '#262626',
+                            700: '#404040',
+                        },
+                        accent: {
+                            500: '#6366f1',
+                            600: '#4f46e5',
+                            glow: 'rgba(99, 102, 241, 0.15)',
+                        }
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            letter-spacing: -0.01em;
+        }
+        /* Custom premium scrollbar */
+        ::-webkit-scrollbar {
+            width: 4px;
+            height: 4px;
+        }
+        ::-webkit-scrollbar-track {
+            background: #0a0a0a;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #262626;
+            border-radius: 2px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: #4f46e5;
+        }
+    </style>
+</head>
+<body class="bg-neutral-950 text-neutral-100 min-h-screen flex flex-col md:flex-row antialiased selection:bg-accent-600/30">
+
+    <!-- NOTIFIKASI TOAST FLOATING -->
+    <div id="toast-container" class="fixed top-6 right-6 z-50 flex flex-col gap-3 pointer-events-none"></div>
+
+    <!-- SIDEBAR NAVIGASI (MINIMALIS MODERN) -->
+    <aside class="w-full md:w-64 bg-neutral-900 border-b md:border-b-0 md:border-r border-neutral-800 flex flex-col shrink-0">
+        <!-- Logo & Brand Header -->
+        <div class="p-6 border-b border-neutral-800 flex items-center justify-between">
+            <div class="flex items-center gap-3">
+                <div class="w-8 h-8 rounded-lg bg-neutral-100 flex items-center justify-center text-neutral-950 shadow-md">
+                    <i data-lucide="shield-check" class="w-5 h-5"></i>
+                </div>
+                <div>
+                    <h1 class="font-extrabold text-sm tracking-wider uppercase text-neutral-100">HyperFamily</h1>
+                    <span class="text-[10px] text-neutral-500 font-medium tracking-wide">CORE CONTROL v3.0</span>
+                </div>
+            </div>
+            <!-- Indicator Status -->
+            <span class="relative flex h-2 w-2">
+                <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-indigo-400 opacity-75"></span>
+                <span class="relative inline-flex rounded-full h-2 w-2 bg-indigo-500"></span>
+            </span>
+        </div>
+
+        <!-- Menu Links -->
+        <nav class="p-4 flex flex-row md:flex-col gap-1 overflow-x-auto md:overflow-x-visible shrink-0">
+            <button onclick="switchView('view-ringkasan')" id="btn-view-ringkasan" class="nav-btn w-full flex items-center gap-3 px-4 py-3 rounded-lg text-xs font-semibold uppercase tracking-wider text-neutral-100 bg-neutral-800 border border-neutral-700 transition duration-150">
+                <i data-lucide="layout-grid" class="w-4 h-4"></i>
+                <span>Ringkasan</span>
+            </button>
+            <button onclick="switchView('view-produk')" id="btn-view-produk" class="nav-btn w-full flex items-center gap-3 px-4 py-3 rounded-lg text-xs font-semibold uppercase tracking-wider text-neutral-400 hover:text-neutral-100 hover:bg-neutral-850/60 transition duration-150">
+                <i data-lucide="package" class="w-4 h-4"></i>
+                <span>Produk</span>
+            </button>
+            <button onclick="switchView('view-pesanan')" id="btn-view-pesanan" class="nav-btn w-full flex items-center gap-3 px-4 py-3 rounded-lg text-xs font-semibold uppercase tracking-wider text-neutral-400 hover:text-neutral-100 hover:bg-neutral-850/60 transition duration-150">
+                <i data-lucide="banknote" class="w-4 h-4"></i>
+                <span>Pesanan</span>
+            </button>
+            <button onclick="switchView('view-testimoni')" id="btn-view-testimoni" class="nav-btn w-full flex items-center gap-3 px-4 py-3 rounded-lg text-xs font-semibold uppercase tracking-wider text-neutral-400 hover:text-neutral-100 hover:bg-neutral-850/60 transition duration-150 relative">
+                <i data-lucide="heart-handshake" class="w-4 h-4"></i>
+                <span>Testimoni</span>
+                <span id="badge-pending-testi" class="absolute right-3 px-1.5 py-0.5 bg-rose-600/25 border border-rose-500/30 text-rose-400 text-[9px] rounded-full font-bold">1</span>
+            </button>
+            <button onclick="switchView('view-pengguna')" id="btn-view-pengguna" class="nav-btn w-full flex items-center gap-3 px-4 py-3 rounded-lg text-xs font-semibold uppercase tracking-wider text-neutral-400 hover:text-neutral-100 hover:bg-neutral-850/60 transition duration-150">
+                <i data-lucide="users" class="w-4 h-4"></i>
+                <span>Grup & User</span>
+            </button>
+            <button onclick="switchView('view-broadcast')" id="btn-view-broadcast" class="nav-btn w-full flex items-center gap-3 px-4 py-3 rounded-lg text-xs font-semibold uppercase tracking-wider text-neutral-400 hover:text-neutral-100 hover:bg-neutral-850/60 transition duration-150">
+                <i data-lucide="send" class="w-4 h-4"></i>
+                <span>Broadcast</span>
+            </button>
+            <button onclick="switchView('view-backup')" id="btn-view-backup" class="nav-btn w-full flex items-center gap-3 px-4 py-3 rounded-lg text-xs font-semibold uppercase tracking-wider text-neutral-400 hover:text-neutral-100 hover:bg-neutral-850/60 transition duration-150">
+                <i data-lucide="database" class="w-4 h-4"></i>
+                <span>Database</span>
+            </button>
+            <button onclick="switchView('view-admin')" id="btn-view-admin" class="nav-btn w-full flex items-center gap-3 px-4 py-3 rounded-lg text-xs font-semibold uppercase tracking-wider text-neutral-400 hover:text-neutral-100 hover:bg-neutral-850/60 transition duration-150">
+                <i data-lucide="fingerprint" class="w-4 h-4"></i>
+                <span>Tim Admin</span>
+            </button>
+            <button onclick="switchView('view-pengaturan')" id="btn-view-pengaturan" class="nav-btn w-full flex items-center gap-3 px-4 py-3 rounded-lg text-xs font-semibold uppercase tracking-wider text-neutral-400 hover:text-neutral-100 hover:bg-neutral-850/60 transition duration-150">
+                <i data-lucide="sliders" class="w-4 h-4"></i>
+                <span>Konfigurasi</span>
+            </button>
+        </nav>
+
+        <!-- Footer Workspace -->
+        <div class="mt-auto p-4 hidden md:block border-t border-neutral-800 text-[11px] text-neutral-500">
+            <p>Database: PostgreSQL</p>
+            <p class="mt-0.5">Connection Pool: 50 Maks</p>
+        </div>
+    </aside>
+
+    <!-- CONTENT WRAPPER -->
+    <main class="flex-1 p-6 md:p-10 overflow-y-auto max-w-full">
+        <!-- TOP HEADER STATS -->
+        <header class="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 mb-10 border-b border-neutral-850 pb-6">
+            <div>
+                <h2 id="view-title" class="text-xl font-bold tracking-tight text-white">Ringkasan Eksekutif</h2>
+                <p id="view-desc" class="text-xs text-neutral-400 mt-1">Status dan metrik performa toko HyperFamily Anda hari ini.</p>
+            </div>
+            <div class="flex items-center gap-3">
+                <button onclick="syncSimulatedData()" class="px-4 py-2 border border-neutral-800 hover:border-neutral-700 hover:bg-neutral-900 text-xs font-semibold tracking-wider uppercase rounded-lg transition duration-150 flex items-center gap-2">
+                    <i data-lucide="refresh-cw" class="w-3.5 h-3.5 animate-spin"></i> Sync Transaksi
+                </button>
+            </div>
+        </header>
+
+        <!-- ================= VIEW 1: RINGKASAN ================= -->
+        <section id="view-ringkasan" class="space-y-8 block">
+            
+            <!-- SEKTOR 1: METRIK FINANSIAL UTAMA -->
+            <div class="space-y-4">
+                <h4 class="text-xs font-bold uppercase tracking-wider text-neutral-500 flex items-center gap-2">
+                    <i data-lucide="coins" class="w-4 h-4"></i> Metrik Finansial Utama
+                </h4>
+                <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
+                    <!-- Card: Omzet Hari Ini (Baru!) -->
+                    <div class="bg-neutral-900 border border-neutral-850 rounded-xl p-6 flex items-center justify-between relative overflow-hidden group">
+                        <div class="absolute inset-0 bg-indigo-500/[0.02] pointer-events-none"></div>
+                        <div class="space-y-2 z-10">
+                            <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-500">Omzet Hari Ini</span>
+                            <h3 id="stat-omzet-hari-ini" class="text-xl font-bold font-mono text-white">Rp 0</h3>
+                            <p class="text-[10px] text-emerald-400 flex items-center gap-1 font-semibold">
+                                <span class="px-1.5 py-0.5 bg-emerald-500/10 border border-emerald-500/20 rounded text-[9px]">Live Track</span> 100% otomatis
+                            </p>
+                        </div>
+                        <div class="w-10 h-10 bg-neutral-950 border border-neutral-800 rounded-lg flex items-center justify-center text-indigo-400 z-10">
+                            <i data-lucide="calendar-check" class="w-5 h-5"></i>
+                        </div>
+                    </div>
+                    <!-- Card: Omzet Bulan Ini (Baru!) -->
+                    <div class="bg-neutral-900 border border-neutral-850 rounded-xl p-6 flex items-center justify-between relative overflow-hidden group">
+                        <div class="space-y-2">
+                            <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-500">Omzet Bulan Ini</span>
+                            <h3 id="stat-omzet-bulan-ini" class="text-xl font-bold font-mono text-white">Rp 0</h3>
+                            <p class="text-[10px] text-neutral-400 flex items-center gap-1 font-semibold">
+                                Sisa pace target 24 hari
+                            </p>
+                        </div>
+                        <div class="w-10 h-10 bg-neutral-950 border border-neutral-800 rounded-lg flex items-center justify-center text-neutral-400">
+                            <i data-lucide="calendar" class="w-5 h-5"></i>
+                        </div>
+                    </div>
+                    <!-- Card: Total Omzet -->
+                    <div class="bg-neutral-900 border border-neutral-850 rounded-xl p-6 flex items-center justify-between">
+                        <div class="space-y-2">
+                            <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-500">Total Omzet (All Time)</span>
+                            <h3 id="stat-omzet-all-time" class="text-xl font-bold font-mono text-white">Rp 0</h3>
+                            <p class="text-[10px] text-emerald-500 flex items-center gap-1 font-semibold">
+                                <i data-lucide="arrow-up-right" class="w-3 h-3"></i> +12.4% minggu ini
+                            </p>
+                        </div>
+                        <div class="w-10 h-10 bg-neutral-950 border border-neutral-800 rounded-lg flex items-center justify-center text-neutral-400">
+                            <i data-lucide="wallet" class="w-5 h-5"></i>
+                        </div>
+                    </div>
+                    <!-- Card: Antrean Transaksi -->
+                    <div class="bg-neutral-900 border border-neutral-850 rounded-xl p-6 flex items-center justify-between">
+                        <div class="space-y-2">
+                            <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-500">Waiting QRIS / Pending</span>
+                            <h3 id="stat-waiting-queue" class="text-xl font-bold font-mono text-white">0 Antrean</h3>
+                            <p class="text-[10px] text-amber-500 flex items-center gap-1 font-semibold">
+                                <i data-lucide="activity" class="w-3 h-3"></i> Sedang diproses polling
+                            </p>
+                        </div>
+                        <div class="w-10 h-10 bg-neutral-950 border border-neutral-800 rounded-lg flex items-center justify-center text-neutral-400">
+                            <i data-lucide="clock" class="w-5 h-5"></i>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- SEKTOR 2: OPERASIONAL & RETENSI PELANGGAN (DIPERLENGKAP!) -->
+            <div class="space-y-4">
+                <h4 class="text-xs font-bold uppercase tracking-wider text-neutral-500 flex items-center gap-2">
+                    <i data-lucide="users" class="w-4 h-4"></i> Metrik Operasional & Retensi
+                </h4>
+                <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
+                    <!-- Card: Total Sukses -->
+                    <div class="bg-neutral-900 border border-neutral-850 rounded-xl p-6 flex items-center justify-between">
+                        <div class="space-y-2">
+                            <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-500">Transaksi Selesai</span>
+                            <h3 id="stat-total-transaksi" class="text-xl font-bold font-mono text-white">0 Transaksi</h3>
+                            <p class="text-[10px] text-indigo-400 flex items-center gap-1 font-semibold">
+                                <i data-lucide="sparkles" class="w-3 h-3"></i> Tingkat Konversi 85%
+                            </p>
+                        </div>
+                        <div class="w-10 h-10 bg-neutral-950 border border-neutral-800 rounded-lg flex items-center justify-center text-neutral-400">
+                            <i data-lucide="badge-check" class="w-5 h-5"></i>
+                        </div>
+                    </div>
+                    <!-- Card: AOV (Baru!) -->
+                    <div class="bg-neutral-900 border border-neutral-850 rounded-xl p-6 flex items-center justify-between">
+                        <div class="space-y-2">
+                            <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-500">Rata-Rata Nilai Order (AOV)</span>
+                            <h3 id="stat-aov" class="text-xl font-bold font-mono text-white">Rp 0</h3>
+                            <p class="text-[10px] text-neutral-400 font-semibold">
+                                Nilai belanja per transaksi
+                            </p>
+                        </div>
+                        <div class="w-10 h-10 bg-neutral-950 border border-neutral-800 rounded-lg flex items-center justify-center text-neutral-400">
+                            <i data-lucide="arrow-up-right" class="w-5 h-5"></i>
+                        </div>
+                    </div>
+                    <!-- Card: Pembeli Unik (Baru!) -->
+                    <div class="bg-neutral-900 border border-neutral-850 rounded-xl p-6 flex items-center justify-between">
+                        <div class="space-y-2">
+                            <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-500">Pelanggan Unik</span>
+                            <h3 id="stat-unique-buyers" class="text-xl font-bold font-mono text-white">0 Pembeli</h3>
+                            <p class="text-[10px] text-emerald-400 flex items-center gap-1 font-semibold">
+                                Terdaftar di database
+                            </p>
+                        </div>
+                        <div class="w-10 h-10 bg-neutral-950 border border-neutral-800 rounded-lg flex items-center justify-center text-neutral-400">
+                            <i data-lucide="user-check" class="w-5 h-5"></i>
+                        </div>
+                    </div>
+                    <!-- Card: Repeat Rate (Baru!) -->
+                    <div class="bg-neutral-900 border border-neutral-850 rounded-xl p-6 flex items-center justify-between">
+                        <div class="space-y-2">
+                            <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-500">Tingkat Repeat Order</span>
+                            <h3 id="stat-repeat-rate" class="text-xl font-bold font-mono text-white">0%</h3>
+                            <p class="text-[10px] text-indigo-400 flex items-center gap-1 font-semibold">
+                                Belanja lebih dari 1x
+                            </p>
+                        </div>
+                        <div class="w-10 h-10 bg-neutral-950 border border-neutral-800 rounded-lg flex items-center justify-center text-neutral-400">
+                            <i data-lucide="percent" class="w-5 h-5"></i>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Bagian Analitik Grafik -->
+            <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                <!-- Grafik Utama -->
+                <div class="bg-neutral-900 border border-neutral-850 rounded-xl p-6 lg:col-span-2 space-y-4">
+                    <div class="flex items-center justify-between">
+                        <h4 class="font-bold text-sm text-neutral-100">Tren Grafik Finansial (7 Hari Terakhir)</h4>
+                        <span class="px-2.5 py-0.5 bg-neutral-950 border border-neutral-800 text-neutral-400 text-[10px] rounded-md font-mono">REALTIME SYNC</span>
+                    </div>
+                    <div class="h-72 w-full">
+                        <canvas id="trendChart"></canvas>
+                    </div>
+                </div>
+                <!-- Grafik Distribusi Paket -->
+                <div class="bg-neutral-900 border border-neutral-850 rounded-xl p-6 flex flex-col justify-between">
+                    <div class="flex items-center justify-between">
+                        <h4 class="font-bold text-sm text-neutral-100">Porsi Penjualan Paket</h4>
+                        <span class="text-[10px] text-neutral-500 uppercase font-bold">Produk Laris</span>
+                    </div>
+                    <div class="h-60 w-full flex items-center justify-center">
+                        <canvas id="productChart"></canvas>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ================= VIEW 2: PRODUK ================= -->
+        <section id="view-produk" class="hidden space-y-6">
+            <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+                <p class="text-xs text-neutral-400">Buat atau ubah pengaturan paket VIP, tautan grup privat, serta alur prasyarat pembeli.</p>
+                <button onclick="openProductModal()" class="px-4 py-2 bg-neutral-100 text-neutral-950 hover:bg-neutral-200 transition text-xs font-bold uppercase tracking-wider rounded-lg flex items-center gap-2">
+                    <i data-lucide="plus" class="w-4 h-4"></i> Tambah Produk
+                </button>
+            </div>
+
+            <div class="bg-neutral-900 border border-neutral-850 rounded-xl overflow-hidden shadow-sm">
+                <div class="overflow-x-auto font-sans">
+                    <table class="w-full text-left border-collapse">
+                        <thead>
+                            <tr class="bg-neutral-950/40 border-b border-neutral-850 text-[10px] font-bold uppercase text-neutral-400 tracking-wider">
+                                <th class="p-4">Paket / Nama</th>
+                                <th class="p-4">Paket ID</th>
+                                <th class="p-4">Harga Satuan</th>
+                                <th class="p-4">Prasyarat (Prereq)</th>
+                                <th class="p-4">Telegram Group ID</th>
+                                <th class="p-4">Status</th>
+                                <th class="p-4 text-right">Kelola</th>
+                            </tr>
+                        </thead>
+                        <tbody id="product-table-body" class="divide-y divide-neutral-850 text-xs">
+                            <!-- JS Inject -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
+
+        <!-- ================= VIEW 3: PESANAN ================= -->
+        <section id="view-pesanan" class="hidden space-y-6">
+            <!-- Filter & Search Bar -->
+            <div class="flex flex-col lg:flex-row gap-4 bg-neutral-900 border border-neutral-850 p-4 rounded-xl">
+                <div class="relative flex-1">
+                    <i data-lucide="search" class="w-4 h-4 text-neutral-500 absolute left-3.5 top-3.5"></i>
+                    <input type="text" id="order-search" oninput="filterOrders()" placeholder="Cari Order ID, nama pembeli, atau ID Telegram..." class="w-full pl-10 pr-4 py-2.5 bg-neutral-950 border border-neutral-850 rounded-lg text-xs text-neutral-200 placeholder-neutral-600 focus:outline-none focus:border-neutral-700 transition font-mono">
+                </div>
+                <div class="flex items-center gap-1.5 flex-wrap">
+                    <button onclick="setOrderFilter('all')" id="filter-all" class="order-filter-btn px-3.5 py-2 rounded-lg text-[10px] font-bold uppercase tracking-wider transition bg-neutral-800 border border-neutral-700 text-neutral-100">Semua</button>
+                    <button onclick="setOrderFilter('waiting')" id="filter-waiting" class="order-filter-btn px-3.5 py-2 rounded-lg text-[10px] font-bold uppercase tracking-wider transition text-neutral-400 hover:text-neutral-200 bg-transparent">Waiting</button>
+                    <button onclick="setOrderFilter('completed')" id="filter-completed" class="order-filter-btn px-3.5 py-2 rounded-lg text-[10px] font-bold uppercase tracking-wider transition text-neutral-400 hover:text-neutral-200 bg-transparent">Lunas</button>
+                    <button onclick="setOrderFilter('cancelled')" id="filter-cancelled" class="order-filter-btn px-3.5 py-2 rounded-lg text-[10px] font-bold uppercase tracking-wider transition text-neutral-400 hover:text-neutral-200 bg-transparent">Batal / Expired</button>
+                </div>
+            </div>
+
+            <!-- Tabel Pesanan -->
+            <div class="bg-neutral-900 border border-neutral-850 rounded-xl overflow-hidden shadow-sm">
+                <div class="overflow-x-auto">
+                    <table class="w-full text-left border-collapse">
+                        <thead>
+                            <tr class="bg-neutral-950/40 border-b border-neutral-850 text-[10px] font-bold uppercase text-neutral-400 tracking-wider">
+                                <th class="p-4">Pembeli</th>
+                                <th class="p-4">Paket ID</th>
+                                <th class="p-4">Order ID</th>
+                                <th class="p-4">Harga</th>
+                                <th class="p-4">Tanggal / Waktu</th>
+                                <th class="p-4">Status</th>
+                                <th class="p-4 text-right">Konfirmasi Manual</th>
+                            </tr>
+                        </thead>
+                        <tbody id="orders-table-body" class="divide-y divide-neutral-850 text-xs">
+                            <!-- JS Inject -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
+
+        <!-- ================= VIEW 4: TESTIMONI ================= -->
+        <section id="view-testimoni" class="hidden space-y-6">
+            <p class="text-xs text-neutral-400">Moderasikan ulasan testimoni dari pembeli sebelum dipublikasikan ke channel publik.</p>
+            
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-6" id="testi-container">
+                <!-- JS Inject Testimonial Cards -->
+            </div>
+        </section>
+
+        <!-- ================= VIEW 5: GRUP & USER ================= -->
+        <section id="view-pengguna" class="hidden space-y-8">
+            <!-- Cek Status & Kick User Grup -->
+            <div class="bg-neutral-900 border border-neutral-850 rounded-xl p-6 space-y-5">
+                <div>
+                    <h4 class="font-bold text-sm text-neutral-100 uppercase tracking-wider">Cek & Kick User Grup VIP</h4>
+                    <p class="text-xs text-neutral-400 mt-1">Periksa secara instan apakah pengguna terdaftar berada di dalam grup privat Telegram. Anda dapat menendang (kick) mereka sekaligus memblokir aksesnya.</p>
+                </div>
+                <div class="flex flex-col sm:flex-row gap-3">
+                    <input type="number" id="group-scan-id" placeholder="Masukkan User ID Telegram pembeli..." class="flex-1 px-4 py-2.5 bg-neutral-950 border border-neutral-850 rounded-lg text-xs text-neutral-200 focus:outline-none focus:border-neutral-700 font-mono">
+                    <button onclick="scanUserInGroups()" class="px-5 py-2.5 bg-neutral-100 hover:bg-neutral-200 text-neutral-950 transition text-xs font-bold uppercase tracking-wider rounded-lg flex items-center justify-center gap-2">
+                        <i data-lucide="scan-eye" class="w-4 h-4"></i> Pindai Status Anggota
+                    </button>
+                </div>
+                
+                <!-- Hasil Scan Group -->
+                <div id="scan-result" class="hidden p-4 bg-neutral-950 border border-neutral-850 rounded-lg divide-y divide-neutral-900 space-y-3">
+                    <!-- JS Inject Scan Rows -->
+                </div>
+            </div>
+
+            <!-- Layout Ban & Blacklist -->
+            <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                <!-- Sektor Kirim Perintah Ban -->
+                <div class="bg-neutral-900 border border-neutral-850 rounded-xl p-6 space-y-5 h-fit">
+                    <div>
+                        <h4 class="font-bold text-sm text-neutral-100 uppercase tracking-wider">Blokir Pengguna (Ban)</h4>
+                        <p class="text-xs text-neutral-400 mt-1">Blokir ID Telegram pengguna dari transaksi bot harian.</p>
+                    </div>
+                    <form onsubmit="executeBan(event)" class="space-y-4">
+                        <div>
+                            <label class="block text-[10px] font-bold text-neutral-500 uppercase mb-2">User ID Telegram</label>
+                            <input type="number" id="ban-user-id" required placeholder="Contoh: 12345678" class="w-full px-4 py-2.5 bg-neutral-950 border border-neutral-850 rounded-lg text-xs text-neutral-200 focus:outline-none focus:border-neutral-700 font-mono">
+                        </div>
+                        <div>
+                            <label class="block text-[10px] font-bold text-neutral-500 uppercase mb-2">Alasan Pemblokiran</label>
+                            <textarea id="ban-reason" required placeholder="Terdeteksi menyebarkan spam di grup VIP" rows="3" class="w-full px-4 py-2.5 bg-neutral-950 border border-neutral-850 rounded-lg text-xs text-neutral-200 focus:outline-none focus:border-neutral-700 resize-none"></textarea>
+                        </div>
+                        <button type="submit" class="w-full py-2.5 bg-rose-600 hover:bg-rose-700 text-white font-bold text-xs uppercase tracking-wider rounded-lg transition flex items-center justify-center gap-2">
+                            <i data-lucide="user-minus" class="w-4 h-4"></i> Blokir Pengguna
+                        </button>
+                    </form>
+                </div>
+
+                <!-- Tabel Daftar Ban Aktif -->
+                <div class="bg-neutral-900 border border-neutral-850 rounded-xl p-6 lg:col-span-2 space-y-4">
+                    <div>
+                        <h4 class="font-bold text-sm text-neutral-100 uppercase tracking-wider">Daftar Blokir Aktif (Blacklist)</h4>
+                        <p class="text-xs text-neutral-400 mt-1">Seseorang yang terdaftar di bawah ini tidak dapat mengakses transaksi bot.</p>
+                    </div>
+                    <div class="border border-neutral-850 rounded-lg overflow-hidden">
+                        <div class="overflow-x-auto">
+                            <table class="w-full text-left border-collapse">
+                                <thead class="bg-neutral-950/40 text-[10px] font-bold uppercase text-neutral-400 border-b border-neutral-850">
+                                    <tr>
+                                        <th class="p-3">User ID</th>
+                                        <th class="p-3">Alasan</th>
+                                        <th class="p-3">Waktu</th>
+                                        <th class="p-3 text-right">Pulihkan</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="banned-table-body" class="divide-y divide-neutral-850 text-xs">
+                                    <!-- JS Inject -->
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ================= VIEW 6: BROADCAST ================= -->
+        <section id="view-broadcast" class="hidden space-y-6">
+            <p class="text-xs text-neutral-400">Kirim pesan siaran (broadcast) masal langsung ke seluruh pembeli terdaftar Anda yang ada di database.</p>
+            
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                <!-- Workspace Input -->
+                <div class="bg-neutral-900 border border-neutral-850 rounded-xl p-6 space-y-4">
+                    <div>
+                        <h4 class="font-bold text-sm text-neutral-100 uppercase tracking-wider">Editor Siaran HTML</h4>
+                        <p class="text-[10px] text-neutral-500">Mendukung format Telegram: &lt;b&gt;, &lt;i&gt;, &lt;code&gt;</p>
+                    </div>
+                    <textarea id="broadcast-input" oninput="updateBroadcastPreview()" rows="10" placeholder="Ketik pesan broadcast Anda di sini... Contoh: <b>Halo Bosku!</b> Ada promo khusus hari ini." class="w-full p-4 bg-neutral-950 border border-neutral-850 rounded-lg text-xs text-neutral-200 focus:outline-none focus:border-neutral-700 font-mono resize-none"></textarea>
+                    
+                    <div class="flex items-center justify-between">
+                        <span class="text-xs text-neutral-400" id="broadcast-receiver-count">Menargetkan: 452 Buyer</span>
+                        <button onclick="triggerBroadcast()" class="px-5 py-2.5 bg-neutral-100 hover:bg-neutral-200 text-neutral-950 transition text-xs font-bold uppercase tracking-wider rounded-lg flex items-center gap-2 shadow-lg">
+                            <i data-lucide="send-horizontal" class="w-4 h-4"></i> Mulai Kirim Broadcast
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Live Preview Sandbox -->
+                <div class="bg-neutral-900 border border-neutral-850 rounded-xl p-6 flex flex-col justify-between">
+                    <div class="space-y-4">
+                        <h4 class="font-bold text-sm text-neutral-100 uppercase tracking-wider">Live Preview Sandbox (Telegram-Style)</h4>
+                        <div id="broadcast-preview-container" class="bg-neutral-950 border border-neutral-850 p-4 rounded-lg min-h-[200px] text-xs leading-relaxed text-neutral-200">
+                            <!-- Live Preview Text -->
+                        </div>
+                        <div id="html-validation-alert" class="hidden p-3 bg-rose-500/10 border border-rose-500/20 text-rose-400 text-xs rounded-lg flex items-center gap-2">
+                            <i data-lucide="info" class="w-4 h-4"></i> Sintaks HTML rusak! Mohon periksa tag penutup.
+                        </div>
+                    </div>
+                    <div class="pt-4 border-t border-neutral-850 text-[11px] text-neutral-500 italic">
+                        *Sistem akan melewatkan user yang memblokir bot secara otomatis tanpa crash.
+                    </div>
+                </div>
+            </div>
+
+            <!-- Loader Progress Sim -->
+            <div id="broadcast-progress-bar" class="hidden bg-neutral-900 border border-neutral-850 p-6 rounded-xl space-y-3">
+                <div class="flex justify-between items-center text-xs">
+                    <span class="font-bold uppercase text-neutral-400">Progres Pengiriman Siaran...</span>
+                    <span class="font-mono text-neutral-300" id="broadcast-percent">40%</span>
+                </div>
+                <div class="w-full bg-neutral-950 rounded-full h-2">
+                    <div class="bg-indigo-600 h-2 rounded-full transition-all duration-300" id="broadcast-progress-fill" style="width: 40%"></div>
+                </div>
+                <div class="flex justify-between items-center text-[10px] text-neutral-500">
+                    <span id="broadcast-sent-count">Terkirim: 180 / 452</span>
+                    <button onclick="stopBroadcastSim()" class="text-rose-500 hover:underline">Hentikan Paksa</button>
+                </div>
+            </div>
+        </section>
+
+        <!-- ================= VIEW 7: DATABASE & BACKUP ================= -->
+        <section id="view-backup" class="hidden space-y-8">
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                <!-- Downloader ZIP & JSON -->
+                <div class="bg-neutral-900 border border-neutral-850 rounded-xl p-6 space-y-6">
+                    <div>
+                        <h4 class="font-bold text-sm text-neutral-100 uppercase tracking-wider">Ekspor & Backup Database</h4>
+                        <p class="text-xs text-neutral-400 mt-1">Unduh backup data harian dalam format ZIP (berisi file .csv lengkap untuk masing-masing tabel) atau format JSON.</p>
+                    </div>
+                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                        <button onclick="simulateZipBackup()" class="p-4 bg-neutral-950 hover:bg-neutral-900 border border-neutral-850 rounded-xl transition text-left space-y-2">
+                            <div class="w-8 h-8 rounded-lg bg-indigo-500/10 text-indigo-400 flex items-center justify-center">
+                                <i data-lucide="file-archive" class="w-4 h-4"></i>
+                            </div>
+                            <p class="text-xs font-bold text-white uppercase tracking-wider">Download ZIP Backup</p>
+                            <p class="text-[10px] text-neutral-500">Berisi data mentah CSV.</p>
+                        </button>
+                        <button onclick="simulateJsonBackup()" class="p-4 bg-neutral-950 hover:bg-neutral-900 border border-neutral-850 rounded-xl transition text-left space-y-2">
+                            <div class="w-8 h-8 rounded-lg bg-emerald-500/10 text-emerald-400 flex items-center justify-center">
+                                <i data-lucide="file-json" class="w-4 h-4"></i>
+                            </div>
+                            <p class="text-xs font-bold text-white uppercase tracking-wider">Export JSON</p>
+                            <p class="text-[10px] text-neutral-500">Backup terstruktur tunggal.</p>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Drag-and-Drop JSON Import -->
+                <div class="bg-neutral-900 border border-neutral-850 rounded-xl p-6 space-y-4 flex flex-col justify-between">
+                    <div>
+                        <h4 class="font-bold text-sm text-neutral-100 uppercase tracking-wider">Import & Restorasi Database (JSON)</h4>
+                        <p class="text-xs text-neutral-400 mt-1">Unggah berkas JSON hasil ekspor cadangan Anda sebelumnya untuk mengembalikan atau menyingkronkan database.</p>
+                    </div>
+                    
+                    <div class="border-2 border-dashed border-neutral-800 hover:border-neutral-700 rounded-xl p-6 text-center cursor-pointer transition relative" id="drop-zone">
+                        <input type="file" id="json-file-input" onchange="handleFileSelect(event)" accept=".json" class="absolute inset-0 opacity-0 cursor-pointer">
+                        <div class="space-y-2 text-neutral-400 pointer-events-none">
+                            <i data-lucide="upload-cloud" class="w-8 h-8 mx-auto text-neutral-500"></i>
+                            <p class="text-xs font-semibold">Tarik & Jatuhkan berkas JSON di sini</p>
+                            <p class="text-[10px] text-neutral-500">Maksimal ukuran file 10MB</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ================= VIEW 8: TIM ADMIN ================= -->
+        <section id="view-admin" class="hidden space-y-6">
+            <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+                <p class="text-xs text-neutral-400">Kelola kru admin tambahan untuk membantu pemantauan transaksi harian dan moderasi ulasan.</p>
+                <button onclick="openAdminModal()" class="px-4 py-2 bg-neutral-100 text-neutral-950 hover:bg-neutral-200 transition text-xs font-bold uppercase tracking-wider rounded-lg flex items-center gap-2">
+                    <i data-lucide="user-plus" class="w-4 h-4"></i> Tambah Admin
+                </button>
+            </div>
+
+            <!-- Tabel Kru Admin -->
+            <div class="bg-neutral-900 border border-neutral-850 rounded-xl overflow-hidden shadow-sm">
+                <div class="overflow-x-auto">
+                    <table class="w-full text-left border-collapse">
+                        <thead>
+                            <tr class="bg-neutral-950/40 border-b border-neutral-850 text-[10px] font-bold uppercase text-neutral-400 tracking-wider">
+                                <th class="p-4">Nama Admin</th>
+                                <th class="p-4">User ID Telegram</th>
+                                <th class="p-4">Ditambahkan Oleh</th>
+                                <th class="p-4">Tanggal Gabung</th>
+                                <th class="p-4 text-right">Aksi</th>
+                            </tr>
+                        </thead>
+                        <tbody id="admins-table-body" class="divide-y divide-neutral-850 text-xs">
+                            <!-- JS Inject -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
+
+        <!-- ================= VIEW 9: PENGATURAN ================= -->
+        <section id="view-pengaturan" class="hidden space-y-6">
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                <!-- Form Group 1: General -->
+                <div class="bg-neutral-900 border border-neutral-850 rounded-xl p-6 space-y-5">
+                    <h4 class="font-bold text-sm text-neutral-100 border-b border-neutral-850 pb-3 uppercase tracking-wider">
+                        Sistem Integrasi Gateway
+                    </h4>
+                    <div class="space-y-4">
+                        <div>
+                            <label class="block text-[10px] font-bold text-neutral-500 uppercase mb-2">Pakasir Webhook Secret</label>
+                            <input type="password" id="cfg-webhook-secret" value="kikuk_super_secret_12345" class="w-full px-4 py-2.5 bg-neutral-950 border border-neutral-850 rounded-lg text-xs text-neutral-200 focus:outline-none focus:border-neutral-700 font-mono">
+                            <span class="text-[9px] text-neutral-500 mt-1 block">Tanda tangan HMAC SHA256 akan wajib terverifikasi untuk memproses order lunas.</span>
+                        </div>
+                        <div>
+                            <label class="block text-[10px] font-bold text-neutral-500 uppercase mb-2">Link CS / Admin Utama</label>
+                            <input type="text" id="cfg-link-admin" value="https://t.me/Kikukkvd" class="w-full px-4 py-2.5 bg-neutral-950 border border-neutral-850 rounded-lg text-xs text-neutral-200 focus:outline-none focus:border-neutral-700 font-mono">
+                        </div>
+                        <div>
+                            <label class="block text-[10px] font-bold text-neutral-500 uppercase mb-2">Link Button Testimoni</label>
+                            <input type="text" id="cfg-link-testi" value="https://t.me/+7zsdSrwYIG8wOTg1" class="w-full px-4 py-2.5 bg-neutral-950 border border-neutral-850 rounded-lg text-xs text-neutral-200 focus:outline-none focus:border-neutral-700 font-mono">
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Form Group 2: Channel & Maintenance -->
+                <div class="bg-neutral-900 border border-neutral-850 rounded-xl p-6 space-y-5">
+                    <h4 class="font-bold text-sm text-neutral-100 border-b border-neutral-850 pb-3 uppercase tracking-wider">
+                        Integrasi Telegram Channel
+                    </h4>
+                    <div class="space-y-4">
+                        <div>
+                            <label class="block text-[10px] font-bold text-neutral-500 uppercase mb-2">ID Channel Notifikasi Order</label>
+                            <input type="text" id="cfg-channel-notif" value="-1001234567890" class="w-full px-4 py-2.5 bg-neutral-950 border border-neutral-850 rounded-lg text-xs text-neutral-200 focus:outline-none focus:border-neutral-700 font-mono">
+                        </div>
+                        <div>
+                            <label class="block text-[10px] font-bold text-neutral-500 uppercase mb-2">ID Channel Testimoni</label>
+                            <input type="text" id="cfg-channel-testi" value="-1009876543210" class="w-full px-4 py-2.5 bg-neutral-950 border border-neutral-850 rounded-lg text-xs text-neutral-200 focus:outline-none focus:border-neutral-700 font-mono">
+                        </div>
+                        
+                        <!-- Toggle Maintenance -->
+                        <div class="pt-2">
+                            <label class="block text-[10px] font-bold text-neutral-500 uppercase mb-2">Mode Perbaikan (Maintenance)</label>
+                            <div class="bg-neutral-950 border border-neutral-850 p-4 rounded-lg flex items-center justify-between">
+                                <div>
+                                    <p class="text-xs font-semibold text-neutral-200" id="maintenance-text-status">Maintenance: OFF</p>
+                                    <p class="text-[9px] text-neutral-500 mt-0.5">Pembeli dapat mengakses bot secara normal.</p>
+                                </div>
+                                <label class="relative inline-flex items-center cursor-pointer">
+                                    <input type="checkbox" id="cfg-maintenance-toggle" onchange="toggleMaintenanceMode()" class="sr-only peer">
+                                    <div class="w-9 h-5 bg-neutral-800 rounded-full peer peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-neutral-400 after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-indigo-600 peer-checked:after:bg-white"></div>
+                                </label>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="flex justify-end">
+                <button onclick="saveConfiguration()" class="px-5 py-3 bg-neutral-100 hover:bg-neutral-200 text-neutral-950 font-bold text-xs uppercase tracking-wider rounded-lg transition shadow-lg">
+                    Simpan Konfigurasi
+                </button>
+            </div>
+        </section>
+    </main>
+
+    <!-- ================= MODAL: TAMBAH / EDIT PRODUK ================= -->
+    <div id="product-modal" class="hidden fixed inset-0 z-50 bg-neutral-950/70 backdrop-blur-sm flex items-center justify-center p-4">
+        <div class="bg-neutral-900 border border-neutral-850 rounded-xl w-full max-w-lg overflow-hidden shadow-2xl">
+            <!-- Modal Header -->
+            <div class="p-6 border-b border-neutral-850 flex items-center justify-between">
+                <h3 id="modal-title" class="text-sm font-bold text-white uppercase tracking-wider">Tambah Produk</h3>
+                <button onclick="closeProductModal()" class="text-neutral-400 hover:text-white transition">
+                    <i data-lucide="x" class="w-5 h-5"></i>
+                </button>
+            </div>
+            
+            <!-- Modal Body Form -->
+            <form id="product-form" onsubmit="saveProduct(event)" class="p-6 space-y-4">
+                <input type="hidden" id="form-product-index">
+                <div class="grid grid-cols-3 gap-4">
+                    <div class="col-span-1">
+                        <label class="block text-[10px] font-bold text-neutral-500 uppercase mb-2">Emoji</label>
+                        <input type="text" id="form-product-emoji" required placeholder="🔥" class="w-full px-4 py-2.5 bg-neutral-950 border border-neutral-850 rounded-lg text-xs text-center text-neutral-200 focus:outline-none focus:border-neutral-700 transition">
+                    </div>
+                    <div class="col-span-2">
+                        <label class="block text-[10px] font-bold text-neutral-500 uppercase mb-2">Nama Produk</label>
+                        <input type="text" id="form-product-name" required placeholder="GB Standard" class="w-full px-4 py-2.5 bg-neutral-950 border border-neutral-850 rounded-lg text-xs text-neutral-200 focus:outline-none focus:border-neutral-700 transition">
+                    </div>
+                </div>
+                <div class="grid grid-cols-2 gap-4">
+                    <div>
+                        <label class="block text-[10px] font-bold text-neutral-500 uppercase mb-2">Paket ID</label>
+                        <input type="text" id="form-product-id" required placeholder="gb_standard" class="w-full px-4 py-2.5 bg-neutral-950 border border-neutral-850 rounded-lg text-xs text-neutral-200 focus:outline-none focus:border-neutral-700 transition font-mono">
+                    </div>
+                    <div>
+                        <label class="block text-[10px] font-bold text-neutral-500 uppercase mb-2">Harga (Rp)</label>
+                        <input type="number" id="form-product-price" required placeholder="15000" class="w-full px-4 py-2.5 bg-neutral-950 border border-neutral-850 rounded-lg text-xs text-neutral-200 focus:outline-none focus:border-neutral-700 transition font-mono">
+                    </div>
+                </div>
+                <div>
+                    <label class="block text-[10px] font-bold text-neutral-500 uppercase mb-2">Group ID Telegram (Grup VIP)</label>
+                    <input type="text" id="form-product-group" placeholder="-100xxxxxxxxxx" class="w-full px-4 py-2.5 bg-neutral-950 border border-neutral-850 rounded-lg text-xs text-neutral-200 focus:outline-none focus:border-neutral-700 transition font-mono">
+                </div>
+                
+                <!-- Visual Prerequisite Selector -->
+                <div>
+                    <label class="block text-[10px] font-bold text-neutral-500 uppercase mb-2">Prasyarat Pembelian (Prerequisites)</label>
+                    <div id="prereq-checkboxes" class="p-3 bg-neutral-950 border border-neutral-850 rounded-lg space-y-2 max-h-32 overflow-y-auto">
+                        <!-- JS Inject Checkboxes -->
+                    </div>
+                </div>
+
+                <div class="flex justify-end gap-3 pt-4 border-t border-neutral-850">
+                    <button type="button" onclick="closeProductModal()" class="px-4 py-2 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 rounded-lg text-xs font-semibold transition">Batal</button>
+                    <button type="submit" class="px-5 py-2 bg-neutral-100 hover:bg-neutral-200 text-neutral-950 rounded-lg text-xs font-semibold transition">Simpan</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- ================= MODAL: TAMBAH ADMIN ================= -->
+    <div id="admin-modal" class="hidden fixed inset-0 z-50 bg-neutral-950/70 backdrop-blur-sm flex items-center justify-center p-4">
+        <div class="bg-neutral-900 border border-neutral-850 rounded-xl w-full max-w-sm overflow-hidden shadow-2xl">
+            <div class="p-6 border-b border-neutral-850 flex items-center justify-between">
+                <h3 class="text-sm font-bold text-white uppercase tracking-wider">Tambah Admin Kru</h3>
+                <button onclick="closeAdminModal()" class="text-neutral-400 hover:text-white transition">
+                    <i data-lucide="x" class="w-5 h-5"></i>
+                </button>
+            </div>
+            <form id="admin-form" onsubmit="saveAdmin(event)" class="p-6 space-y-4">
+                <div>
+                    <label class="block text-[10px] font-bold text-neutral-500 uppercase mb-2">Nama Lengkap</label>
+                    <input type="text" id="form-admin-name" required placeholder="Budi Santoso" class="w-full px-4 py-2.5 bg-neutral-950 border border-neutral-850 rounded-lg text-xs text-neutral-200 focus:outline-none focus:border-neutral-700 transition">
+                </div>
+                <div>
+                    <label class="block text-[10px] font-bold text-neutral-500 uppercase mb-2">User ID Telegram</label>
+                    <input type="number" id="form-admin-id" required placeholder="Contoh: 87654321" class="w-full px-4 py-2.5 bg-neutral-950 border border-neutral-850 rounded-lg text-xs text-neutral-200 focus:outline-none focus:border-neutral-700 transition font-mono">
+                </div>
+                <div class="flex justify-end gap-3 pt-4 border-t border-neutral-850">
+                    <button type="button" onclick="closeAdminModal()" class="px-4 py-2 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 rounded-lg text-xs font-semibold transition">Batal</button>
+                    <button type="submit" class="px-5 py-2 bg-neutral-100 hover:bg-neutral-200 text-neutral-950 rounded-lg text-xs font-semibold transition">Simpan</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- ================= JAVASCRIPT LOGIKAL WORKSPACE ================= -->
+    <script>
+        // Simulasi database State sinkron dengan ty.py
+        let state = {
+            products: [
+                { emoji: "🔥", nama: "GB Biasa", paket_id: "gb_biasa", harga: 5000, link: "https://t.me/Kikukkvd", group_chat_id: null, requires_paket_ids: null, aktif: true },
+                { emoji: "👑", nama: "GB VIP", paket_id: "gb_vip", harga: 25000, link: "https://t.me/Kikukkvd", group_chat_id: "-1001234567890", requires_paket_ids: "gb_biasa", aktif: true }
+            ],
+            orders: [
+                { id: 1, user_id: 87654321, user_name: "Yanto Widodo", paket_id: "gb_biasa", order_id: "HFB-87654321-20260601-ABC1", status: "completed", waktu: "12:30 - 05/06/2026", harga_dibayar: 5000 },
+                { id: 2, user_id: 11223344, user_name: "Budi Pratama", paket_id: "gb_vip", order_id: "HFB-11223344-20260604-XYZ2", status: "completed", waktu: "15:45 - 04/06/2026", harga_dibayar: 25000 },
+                { id: 3, user_id: 99887766, user_name: "Sarah Amanda", paket_id: "gb_vip", order_id: "HFB-99887766-20260606-QWE3", status: "waiting", waktu: "07:15 - 06/06/2026", harga_dibayar: 25150 },
+                { id: 4, user_id: 55667788, user_name: "Rizky Fauzi", paket_id: "gb_biasa", order_id: "HFB-55667788-20260605-MNO4", status: "cancelled", waktu: "21:10 - 05/06/2026", harga_dibayar: 5000 }
+            ],
+            bannedUsers: [
+                { user_id: 99999999, reason: "Terdeteksi melakukan spam link grup privat", banned_at: "10:15 - 03/06/2026" }
+            ],
+            testimonials: [
+                { user_id: 11223344, user_name: "Budi Pratama", paket_id: "gb_vip", order_id: "HFB-11223344-20260604-XYZ2", rating: 5, review: "Akses grup otomatisnya kencang gila! Mantap HyperFamily.", status: "approved" },
+                { user_id: 87654321, user_name: "Yanto Widodo", paket_id: "gb_biasa", order_id: "HFB-87654321-20260601-ABC1", rating: 4, review: "Bagus, admin ramah, tapi nunggu polling QRIS 2 menit tadi.", status: "pending" }
+            ],
+            admins: [
+                { user_id: 77777777, nama: "Kiki Admin", added_by: 12345678, added_at: "01/01/2026" }
+            ],
+            groups: [
+                { chat_id: "-1001234567890", nama: "HyperFamily VIP Base", members: [11223344] }
+            ],
+            maintenance: false,
+            currentOrderFilter: 'all',
+            broadcastSimInterval: null
+        };
+
+        let trendChartInstance = null;
+        let productChartInstance = null;
+
+        // Atur tanggal order simulasi secara dinamis saat webapp dijalankan agar live tracking berfungsi akurat
+        function initDynamicDates() {
+            const now = new Date();
+            const format = (d) => {
+                const dd = String(d.getDate()).padStart(2, '0');
+                const mm = String(d.getMonth() + 1).padStart(2, '0');
+                const yyyy = d.getFullYear();
+                return `${dd}/${mm}/${yyyy}`;
+            };
+            
+            const todayStr = format(now);
+            const yesterdayStr = format(new Date(now.getTime() - 24 * 60 * 60 * 1000));
+
+            // Set waktu pesanan 1 & 2 secara dinamis
+            state.orders[0].waktu = `12:30 - ${yesterdayStr}`; // Lunas kemarin (Rp 5.000)
+            state.orders[1].waktu = `15:45 - ${todayStr}`;     // Lunas hari ini (Rp 25.000)
+
+            // Tambah transaksi lunas tambahan khusus hari ini agar omset default terlihat realistis
+            state.orders.push({
+                id: 5,
+                user_id: 34567890,
+                user_name: "Santi Lestari",
+                paket_id: "gb_biasa",
+                order_id: `HFB-34567890-TODAY-001`,
+                status: "completed",
+                waktu: `10:15 - ${todayStr}`,
+                harga_dibayar: 5000
+            });
+        }
+
+        window.onload = function() {
+            initDynamicDates();
+            lucide.createIcons();
+            renderAllData();
+            initCharts();
+            updateBroadcastPreview();
+        };
+
+        // SPA View Switcher
+        function switchView(viewId) {
+            const views = ['view-ringkasan', 'view-produk', 'view-pesanan', 'view-testimoni', 'view-pengguna', 'view-broadcast', 'view-backup', 'view-admin', 'view-pengaturan'];
+            views.forEach(v => {
+                const el = document.getElementById(v);
+                if (v === viewId) {
+                    el.classList.remove('hidden');
+                    el.classList.add('block');
+                } else {
+                    el.classList.remove('block');
+                    el.classList.add('hidden');
+                }
+
+                // Ubah style tombol navigasi
+                const btn = document.getElementById('btn-' + v);
+                if (v === viewId) {
+                    btn.className = "nav-btn w-full flex items-center gap-3 px-4 py-3 rounded-lg text-xs font-bold uppercase tracking-wider text-neutral-100 bg-neutral-800 border border-neutral-700 transition duration-150";
+                } else {
+                    btn.className = "nav-btn w-full flex items-center gap-3 px-4 py-3 rounded-lg text-xs font-bold uppercase tracking-wider text-neutral-400 hover:text-neutral-100 hover:bg-neutral-850/60 transition duration-150";
+                }
+            });
+
+            // Ganti Title Header
+            const titleMap = {
+                'view-ringkasan': 'Ringkasan Eksekutif',
+                'view-produk': 'Katalog & Alur Paket Produk',
+                'view-pesanan': 'Laporan Riwayat Pesanan',
+                'view-testimoni': 'Moderasi Testimoni Pembeli',
+                'view-pengguna': 'Grup & Manajemen Blacklist',
+                'view-broadcast': 'Kirim Broadcast Pesan',
+                'view-backup': 'Backup & Restore Database',
+                'view-admin': 'Sub-Admin Tambahan',
+                'view-pengaturan': 'Konfigurasi Server & Bot'
+            };
+            const descMap = {
+                'view-ringkasan': 'Status dan metrik performa toko HyperFamily Anda hari ini.',
+                'view-produk': 'Ubah paket, tautan grup privat, serta alur prasyarat pembeli.',
+                'view-pesanan': 'Konfirmasi secara manual atau batalkan pesanan pembeli.',
+                'view-testimoni': 'Lihat, terima, atau tolak ulasan pembeli sebelum dikirim ke channel.',
+                'view-pengguna': 'Kelola pengguna di dalam grup Telegram dan pemblokiran akses transaksi.',
+                'view-broadcast': 'Kirim pesan siaran HTML massal ke seluruh pembeli di database.',
+                'view-backup': 'Unduh cadangan CSV/JSON atau kembalikan database menggunakan backup.',
+                'view-admin': 'Kru admin tambahan dengan akses terbatas ke panel kontrol.',
+                'view-pengaturan': 'Atur kunci HMAC, webhook token, dan mode maintenance.'
+            };
+            document.getElementById('view-title').innerText = titleMap[viewId];
+            document.getElementById('view-desc').innerText = descMap[viewId];
+        }
+
+        // Floating Toast Notification
+        function showToast(message, type = 'success') {
+            const container = document.getElementById('toast-container');
+            const toast = document.createElement('div');
+            
+            const borderClass = type === 'success' ? 'border-indigo-500/20 text-indigo-300 bg-neutral-900' : 'border-rose-500/20 text-rose-300 bg-neutral-900';
+            const icon = type === 'success' ? 'sparkles' : 'alert-circle';
+
+            toast.className = `flex items-center gap-3 px-4 py-3.5 border rounded-xl shadow-2xl transition duration-300 transform translate-y-2 opacity-0 pointer-events-auto min-w-[280px] ${borderClass}`;
+            toast.innerHTML = `
+                <i data-lucide="${icon}" class="w-4 h-4 shrink-0"></i>
+                <span class="text-xs font-semibold tracking-wide">${message}</span>
+            `;
+            
+            container.appendChild(toast);
+            lucide.createIcons({attrs: {'class': 'w-4 h-4'}});
+
+            setTimeout(() => {
+                toast.classList.remove('translate-y-2', 'opacity-0');
+            }, 10);
+
+            setTimeout(() => {
+                toast.classList.add('translate-y-2', 'opacity-0');
+                setTimeout(() => { toast.remove(); }, 300);
+            }, 3500);
+        }
+
+        // Render Data Tables
+        function renderAllData() {
+            renderStats();
+            renderProducts();
+            renderOrders();
+            renderTestimonials();
+            renderBannedUsers();
+            renderAdmins();
+        }
+
+        // Hitung dan Render Seluruh Metrik Finansial Lengkap (Hari Ini, Bulanan, AOV, Repeat Rate)
+        function renderStats() {
+            const now = new Date();
+            const dd = String(now.getDate()).padStart(2, '0');
+            const mm = String(now.getMonth() + 1).padStart(2, '0');
+            const yyyy = now.getFullYear();
+            const todayStr = `${dd}/${mm}/${yyyy}`;
+            const currentMonthYear = `${mm}/${yyyy}`;
+
+            const completed = state.orders.filter(o => o.status === 'completed');
+            
+            // 1. Total Omzet (All-Time)
+            const allTimeRevenue = completed.reduce((sum, o) => sum + o.harga_dibayar, 0);
+            
+            // 2. Omzet Hari Ini (Dihitung Dinamis!)
+            const todayOrders = completed.filter(o => o.waktu.includes(todayStr));
+            const todayRevenue = todayOrders.reduce((sum, o) => sum + o.harga_dibayar, 0);
+            
+            // 3. Omzet Bulan Ini
+            const monthOrders = completed.filter(o => o.waktu.includes(currentMonthYear));
+            const monthRevenue = monthOrders.reduce((sum, o) => sum + o.harga_dibayar, 0);
+
+            // 4. Waiting Queue
+            const waitingCount = state.orders.filter(o => o.status === 'waiting').length;
+
+            // 5. Rata-rata Nilai Order (AOV)
+            const aov = completed.length > 0 ? Math.round(allTimeRevenue / completed.length) : 0;
+
+            // 6. Pembeli Unik
+            const uniqueBuyers = new Set(completed.map(o => o.user_id)).size;
+
+            // 7. Repeat Purchase Rate (Persentase pelanggan RO)
+            const userCounts = {};
+            completed.forEach(o => {
+                userCounts[o.user_id] = (userCounts[o.user_id] || 0) + 1;
+            });
+            const repeatBuyers = Object.values(userCounts).filter(cnt => cnt > 1).length;
+            const repeatRate = uniqueBuyers > 0 ? Math.round((repeatBuyers / uniqueBuyers) * 100) : 0;
+
+            // Inject data ke UI
+            document.getElementById('stat-omzet-hari-ini').innerText = "Rp " + todayRevenue.toLocaleString('id-ID');
+            document.getElementById('stat-omzet-bulan-ini').innerText = "Rp " + monthRevenue.toLocaleString('id-ID');
+            document.getElementById('stat-omzet-all-time').innerText = "Rp " + allTimeRevenue.toLocaleString('id-ID');
+            document.getElementById('stat-waiting-queue').innerText = waitingCount + " Antrean";
+            
+            document.getElementById('stat-total-transaksi').innerText = completed.length + " Transaksi";
+            document.getElementById('stat-aov').innerText = "Rp " + aov.toLocaleString('id-ID');
+            document.getElementById('stat-unique-buyers').innerText = uniqueBuyers + " Pembeli";
+            document.getElementById('stat-repeat-rate').innerText = repeatRate + "%";
+        }
+
+        // Render Produk
+        function renderProducts() {
+            const tbody = document.getElementById('product-table-body');
+            tbody.innerHTML = '';
+
+            state.products.forEach((p, idx) => {
+                const tr = document.createElement('tr');
+                tr.className = "hover:bg-neutral-900/40 transition duration-150 border-b border-neutral-850";
+                
+                const groupLabel = p.group_chat_id ? `<code class="bg-neutral-950 px-2 py-0.5 border border-neutral-800 rounded text-[10px] text-indigo-400 font-mono">${p.group_chat_id}</code>` : `<span class="text-[10px] text-neutral-500 italic">Tanpa Grup</span>`;
+                const prereqLabel = p.requires_paket_ids ? `<code class="bg-neutral-950 px-2 py-0.5 border border-neutral-800 rounded text-[10px] text-rose-400 font-mono">${p.requires_paket_ids}</code>` : `<span class="text-[10px] text-neutral-500 italic">Tanpa Syarat</span>`;
+                const statusBadge = p.aktif ? `<span class="px-2 py-0.5 bg-indigo-500/10 text-indigo-400 text-[10px] font-bold uppercase tracking-wider rounded-md border border-indigo-500/20">Aktif</span>` : `<span class="px-2 py-0.5 bg-neutral-800 text-neutral-500 text-[10px] font-bold uppercase tracking-wider rounded-md border border-neutral-700">Nonaktif</span>`;
+                const statusBtnText = p.aktif ? 'Matikan' : 'Aktifkan';
+
+                tr.innerHTML = `
+                    <td class="p-4 font-semibold text-neutral-200 flex items-center gap-2">
+                        <span class="text-base">${p.emoji}</span> ${p.nama}
+                    </td>
+                    <td class="p-4 font-mono text-[10px] text-neutral-400"><code>${p.paket_id}</code></td>
+                    <td class="p-4 font-mono text-neutral-300">Rp ${p.harga.toLocaleString('id-ID')}</td>
+                    <td class="p-4">${prereqLabel}</td>
+                    <td class="p-4">${groupLabel}</td>
+                    <td class="p-4">${statusBadge}</td>
+                    <td class="p-4 text-right space-x-2">
+                        <button onclick="toggleProductStatus(${idx})" class="text-[10px] uppercase font-bold text-neutral-400 hover:text-white transition">${statusBtnText}</button>
+                        <button onclick="openProductModal(${idx})" class="text-[10px] uppercase font-bold text-indigo-400 hover:text-indigo-300 transition">Edit</button>
+                        <button onclick="deleteProduct(${idx})" class="text-[10px] uppercase font-bold text-rose-500 hover:text-rose-400 transition">Hapus</button>
+                    </td>
+                `;
+                tbody.appendChild(tr);
+            });
+        }
+
+        // Render Pesanan
+        function renderOrders() {
+            const tbody = document.getElementById('orders-table-body');
+            tbody.innerHTML = '';
+
+            const filtered = state.orders.filter(o => {
+                if (state.currentOrderFilter === 'all') return true;
+                return o.status === state.currentOrderFilter;
+            });
+
+            filtered.forEach(o => {
+                const tr = document.createElement('tr');
+                tr.className = "hover:bg-neutral-900/40 transition duration-150 border-b border-neutral-850";
+
+                let statusBadge = '';
+                let actionBtn = '';
+
+                if (o.status === 'completed') {
+                    statusBadge = `<span class="px-2 py-0.5 bg-emerald-500/10 text-emerald-400 text-[10px] font-bold uppercase tracking-wider rounded-md border border-emerald-500/20">Lunas</span>`;
+                    actionBtn = `<button onclick="copyToClipboard('${o.order_id}')" class="px-2 py-1 bg-neutral-800 hover:bg-neutral-700 rounded text-[10px] font-bold text-neutral-300 uppercase transition">Salin ID</button>`;
+                } else if (o.status === 'waiting') {
+                    statusBadge = `<span class="px-2 py-0.5 bg-amber-500/10 text-amber-400 text-[10px] font-bold uppercase tracking-wider rounded-md border border-amber-500/20">Waiting</span>`;
+                    actionBtn = `
+                        <div class="flex items-center gap-1 justify-end">
+                            <button onclick="manualConfirmOrder('${o.order_id}')" class="px-2 py-1 bg-indigo-600 hover:bg-indigo-700 text-white rounded text-[10px] font-bold uppercase transition">Konfirm</button>
+                            <button onclick="manualCancelOrder('${o.order_id}')" class="px-2 py-1 bg-neutral-800 hover:bg-neutral-700 text-neutral-400 rounded text-[10px] font-bold uppercase transition">Batal</button>
+                        </div>
+                    `;
+                } else {
+                    statusBadge = `<span class="px-2 py-0.5 bg-neutral-800 text-neutral-500 text-[10px] font-bold uppercase tracking-wider rounded-md border border-neutral-700">Gagal</span>`;
+                    actionBtn = `<span class="text-xs text-neutral-600 italic">-</span>`;
+                }
+
+                tr.innerHTML = `
+                    <td class="p-4">
+                        <p class="font-semibold text-neutral-200">${o.user_name}</p>
+                        <p class="text-[9px] text-neutral-500">ID: <code>${o.user_id}</code></p>
+                    </td>
+                    <td class="p-4 font-mono text-[10px] text-neutral-300"><code>${o.paket_id}</code></td>
+                    <td class="p-4 font-mono text-[10px] text-neutral-400"><code>${o.order_id}</code></td>
+                    <td class="p-4 text-emerald-400 font-mono">Rp ${o.harga_dibayar.toLocaleString('id-ID')}</td>
+                    <td class="p-4 text-neutral-400 font-mono">${o.waktu}</td>
+                    <td class="p-4">${statusBadge}</td>
+                    <td class="p-4 text-right">${actionBtn}</td>
+                `;
+                tbody.appendChild(tr);
+            });
+        }
+
+        function filterOrders() {
+            const query = document.getElementById('order-search').value.toLowerCase().trim();
+            const tbody = document.getElementById('orders-table-body');
+            const rows = tbody.getElementsByTagName('tr');
+
+            for (let i = 0; i < rows.length; i++) {
+                const text = rows[i].textContent.toLowerCase();
+                if (text.includes(query)) {
+                    rows[i].classList.remove('hidden');
+                } else {
+                    rows[i].classList.add('hidden');
+                }
+            }
+        }
+
+        function setOrderFilter(filterType) {
+            state.currentOrderFilter = filterType;
+            const filterButtons = document.getElementsByClassName('order-filter-btn');
+            for (let btn of filterButtons) {
+                btn.className = "order-filter-btn px-3.5 py-2 rounded-lg text-[10px] font-bold uppercase tracking-wider transition text-neutral-400 hover:text-neutral-200 bg-transparent";
+            }
+            document.getElementById('filter-' + filterType).className = "order-filter-btn px-3.5 py-2 rounded-lg text-[10px] font-bold uppercase tracking-wider transition bg-neutral-800 border border-neutral-700 text-neutral-100";
+            renderOrders();
+        }
+
+        // ================= MODERASI TESTIMONI =================
+        function renderTestimonials() {
+            const container = document.getElementById('testi-container');
+            container.innerHTML = '';
+            
+            const pendingCount = state.testimonials.filter(t => t.status === 'pending').length;
+            document.getElementById('badge-pending-testi').innerText = pendingCount;
+
+            state.testimonials.forEach((t, idx) => {
+                const card = document.createElement('div');
+                card.className = "bg-neutral-900 border border-neutral-850 p-6 rounded-xl space-y-4 relative overflow-hidden";
+                
+                const stars = '★'.repeat(t.rating) + '☆'.repeat(5 - t.rating);
+                let statusBadge = '';
+                let actionRow = '';
+
+                if (t.status === 'pending') {
+                    statusBadge = `<span class="px-2 py-0.5 bg-amber-500/10 text-amber-400 text-[9px] font-bold uppercase tracking-wider rounded border border-amber-500/20 absolute top-4 right-4">PENDING</span>`;
+                    actionRow = `
+                        <div class="flex gap-2 justify-end pt-3 border-t border-neutral-850">
+                            <button onclick="approveTesti(${idx})" class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded text-[10px] font-bold uppercase transition">Setujui & Post</button>
+                            <button onclick="rejectTesti(${idx})" class="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-400 rounded text-[10px] font-bold uppercase transition">Tolak</button>
+                        </div>
+                    `;
+                } else if (t.status === 'approved') {
+                    statusBadge = `<span class="px-2 py-0.5 bg-emerald-500/10 text-emerald-400 text-[9px] font-bold uppercase tracking-wider rounded border border-emerald-500/20 absolute top-4 right-4">APPROVED</span>`;
+                } else {
+                    statusBadge = `<span class="px-2 py-0.5 bg-neutral-800 text-neutral-500 text-[9px] font-bold uppercase tracking-wider rounded border border-neutral-700 absolute top-4 right-4">REJECTED</span>`;
+                }
+
+                card.innerHTML = `
+                    ${statusBadge}
+                    <div class="space-y-1">
+                        <p class="font-bold text-neutral-200 text-xs">${t.user_name}</p>
+                        <p class="text-[9px] text-neutral-500">Order ID: <code class="font-mono">${t.order_id}</code></p>
+                    </div>
+                    <div class="text-amber-500 font-semibold text-xs tracking-widest">${stars}</div>
+                    <p class="text-xs text-neutral-300 italic">"${t.review}"</p>
+                    ${actionRow}
+                `;
+                container.appendChild(card);
+            });
+        }
+
+        function approveTesti(idx) {
+            state.testimonials[idx].status = 'approved';
+            showToast("Ulasan disetujui & dipublikasikan ke channel!");
+            renderTestimonials();
+            renderStats();
+        }
+
+        function rejectTesti(idx) {
+            state.testimonials[idx].status = 'rejected';
+            showToast("Ulasan ditolak dari sistem.", "error");
+            renderTestimonials();
+        }
+
+        // ================= KICK & SCAN USER GRUP =================
+        function scanUserInGroups() {
+            const userId = parseInt(document.getElementById('group-scan-id').value);
+            if (!userId) {
+                showToast("Masukkan User ID terlebih dahulu!", "error");
+                return;
+            }
+
+            const resultsContainer = document.getElementById('scan-result');
+            resultsContainer.innerHTML = '';
+            resultsContainer.classList.remove('hidden');
+
+            state.groups.forEach(group => {
+                const isMember = group.members.includes(userId);
+                const tr = document.createElement('div');
+                tr.className = "flex items-center justify-between py-3 text-xs";
+
+                const icon = isMember ? `<span class="text-emerald-400 font-bold flex items-center gap-1"><i data-lucide="check-circle" class="w-3.5 h-3.5"></i> Terdaftar</span>` : `<span class="text-neutral-500 flex items-center gap-1"><i data-lucide="circle-dashed" class="w-3.5 h-3.5"></i> Tidak Ada</span>`;
+                const kickBtn = isMember ? `<button onclick="kickUserFromSimGroup(${userId}, '${group.chat_id}')" class="px-2.5 py-1 bg-rose-600/10 hover:bg-rose-600/20 text-rose-400 border border-rose-500/20 text-[10px] font-bold uppercase tracking-wider rounded transition">Kick</button>` : `<span class="text-[10px] text-neutral-600 italic">No Action</span>`;
+
+                tr.innerHTML = `
+                    <div class="space-y-0.5">
+                        <p class="font-semibold text-neutral-200">${group.nama}</p>
+                        <p class="text-[9px] text-neutral-500 font-mono">ID: ${group.chat_id}</p>
+                    </div>
+                    <div>${icon}</div>
+                    <div>${kickBtn}</div>
+                `;
+                resultsContainer.appendChild(tr);
+            });
+            lucide.createIcons();
+        }
+
+        function kickUserFromSimGroup(userId, groupId) {
+            const group = state.groups.find(g => g.chat_id === groupId);
+            if (group) {
+                group.members = group.members.filter(id => id !== userId);
+                showToast(`User ${userId} ditendang dari grup ${group.nama}!`, 'error');
+                scanUserInGroups();
+            }
+        }
+
+        // Banned Users
+        function renderBannedUsers() {
+            const tbody = document.getElementById('banned-table-body');
+            tbody.innerHTML = '';
+
+            state.bannedUsers.forEach((user, idx) => {
+                const tr = document.createElement('tr');
+                tr.className = "hover:bg-neutral-900/40 transition border-b border-neutral-850";
+                tr.innerHTML = `
+                    <td class="p-3 font-mono text-[10px] text-neutral-200"><code>${user.user_id}</code></td>
+                    <td class="p-3 text-neutral-300">${user.reason}</td>
+                    <td class="p-3 text-neutral-500 font-mono">${user.banned_at}</td>
+                    <td class="p-3 text-right">
+                        <button onclick="unbanUser(${idx})" class="px-2 py-1 bg-neutral-850 hover:bg-neutral-800 text-emerald-400 transition rounded text-[10px] font-bold uppercase">Unban</button>
+                    </td>
+                `;
+                tbody.appendChild(tr);
+            });
+        }
+
+        function executeBan(event) {
+            event.preventDefault();
+            const userId = parseInt(document.getElementById('ban-user-id').value);
+            const reason = document.getElementById('ban-reason').value;
+
+            const exists = state.bannedUsers.find(u => u.user_id === userId);
+            if (exists) {
+                showToast("Pengguna ini sudah berada di daftar hitam!", "error");
+                return;
+            }
+
+            const now = new Date();
+            const timeStr = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')} - ${now.getDate().toString().padStart(2, '0')}/${(now.getMonth()+1).toString().padStart(2, '0')}/${now.getFullYear()}`;
+
+            state.bannedUsers.unshift({ user_id: userId, reason: reason, banned_at: timeStr });
+            document.getElementById('ban-user-id').value = '';
+            document.getElementById('ban-reason').value = '';
+            showToast(`ID ${userId} sukses dibanned.`);
+            renderBannedUsers();
+        }
+
+        function unbanUser(idx) {
+            const user = state.bannedUsers[idx];
+            state.bannedUsers.splice(idx, 1);
+            showToast(`ID ${user.user_id} dipulihkan.`);
+            renderBannedUsers();
+        }
+
+        // ================= KRU ADMINS =================
+        function renderAdmins() {
+            const tbody = document.getElementById('admins-table-body');
+            tbody.innerHTML = '';
+
+            state.admins.forEach((admin, idx) => {
+                const tr = document.createElement('tr');
+                tr.className = "hover:bg-neutral-900/40 transition duration-150 border-b border-neutral-850";
+                tr.innerHTML = `
+                    <td class="p-4 font-semibold text-neutral-200">${admin.nama}</td>
+                    <td class="p-4 font-mono text-[10px]"><code>${admin.user_id}</code></td>
+                    <td class="p-4 font-mono text-[10px] text-neutral-400"><code>${admin.added_by}</code></td>
+                    <td class="p-4 text-neutral-400 font-mono">${admin.added_at}</td>
+                    <td class="p-4 text-right">
+                        <button onclick="removeAdmin(${idx})" class="text-[10px] uppercase font-bold text-rose-500 hover:text-rose-400">Hapus</button>
+                    </td>
+                `;
+                tbody.appendChild(tr);
+            });
+        }
+
+        function openAdminModal() {
+            document.getElementById('admin-modal').classList.remove('hidden');
+        }
+
+        function closeAdminModal() {
+            document.getElementById('admin-modal').classList.add('hidden');
+        }
+
+        function saveAdmin(event) {
+            event.preventDefault();
+            const nama = document.getElementById('form-admin-name').value;
+            const user_id = parseInt(document.getElementById('form-admin-id').value);
+
+            const exists = state.admins.find(a => a.user_id === user_id);
+            if (exists) {
+                showToast("ID Admin ini sudah terdaftar!", "error");
+                return;
+            }
+
+            const now = new Date();
+            const dateStr = `${now.getDate().toString().padStart(2, '0')}/${(now.getMonth()+1).toString().padStart(2, '0')}/${now.getFullYear()}`;
+
+            state.admins.push({
+                user_id: user_id,
+                nama: nama,
+                added_by: 12345678,
+                added_at: dateStr
+            });
+
+            closeAdminModal();
+            document.getElementById('admin-form').reset();
+            showToast(`Kru admin ${nama} sukses ditambahkan!`);
+            renderAdmins();
+        }
+
+        function removeAdmin(idx) {
+            const a = state.admins[idx];
+            state.admins.splice(idx, 1);
+            showToast(`Admin ${a.nama} dicabut aksesnya.`, 'error');
+            renderAdmins();
+        }
+
+        // ================= BROADCAST LOGIC (SANDBOX) =================
+        function updateBroadcastPreview() {
+            const text = document.getElementById('broadcast-input').value;
+            const previewContainer = document.getElementById('broadcast-preview-container');
+            const alertEl = document.getElementById('html-validation-alert');
+            
+            if (!text.trim()) {
+                previewContainer.innerHTML = `<span class="text-neutral-600 italic">Ketik teks broadcast Anda di editor sebelah kiri untuk melihat simulasi visual di sini...</span>`;
+                alertEl.classList.add('hidden');
+                return;
+            }
+
+            // Validasi parser HTML asinkron Telegram sederhana
+            try {
+                // Periksa keseimbangan tag dasar
+                const basicTags = ['b', 'i', 'code'];
+                basicTags.forEach(tag => {
+                    const openCount = (text.match(new RegExp(`<${tag}>`, 'g')) || []).length;
+                    const closeCount = (text.match(new RegExp(`</${tag}>`, 'g')) || []).length;
+                    if (openCount !== closeCount) {
+                        throw new Error(`Keseimbangan tag <${tag}> tidak cocok.`);
+                    }
+                });
+
+                // Render sederhana
+                let rendered = text
+                    .replace(/&/g, "&amp;")
+                    .replace(/</g, "&lt;")
+                    .replace(/>/g, "&gt;")
+                    .replace(/&lt;b&gt;/g, "<b>")
+                    .replace(/&lt;\/b&gt;/g, "</b>")
+                    .replace(/&lt;i&gt;/g, "<i>")
+                    .replace(/&lt;\/i&gt;/g, "</i>")
+                    .replace(/&lt;code&gt;/g, "<code class='bg-neutral-800 px-1.5 py-0.5 border border-neutral-700 rounded font-mono text-[10px] text-amber-400'>")
+                    .replace(/&lt;\/code&gt;/g, "</code>");
+
+                previewContainer.innerHTML = rendered.replace(/\n/g, '<br>');
+                alertEl.classList.add('hidden');
+            } catch (err) {
+                previewContainer.innerHTML = `<span class="text-rose-500 italic font-mono">[SINTAKS ERROR]: ${err.message}</span>`;
+                alertEl.classList.remove('hidden');
+            }
+        }
+
+        function triggerBroadcast() {
+            const text = document.getElementById('broadcast-input').value;
+            if (!text.trim()) {
+                showToast("Pesan broadcast masih kosong!", "error");
+                return;
+            }
+
+            const alertEl = document.getElementById('html-validation-alert');
+            if (!alertEl.classList.contains('hidden')) {
+                showToast("Perbaiki sintaks HTML yang rusak terlebih dahulu!", "error");
+                return;
+            }
+
+            // Jalankan simulasi pengiriman asinkron masal
+            const progressBar = document.getElementById('broadcast-progress-bar');
+            progressBar.classList.remove('hidden');
+
+            let count = 0;
+            const max = 452;
+            
+            clearInterval(state.broadcastSimInterval);
+            state.broadcastSimInterval = setInterval(() => {
+                count += Math.floor(Math.random() * 40) + 10;
+                if (count >= max) {
+                    count = max;
+                    clearInterval(state.broadcastSimInterval);
+                    showToast("Pesan broadcast terkirim ke seluruh buyer terdaftar!");
+                    setTimeout(() => { progressBar.classList.add('hidden'); }, 2000);
+                }
+
+                const percent = Math.round((count / max) * 100);
+                document.getElementById('broadcast-percent').innerText = `${percent}%`;
+                document.getElementById('broadcast-progress-fill').style.width = `${percent}%`;
+                document.getElementById('broadcast-sent-count').innerText = `Terkirim: ${count} / ${max}`;
+            }, 150);
+        }
+
+        function stopBroadcastSim() {
+            clearInterval(state.broadcastSimInterval);
+            document.getElementById('broadcast-progress-bar').classList.add('hidden');
+            showToast("Progres broadcast dihentikan paksa admin.", "error");
+        }
+
+        // ================= DATABASE BACKUP & FILE MANAGER =================
+        function simulateZipBackup() {
+            showToast("Berhasil mengonversi CSV. Mengunduh backup_20260606.zip...");
+        }
+
+        function simulateJsonBackup() {
+            showToast("Berhasil mengekspor format data. Mengunduh export_20260606.json...");
+        }
+
+        function handleFileSelect(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                try {
+                    const parsedData = JSON.parse(e.target.result);
+                    if (parsedData.products && parsedData.orders) {
+                        showToast(`Singkronisasi Berhasil! Memulihkan ${parsedData.products.length} Produk & ${parsedData.orders.length} Transaksi.`);
+                        state.products = parsedData.products;
+                        state.orders = parsedData.orders;
+                        renderAllData();
+                        updateCharts();
+                    } else {
+                        throw new Error();
+                    }
+                } catch (err) {
+                    showToast("Format JSON salah! Pastikan file berasal dari menu Export.", "error");
+                }
+            };
+            reader.readAsText(file);
+        }
+
+        // ================= MODAL PRODUCT LOGIC =================
+        function openProductModal(idx = null) {
+            const modal = document.getElementById('product-modal');
+            modal.classList.remove('hidden');
+
+            // Render visual Checkboxes Prasyarat
+            const prereqContainer = document.getElementById('prereq-checkboxes');
+            prereqContainer.innerHTML = '';
+
+            if (idx !== null) {
+                // Mode Edit Produk
+                const p = state.products[idx];
+                document.getElementById('modal-title').innerText = "Edit Produk";
+                document.getElementById('form-product-index').value = idx;
+                document.getElementById('form-product-emoji').value = p.emoji;
+                document.getElementById('form-product-name').value = p.nama;
+                document.getElementById('form-product-id').value = p.paket_id;
+                document.getElementById('form-product-price').value = p.harga;
+                document.getElementById('form-product-group').value = p.group_chat_id || '';
+
+                // Buat list checklist
+                state.products.forEach(otherProd => {
+                    if (otherProd.paket_id !== p.paket_id) {
+                        const isChecked = p.requires_paket_ids && p.requires_paket_ids.split(',').includes(otherProd.paket_id);
+                        prereqContainer.innerHTML += `
+                            <label class="flex items-center gap-2 text-xs text-neutral-300 cursor-pointer">
+                                <input type="checkbox" name="prereq_items" value="${otherProd.paket_id}" ${isChecked ? 'checked' : ''} class="rounded border-neutral-850 bg-neutral-950 text-indigo-600 focus:ring-0">
+                                <span>${otherProd.emoji} ${otherProd.nama} (${otherProd.paket_id})</span>
+                            </label>
+                        `;
+                    }
+                });
+            } else {
+                // Mode Tambah
+                document.getElementById('modal-title').innerText = "Tambah Produk Baru";
+                document.getElementById('product-form').reset();
+                document.getElementById('form-product-index').value = '';
+
+                state.products.forEach(otherProd => {
+                    prereqContainer.innerHTML += `
+                        <label class="flex items-center gap-2 text-xs text-neutral-300 cursor-pointer">
+                            <input type="checkbox" name="prereq_items" value="${otherProd.paket_id}" class="rounded border-neutral-850 bg-neutral-950 text-indigo-600 focus:ring-0">
+                            <span>${otherProd.emoji} ${otherProd.nama} (${otherProd.paket_id})</span>
+                        </label>
+                    `;
+                });
+            }
+        }
+
+        function closeProductModal() {
+            document.getElementById('product-modal').classList.add('hidden');
+        }
+
+        function saveProduct(event) {
+            event.preventDefault();
+            const idx = document.getElementById('form-product-index').value;
+            const emoji = document.getElementById('form-product-emoji').value;
+            const nama = document.getElementById('form-product-name').value;
+            const paket_id = document.getElementById('form-product-id').value;
+            const harga = parseInt(document.getElementById('form-product-price').value);
+            const group = document.getElementById('form-product-group').value || null;
+
+            // Dapatkan list prasyarat dari Checkboxes
+            const checkedPrereqs = [];
+            const checkboxes = document.getElementsByName('prereq_items');
+            checkboxes.forEach(cb => {
+                if (cb.checked) checkedPrereqs.push(cb.value);
+            });
+            const prereq_str = checkedPrereqs.length > 0 ? checkedPrereqs.join(',') : null;
+
+            if (idx !== '') {
+                state.products[idx] = {
+                    ...state.products[idx],
+                    emoji, nama, paket_id, harga, group_chat_id: group, requires_paket_ids: prereq_str
+                };
+                showToast(`Produk "${nama}" sukses disimpan!`);
+            } else {
+                state.products.push({
+                    emoji, nama, paket_id, harga, link: "https://t.me/Kikukkvd", group_chat_id: group, requires_paket_ids: prereq_str, aktif: true
+                });
+                showToast(`Produk "${nama}" sukses terdaftar!`);
+            }
+
+            closeProductModal();
+            renderProducts();
+            updateCharts();
+        }
+
+        // Toggle Status & Lainnya
+        function toggleProductStatus(idx) {
+            state.products[idx].aktif = !state.products[idx].aktif;
+            const status = state.products[idx].aktif ? "diaktifkan" : "dinonaktifkan";
+            showToast(`Status "${state.products[idx].nama}" ${status}!`);
+            renderProducts();
+        }
+
+        function deleteProduct(idx) {
+            const p = state.products[idx];
+            state.products.splice(idx, 1);
+            showToast(`Produk "${p.nama}" deleted.`, 'error');
+            renderProducts();
+            updateCharts();
+        }
+
+        function manualConfirmOrder(orderId) {
+            const order = state.orders.find(o => o.order_id === orderId);
+            if (order) {
+                order.status = 'completed';
+                showToast(`Status Order ${orderId} diubah menjadi lunas!`);
+                renderAllData();
+                updateCharts();
+            }
+        }
+
+        function manualCancelOrder(orderId) {
+            const order = state.orders.find(o => o.order_id === orderId);
+            if (order) {
+                order.status = 'cancelled';
+                showToast(`Order ${orderId} dibatalkan.`, 'error');
+                renderAllData();
+            }
+        }
+
+        function toggleMaintenanceMode() {
+            const active = document.getElementById('cfg-maintenance-toggle').checked;
+            state.maintenance = active;
+            const textEl = document.getElementById('maintenance-text-status');
+            
+            if (active) {
+                textEl.innerText = "Maintenance: ON";
+                textEl.className = "text-xs font-semibold text-rose-400";
+                showToast("Mode Maintenance aktif. Bot tidak melayani transaksi!", 'error');
+            } else {
+                textEl.innerText = "Maintenance: OFF";
+                textEl.className = "text-xs font-semibold text-neutral-200";
+                showToast("Mode Maintenance tidak aktif.");
+            }
+        }
+
+        function saveConfiguration() {
+            showToast("Konfigurasi API, Webhook Secret & Channel ID diperbarui.");
+        }
+
+        function copyToClipboard(text) {
+            const input = document.createElement('input');
+            input.setAttribute('value', text);
+            document.body.appendChild(input);
+            input.select();
+            document.execCommand('copy');
+            document.body.removeChild(input);
+            showToast("Order ID disalin ke clipboard!");
+        }
+
+        // Sinkronisasi data order masuk simulasi baru secara real-time untuk pengetesan omset hari ini
+        function syncSimulatedData() {
+            showToast("Kueri sync database ty.py sukses dipanggil.");
+            const now = new Date();
+            const dd = String(now.getDate()).padStart(2, '0');
+            const mm = String(now.getMonth() + 1).padStart(2, '0');
+            const yyyy = now.getFullYear();
+            const todayStr = `${dd}/${mm}/${yyyy}`;
+            
+            const timeStr = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')} - ${todayStr}`;
+            
+            const buyers = ["Ahmad Fauzi", "Wulandari", "Hendra Wijaya", "Rian Hidayat"];
+            const selectedUser = buyers[Math.floor(Math.random() * buyers.length)];
+            const selectedProd = state.products[Math.floor(Math.random() * state.products.length)];
+            const randomID = Math.floor(10000000 + Math.random() * 90000000);
+
+            // Transaksi masuk lunas otomatis untuk pengetesan live tracking omset hari ini
+            state.orders.unshift({
+                id: state.orders.length + 1,
+                user_id: randomID,
+                user_name: selectedUser,
+                paket_id: selectedProd.paket_id,
+                order_id: `HFB-${randomID}-${now.getFullYear()}${mm}${dd}-${Math.random().toString(36).substr(2, 4).toUpperCase()}`,
+                status: "completed", // disimulasikan sukses langsung agar omset hari ini bertambah secara dinamis
+                waktu: timeStr,
+                harga_dibayar: selectedProd.aktif ? selectedProd.harga : 5000
+            });
+
+            renderAllData();
+            updateCharts();
+        }
+
+        // ================= CHART CONFIGURATION =================
+        function initCharts() {
+            const trendCtx = document.getElementById('trendChart').getContext('2d');
+            trendChartInstance = new Chart(trendCtx, {
+                type: 'line',
+                data: {
+                    labels: ['Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu', 'Minggu'],
+                    datasets: [{
+                        label: 'Omzet',
+                        data: [150000, 320000, 220000, 480000, 390000, 650000, 890000],
+                        borderColor: '#4f46e5',
+                        backgroundColor: 'rgba(79, 70, 229, 0.05)',
+                        borderWidth: 2,
+                        fill: true,
+                        tension: 0.4
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: { legend: { display: false } },
+                    scales: {
+                        y: { grid: { color: '#1a1a1a' }, ticks: { color: '#525252', font: { size: 10 } } },
+                        x: { grid: { display: false }, ticks: { color: '#525252', font: { size: 10 } } }
+                    }
+                }
+            });
+
+            const productCtx = document.getElementById('productChart').getContext('2d');
+            productChartInstance = new Chart(productCtx, {
+                type: 'doughnut',
+                data: getProductChartData(),
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                            position: 'bottom',
+                            labels: { color: '#737373', boxWidth: 10, font: { size: 10 } }
+                        }
+                    },
+                    cutout: '75%'
+                }
+            });
+        }
+
+        function getProductChartData() {
+            const labels = state.products.map(p => p.nama);
+            const data = state.products.map(p => {
+                return state.orders
+                    .filter(o => o.paket_id === p.paket_id && o.status === 'completed')
+                    .reduce((sum, o) => sum + o.harga_dibayar, 0) || 5000;
+            });
+
+            return {
+                labels: labels,
+                datasets: [{
+                    data: data,
+                    backgroundColor: ['#4f46e5', '#10b981', '#f59e0b', '#ec4899'],
+                    borderWidth: 0
+                }]
+            };
+        }
+
+        function updateCharts() {
+            if (trendChartInstance && productChartInstance) {
+                productChartInstance.data = getProductChartData();
+                productChartInstance.update();
+
+                const completed = state.orders.filter(o => o.status === 'completed');
+                const total = completed.reduce((sum, o) => sum + o.harga_dibayar, 0);
+                trendChartInstance.data.datasets[0].data[6] = total / 8;
+                trendChartInstance.update();
+            }
+        }
+    </script>
+</body>
+</html>

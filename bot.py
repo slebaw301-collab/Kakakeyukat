@@ -918,6 +918,22 @@ def set_sent_link(order_id, link):
         release_conn(conn)
 
 @async_wrap
+def get_completed_no_link_orders(user_id: int) -> list:
+    """Ambil semua order completed yang belum dapat link (pending prereq)."""
+    conn = get_conn()
+    try:
+        with conn.cursor() as c:
+            c.execute(
+                """SELECT * FROM orders
+                   WHERE user_id=%s AND status='completed'
+                   AND (sent_link IS NULL OR sent_link='')""",
+                (user_id,)
+            )
+            return [dict(r) for r in c.fetchall()]
+    finally:
+        release_conn(conn)
+
+@async_wrap
 def save_order(user_id, user_name, paket_id, order_id, harga_dibayar=0, order_changes=0):
     conn = get_conn()
     try:
@@ -1696,6 +1712,51 @@ async def pilih_paket(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     await _buat_order_baru(update, context, query, user_id, user_name, paket, order_changes=0)
 
+async def prereq_buy_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler ketika buyer klik 🛒 Beli [produk] dari pesan syarat prereq."""
+    query = update.callback_query
+    user_id = query.from_user.id
+    user_name = query.from_user.full_name
+
+    if await is_banned(user_id):
+        await query.answer("🚫 Akun kamu diblokir. Hubungi admin.", show_alert=True)
+        return
+
+    # Format: prereq_buy_{pid}|{parent_order_id}
+    parts = query.data.split("|")
+    prereq_pid = parts[0].replace("prereq_buy_", "")
+    parent_order_id = parts[1] if len(parts) > 1 else None
+
+    paket = await get_product(prereq_pid)
+    if not paket:
+        await query.answer("❌ Produk tidak ditemukan.", show_alert=True)
+        return
+
+    active = await get_active_order(user_id)
+    if active:
+        await query.answer("⏳ Kamu sudah punya invoice aktif! Batalkan dulu.", show_alert=True)
+        return
+
+    sisa = await get_cooldown_sisa_db(user_id)
+    if sisa > 0:
+        await query.answer(
+            f"⏳ Kamu baru saja membatalkan order. Coba lagi dalam {sisa} menit.",
+            show_alert=True
+        )
+        return
+
+    # Simpan konteks prereq agar back_start bisa tampilkan ulang pesan syarat
+    if parent_order_id:
+        parent_order = await get_order_by_id(parent_order_id)
+        if parent_order:
+            context.user_data['prereq_ctx'] = {
+                'parent_order_id': parent_order_id,
+                'parent_paket_id': parent_order['paket_id'],
+            }
+
+    await query.answer()
+    await _buat_order_baru(update, context, query, user_id, user_name, paket, order_changes=0)
+
 async def _buat_order_baru(update, context, query, user_id, user_name, paket, order_changes=0):
     """Helper: buat QRIS + simpan order + kirim ke buyer & admin."""
     loading_msg = await context.bot.send_message(
@@ -1749,20 +1810,35 @@ async def _buat_order_baru(update, context, query, user_id, user_name, paket, or
     qr_buffer = await asyncio.to_thread(generate_qr_image, qris_string)
 
     sisa_ganti = 2 - order_changes
+
+    # Tambah catatan konteks prereq jika buyer datang dari flow syarat
+    prereq_ctx = context.user_data.get('prereq_ctx') if context else None
+    prereq_note = ""
+    if prereq_ctx:
+        parent_pid = prereq_ctx.get('parent_paket_id')
+        parent_paket = await get_product(parent_pid) if parent_pid else None
+        if parent_paket:
+            prereq_note = (
+                f"\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📌 <b>Tujuan:</b> Syarat untuk {esc(parent_paket['emoji'])} {esc(parent_paket['nama'])}\n"
+                f"Setelah lunas, link akan <b>otomatis dikirim</b>. 🚀"
+            )
+
     caption = (
         f"<b>{esc(paket['emoji'])} {esc(paket['nama']).upper()}</b>\n"
-        f"========================\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"📋 <b>Detail Pembayaran</b>\n"
         f"- Harga: {format_harga(amount)}\n"
         f"- Fee: {format_harga(fee)}\n"
         f"- <b>Total: {format_harga(total_payment)}</b>\n\n"
         f"📝 Order ID: <code>{esc(order_id)}</code>\n"
         f"⏰ Berlaku hingga: {expire} WIB\n\n"
-        f"========================\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📱 <b>Scan QRIS di atas untuk membayar</b>\n\n"
         f"✅ Nominal sudah termasuk fee\n"
         f"✅ Pembayaran otomatis terverifikasi\n"
-        f"✅ Link produk dikirim otomatis setelah bayar\n\n"
+        f"✅ Link produk dikirim otomatis setelah bayar"
+        f"{prereq_note}\n\n"
         f"⏳ Menunggu pembayaran..."
     )
 
@@ -1841,12 +1917,62 @@ async def back_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if msg_id:
             await set_admin_msg_id(cancelled_order_id, msg_id)
 
+    # Ambil prereq_ctx SEBELUM clear agar tidak hilang
+    prereq_ctx = context.user_data.pop('prereq_ctx', None)
     context.user_data.clear()
 
     try:
         await query.message.delete()
     except Exception:
         pass
+
+    # Jika buyer batal dari flow prereq, tampilkan ulang pesan syarat
+    if prereq_ctx:
+        parent_order_id = prereq_ctx.get('parent_order_id')
+        parent_paket_id = prereq_ctx.get('parent_paket_id')
+        parent_order = await get_order_by_id(parent_order_id) if parent_order_id else None
+        parent_paket = await get_product(parent_paket_id) if parent_paket_id else None
+        if parent_order and parent_paket:
+            req_str = parent_paket.get("requires_paket_ids") or ""
+            all_req_ids = [p.strip() for p in req_str.split(",") if p.strip()]
+            missing = await check_prerequisites_sync(user_id, req_str)
+            missing_set = set(missing)
+            fulfilled_count = len(all_req_ids) - len(missing_set)
+            total_count = len(all_req_ids)
+
+            prereq_lines = []
+            buy_buttons = []
+            for pid in all_req_ids:
+                p_obj = await get_product(pid)
+                label = f"{p_obj['emoji']} {p_obj['nama']}" if p_obj else pid
+                if pid in missing_set:
+                    prereq_lines.append(f"  ❌ {label}")
+                    buy_buttons.append([InlineKeyboardButton(
+                        f"🛒 Beli {p_obj['nama'] if p_obj else pid}",
+                        callback_data=f"prereq_buy_{pid}|{parent_order_id}"
+                    )])
+                else:
+                    prereq_lines.append(f"  ✅ {label}")
+
+            prereq_status = "\n".join(prereq_lines)
+            msg = await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=(
+                    f"<b>⏸️ Pembelian dibatalkan</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"📦 Paket: {esc(parent_paket['emoji'])} {esc(parent_paket['nama'])}\n"
+                    f"🔖 Order ID: <code>{esc(parent_order_id)}</code>\n\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📋 Progress syarat <b>({fulfilled_count}/{total_count} terpenuhi)</b>:\n"
+                    f"{prereq_status}\n\n"
+                    f"Beli paket ❌ di bawah untuk melanjutkan. 👇"
+                ),
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(buy_buttons)
+            )
+            simpan_msg_user(context, user_id, msg.message_id)
+            await hapus_msg_user_lama(context, user_id, keep_last=1)
+            return
 
     msg = await context.bot.send_message(
         chat_id=update.effective_chat.id,
@@ -2143,13 +2269,27 @@ async def _handle_payment_success(bot, order_id: str, paket_id: str, user_id: in
     missing_prereqs = await check_prerequisites_sync(user_id, requires_str)
 
     if missing_prereqs:
-        # Ambil nama paket yang belum terpenuhi untuk ditampilkan
-        missing_names = []
-        for pid in missing_prereqs:
+        # Bangun status per item (✅/❌) untuk semua syarat
+        all_req_ids = [p.strip() for p in requires_str.split(",") if p.strip()]
+        missing_set = set(missing_prereqs)
+        fulfilled_count = len(all_req_ids) - len(missing_set)
+        total_count = len(all_req_ids)
+
+        prereq_lines = []
+        buy_buttons = []
+        for pid in all_req_ids:
             p_obj = await get_product(pid)
-            label = f"{p_obj['emoji']} {p_obj['nama']}" if p_obj else f"<code>{esc(pid)}</code>"
-            missing_names.append(label)
-        missing_list = "\n".join(f"  • {n}" for n in missing_names)
+            label = f"{p_obj['emoji']} {p_obj['nama']}" if p_obj else pid
+            if pid in missing_set:
+                prereq_lines.append(f"  ❌ {label}")
+                buy_buttons.append([InlineKeyboardButton(
+                    f"🛒 Beli {p_obj['nama'] if p_obj else pid}",
+                    callback_data=f"prereq_buy_{pid}|{order_id}"
+                )])
+            else:
+                prereq_lines.append(f"  ✅ {label}")
+
+        prereq_status = "\n".join(prereq_lines)
 
         # Beritahu buyer — pembayaran diterima tapi link ditahan
         try:
@@ -2157,21 +2297,19 @@ async def _handle_payment_success(bot, order_id: str, paket_id: str, user_id: in
                 chat_id=user_id,
                 text=(
                     f"<b>✅ PEMBAYARAN BERHASIL DITERIMA</b>\n"
-                    f"========================\n\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                     f"📦 Paket: {esc(paket['emoji'])} {esc(paket['nama'])}\n"
                     f"💰 Total: {format_harga(paid_amount)}\n"
                     f"🔖 Order ID: <code>{esc(order_id)}</code>\n\n"
-                    f"========================\n"
-                    f"⚠️ <b>Link belum bisa dikirim.</b>\n\n"
-                    f"Untuk mengakses paket ini, kamu harus sudah pernah membeli:\n"
-                    f"{missing_list}\n\n"
-                    f"Setelah kamu menyelesaikan pembelian paket di atas, "
-                    f"hubungi admin dan link akan segera dikirimkan. 🙏"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"⏸️ <b>Link ditahan — syarat belum terpenuhi</b>\n\n"
+                    f"📋 Progress syarat <b>({fulfilled_count}/{total_count} terpenuhi)</b>:\n"
+                    f"{prereq_status}\n\n"
+                    f"Beli paket ❌ di bawah. Setelah semua syarat\n"
+                    f"terpenuhi, link akan <b>otomatis dikirim</b>. 🚀"
                 ),
                 parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("💬 Hubungi Admin", url=await get_setting('link_admin', 'https://t.me/Kikukkvd'))
-                ]])
+                reply_markup=InlineKeyboardMarkup(buy_buttons)
             )
         except Exception as e:
             logger.error(f"[PAYMENT] Gagal kirim notif prereq ke buyer {user_id}: {e}")
@@ -2257,6 +2395,69 @@ async def _handle_payment_success(bot, order_id: str, paket_id: str, user_id: in
             )
         except Exception:
             pass
+
+    # Cek apakah payment ini memenuhi prereq untuk order lain yang pending
+    await _auto_deliver_pending_prereq_orders(bot, user_id, user_name)
+
+# =================== AUTO-DELIVER PENDING PREREQ ORDERS ===================
+
+async def _auto_deliver_pending_prereq_orders(bot, user_id: int, user_name: str):
+    """Setelah payment sukses, cek apakah order lain yang prereq-nya sekarang terpenuhi."""
+    pending = await get_completed_no_link_orders(user_id)
+    if not pending:
+        return
+    for order in pending:
+        pid = order['paket_id']
+        oid = order['order_id']
+        paket = await get_product(pid)
+        if not paket:
+            continue
+        req_str = paket.get("requires_paket_ids") or ""
+        if not req_str:
+            continue
+        missing = await check_prerequisites_sync(user_id, req_str)
+        if missing:
+            continue  # masih ada yang belum terpenuhi
+
+        # Semua prereq sudah terpenuhi! Auto-kirim link.
+        group_link = await generate_group_link(bot, paket, oid)
+        link = group_link or (paket.get("link") or DEFAULT_LINK)
+        link_section = _build_link_section(group_link, link)
+        try:
+            await bot.send_message(
+                chat_id=user_id,
+                text=(
+                    f"<b>🎉 SEMUA SYARAT TERPENUHI!</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"📦 Paket: {esc(paket['emoji'])} {esc(paket['nama'])}\n"
+                    f"🔖 Order ID: <code>{esc(oid)}</code>\n\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"{link_section}\n\n"
+                    f"Terima kasih! Nikmati paketmu. 🙏\n\n"
+                    f"Bantu kami berkembang dengan memberikan ulasan:"
+                ),
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⭐ Beri Ulasan / Testimoni", callback_data=f"rate_start|{oid}")]
+                ])
+            )
+        except Exception as e:
+            logger.error(f"[AUTO-PREREQ] Gagal kirim link ke buyer {user_id}: {e}")
+            continue
+
+        await set_sent_link(oid, link)
+        await hapus_notif_lama(bot, oid)
+        msg_id = await kirim_notif(
+            bot,
+            _format_order_notif(
+                "✅ <b>LINK AUTO-TERKIRIM (Syarat Terpenuhi)</b>",
+                user_name, user_id, paket, oid,
+                amount=order.get('harga_dibayar', 0),
+                extra="🤖 Link dikirim otomatis setelah semua syarat terpenuhi."
+            )
+        )
+        if msg_id:
+            await set_admin_msg_id(oid, msg_id)
 
 # =================== ADMIN: KIRIM LINK PREREQ MANUAL ===================
 
@@ -5737,6 +5938,7 @@ def main():
     # User callbacks
     app.add_handler(CallbackQueryHandler(buy_callback,         pattern="^buy$"))
     app.add_handler(CallbackQueryHandler(pilih_paket,          pattern="^pilih_"))
+    app.add_handler(CallbackQueryHandler(prereq_buy_handler,   pattern="^prereq_buy_"))
     app.add_handler(CallbackQueryHandler(back_start,           pattern="^back_start$"))
     app.add_handler(CallbackQueryHandler(ganti_paket_list,     pattern="^ganti_paket_list$"))
     app.add_handler(CallbackQueryHandler(ganti_paket_konfirm,  pattern="^ganti_paket_konfirm\\|"))

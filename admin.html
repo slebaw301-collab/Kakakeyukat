@@ -4,6 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>HyperFamily - Premium Admin Dashboard</title>
+    <!-- Telegram Mini App SDK (harus paling pertama) -->
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
     <!-- Google Fonts Inter -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -732,75 +734,95 @@
 
     <!-- ================= JAVASCRIPT LOGIKAL WORKSPACE ================= -->
     <script>
-        // Simulasi database State sinkron dengan ty.py
+        // ===== TELEGRAM MINI APP INIT =====
+        const tg = window.Telegram?.WebApp;
+        if (tg) {
+            tg.expand();   // full-screen
+            tg.ready();    // sinyal ke Telegram bahwa app sudah siap
+            // Aktifkan tombol back Telegram agar bisa tutup panel
+            tg.BackButton.show();
+            tg.BackButton.onClick(() => tg.close());
+        }
+
+        // ===== API CONFIG =====
+        // Prioritas auth: (1) Telegram initData, (2) ADMIN_API_KEY injeksi bot, (3) localStorage, (4) prompt
+        const _INJECTED_KEY = '__ADMIN_API_KEY__';
+        let API_KEY = _INJECTED_KEY && _INJECTED_KEY !== '__ADMIN_API_KEY__' ? _INJECTED_KEY : (localStorage.getItem('admin_api_key') || '');
+
+        function getAuthHeader() {
+            // Jika dibuka via Telegram Mini App, gunakan initData untuk auth
+            if (tg && tg.initData) return `tma ${tg.initData}`;
+            // Fallback: ADMIN_API_KEY
+            return `Bearer ${API_KEY}`;
+        }
+
+        // Jika bukan Mini App dan key belum ada, minta dari user
+        if (!tg?.initData && !API_KEY) {
+            API_KEY = prompt('Masukkan ADMIN_API_KEY untuk autentikasi:') || '';
+            if (API_KEY) localStorage.setItem('admin_api_key', API_KEY);
+        }
+
+        const API_BASE = '';  // same-origin
+
+        async function apiCall(endpoint, method = 'GET', body = null) {
+            const opts = {
+                method,
+                headers: { 'Authorization': getAuthHeader(), 'Content-Type': 'application/json' }
+            };
+            if (body) opts.body = JSON.stringify(body);
+            const res = await fetch(API_BASE + endpoint, opts);
+            if (res.status === 401) throw new Error('Autentikasi gagal. Pastikan kamu admin & ADMIN_API_KEY sudah diset di Railway.');
+            if (!res.ok) {
+                let errMsg = `HTTP ${res.status}`;
+                try { const d = await res.json(); errMsg = d.error || errMsg; } catch(e) {}
+                throw new Error(errMsg);
+            }
+            return res.json();
+        }
+
+        // ===== STATE =====
         let state = {
-            products: [
-                { emoji: "🔥", nama: "GB Biasa", paket_id: "gb_biasa", harga: 5000, link: "https://t.me/Kikukkvd", group_chat_id: null, requires_paket_ids: null, aktif: true },
-                { emoji: "👑", nama: "GB VIP", paket_id: "gb_vip", harga: 25000, link: "https://t.me/Kikukkvd", group_chat_id: "-1001234567890", requires_paket_ids: "gb_biasa", aktif: true }
-            ],
-            orders: [
-                { id: 1, user_id: 87654321, user_name: "Yanto Widodo", paket_id: "gb_biasa", order_id: "HFB-87654321-20260601-ABC1", status: "completed", waktu: "12:30 - 05/06/2026", harga_dibayar: 5000 },
-                { id: 2, user_id: 11223344, user_name: "Budi Pratama", paket_id: "gb_vip", order_id: "HFB-11223344-20260604-XYZ2", status: "completed", waktu: "15:45 - 04/06/2026", harga_dibayar: 25000 },
-                { id: 3, user_id: 99887766, user_name: "Sarah Amanda", paket_id: "gb_vip", order_id: "HFB-99887766-20260606-QWE3", status: "waiting", waktu: "07:15 - 06/06/2026", harga_dibayar: 25150 },
-                { id: 4, user_id: 55667788, user_name: "Rizky Fauzi", paket_id: "gb_biasa", order_id: "HFB-55667788-20260605-MNO4", status: "cancelled", waktu: "21:10 - 05/06/2026", harga_dibayar: 5000 }
-            ],
-            bannedUsers: [
-                { user_id: 99999999, reason: "Terdeteksi melakukan spam link grup privat", banned_at: "10:15 - 03/06/2026" }
-            ],
-            testimonials: [
-                { user_id: 11223344, user_name: "Budi Pratama", paket_id: "gb_vip", order_id: "HFB-11223344-20260604-XYZ2", rating: 5, review: "Akses grup otomatisnya kencang gila! Mantap HyperFamily.", status: "approved" },
-                { user_id: 87654321, user_name: "Yanto Widodo", paket_id: "gb_biasa", order_id: "HFB-87654321-20260601-ABC1", rating: 4, review: "Bagus, admin ramah, tapi nunggu polling QRIS 2 menit tadi.", status: "pending" }
-            ],
-            admins: [
-                { user_id: 77777777, nama: "Kiki Admin", added_by: 12345678, added_at: "01/01/2026" }
-            ],
-            groups: [
-                { chat_id: "-1001234567890", nama: "HyperFamily VIP Base", members: [11223344] }
-            ],
-            maintenance: false,
+            products: [],
+            orders: [],
+            bannedUsers: [],
+            testimonials: [],
+            admins: [],
             currentOrderFilter: 'all',
-            broadcastSimInterval: null
+            apiStats: null
         };
 
         let trendChartInstance = null;
         let productChartInstance = null;
 
-        // Atur tanggal order simulasi secara dinamis saat webapp dijalankan agar live tracking berfungsi akurat
-        function initDynamicDates() {
-            const now = new Date();
-            const format = (d) => {
-                const dd = String(d.getDate()).padStart(2, '0');
-                const mm = String(d.getMonth() + 1).padStart(2, '0');
-                const yyyy = d.getFullYear();
-                return `${dd}/${mm}/${yyyy}`;
-            };
-            
-            const todayStr = format(now);
-            const yesterdayStr = format(new Date(now.getTime() - 24 * 60 * 60 * 1000));
-
-            // Set waktu pesanan 1 & 2 secara dinamis
-            state.orders[0].waktu = `12:30 - ${yesterdayStr}`; // Lunas kemarin (Rp 5.000)
-            state.orders[1].waktu = `15:45 - ${todayStr}`;     // Lunas hari ini (Rp 25.000)
-
-            // Tambah transaksi lunas tambahan khusus hari ini agar omset default terlihat realistis
-            state.orders.push({
-                id: 5,
-                user_id: 34567890,
-                user_name: "Santi Lestari",
-                paket_id: "gb_biasa",
-                order_id: `HFB-34567890-TODAY-001`,
-                status: "completed",
-                waktu: `10:15 - ${todayStr}`,
-                harga_dibayar: 5000
-            });
+        // ===== LOAD DATA DARI BACKEND =====
+        async function loadData() {
+            try {
+                const [products, orders, testimonials, banned, admins, stats] = await Promise.all([
+                    apiCall('/api/products'),
+                    apiCall('/api/orders'),
+                    apiCall('/api/testimonials'),
+                    apiCall('/api/banned'),
+                    apiCall('/api/admins'),
+                    apiCall('/api/stats')
+                ]);
+                state.products     = products;
+                state.orders       = orders;
+                state.testimonials = testimonials;
+                state.bannedUsers  = banned;
+                state.admins       = admins;
+                state.apiStats     = stats;
+                renderAllData();
+                updateCharts();
+            } catch (e) {
+                showToast('Gagal memuat data: ' + e.message, 'error');
+            }
         }
 
         window.onload = function() {
-            initDynamicDates();
             lucide.createIcons();
-            renderAllData();
             initCharts();
             updateBroadcastPreview();
+            loadData();
         };
 
         // SPA View Switcher
@@ -889,55 +911,22 @@
             renderAdmins();
         }
 
-        // Hitung dan Render Seluruh Metrik Finansial Lengkap (Hari Ini, Bulanan, AOV, Repeat Rate)
+        // Render stats dari API (state.apiStats sudah diisi loadData)
         function renderStats() {
-            const now = new Date();
-            const dd = String(now.getDate()).padStart(2, '0');
-            const mm = String(now.getMonth() + 1).padStart(2, '0');
-            const yyyy = now.getFullYear();
-            const todayStr = `${dd}/${mm}/${yyyy}`;
-            const currentMonthYear = `${mm}/${yyyy}`;
+            const s = state.apiStats;
+            if (!s) return;
 
-            const completed = state.orders.filter(o => o.status === 'completed');
-            
-            // 1. Total Omzet (All-Time)
-            const allTimeRevenue = completed.reduce((sum, o) => sum + o.harga_dibayar, 0);
-            
-            // 2. Omzet Hari Ini (Dihitung Dinamis!)
-            const todayOrders = completed.filter(o => o.waktu.includes(todayStr));
-            const todayRevenue = todayOrders.reduce((sum, o) => sum + o.harga_dibayar, 0);
-            
-            // 3. Omzet Bulan Ini
-            const monthOrders = completed.filter(o => o.waktu.includes(currentMonthYear));
-            const monthRevenue = monthOrders.reduce((sum, o) => sum + o.harga_dibayar, 0);
+            const fmt = (n) => "Rp " + (n || 0).toLocaleString('id-ID');
+            const repeatRate = s.total_buyers > 0 ? Math.round((s.repeat_buyers / s.total_buyers) * 100) : 0;
 
-            // 4. Waiting Queue
-            const waitingCount = state.orders.filter(o => o.status === 'waiting').length;
-
-            // 5. Rata-rata Nilai Order (AOV)
-            const aov = completed.length > 0 ? Math.round(allTimeRevenue / completed.length) : 0;
-
-            // 6. Pembeli Unik
-            const uniqueBuyers = new Set(completed.map(o => o.user_id)).size;
-
-            // 7. Repeat Purchase Rate (Persentase pelanggan RO)
-            const userCounts = {};
-            completed.forEach(o => {
-                userCounts[o.user_id] = (userCounts[o.user_id] || 0) + 1;
-            });
-            const repeatBuyers = Object.values(userCounts).filter(cnt => cnt > 1).length;
-            const repeatRate = uniqueBuyers > 0 ? Math.round((repeatBuyers / uniqueBuyers) * 100) : 0;
-
-            // Inject data ke UI
-            document.getElementById('stat-omzet-hari-ini').innerText = "Rp " + todayRevenue.toLocaleString('id-ID');
-            document.getElementById('stat-omzet-bulan-ini').innerText = "Rp " + monthRevenue.toLocaleString('id-ID');
-            document.getElementById('stat-omzet-all-time').innerText = "Rp " + allTimeRevenue.toLocaleString('id-ID');
-            document.getElementById('stat-waiting-queue').innerText = waitingCount + " Antrean";
-            
-            document.getElementById('stat-total-transaksi').innerText = completed.length + " Transaksi";
-            document.getElementById('stat-aov').innerText = "Rp " + aov.toLocaleString('id-ID');
-            document.getElementById('stat-unique-buyers').innerText = uniqueBuyers + " Pembeli";
-            document.getElementById('stat-repeat-rate').innerText = repeatRate + "%";
+            document.getElementById('stat-omzet-hari-ini').innerText  = fmt(s.today_revenue);
+            document.getElementById('stat-omzet-bulan-ini').innerText = fmt(s.month_revenue);
+            document.getElementById('stat-omzet-all-time').innerText  = fmt(s.total_revenue);
+            document.getElementById('stat-waiting-queue').innerText   = (s.active_count || 0) + " Antrean";
+            document.getElementById('stat-total-transaksi').innerText = (s.total_orders || 0) + " Transaksi";
+            document.getElementById('stat-aov').innerText             = fmt(s.aov);
+            document.getElementById('stat-unique-buyers').innerText   = (s.total_buyers || 0) + " Pembeli";
+            document.getElementById('stat-repeat-rate').innerText     = repeatRate + "%";
         }
 
         // Render Produk
@@ -959,14 +948,14 @@
                         <span class="text-base">${p.emoji}</span> ${p.nama}
                     </td>
                     <td class="p-4 font-mono text-[10px] text-neutral-400"><code>${p.paket_id}</code></td>
-                    <td class="p-4 font-mono text-neutral-300">Rp ${p.harga.toLocaleString('id-ID')}</td>
+                    <td class="p-4 font-mono text-neutral-300">Rp ${(p.harga||0).toLocaleString('id-ID')}</td>
                     <td class="p-4">${prereqLabel}</td>
                     <td class="p-4">${groupLabel}</td>
                     <td class="p-4">${statusBadge}</td>
                     <td class="p-4 text-right space-x-2">
-                        <button onclick="toggleProductStatus(${idx})" class="text-[10px] uppercase font-bold text-neutral-400 hover:text-white transition">${statusBtnText}</button>
+                        <button onclick="toggleProductStatus('${p.paket_id}', ${p.aktif})" class="text-[10px] uppercase font-bold text-neutral-400 hover:text-white transition">${statusBtnText}</button>
                         <button onclick="openProductModal(${idx})" class="text-[10px] uppercase font-bold text-indigo-400 hover:text-indigo-300 transition">Edit</button>
-                        <button onclick="deleteProduct(${idx})" class="text-[10px] uppercase font-bold text-rose-500 hover:text-rose-400 transition">Hapus</button>
+                        <button onclick="deleteProduct('${p.paket_id}')" class="text-[10px] uppercase font-bold text-rose-500 hover:text-rose-400 transition">Hapus</button>
                     </td>
                 `;
                 tbody.appendChild(tr);
@@ -1013,8 +1002,8 @@
                     </td>
                     <td class="p-4 font-mono text-[10px] text-neutral-300"><code>${o.paket_id}</code></td>
                     <td class="p-4 font-mono text-[10px] text-neutral-400"><code>${o.order_id}</code></td>
-                    <td class="p-4 text-emerald-400 font-mono">Rp ${o.harga_dibayar.toLocaleString('id-ID')}</td>
-                    <td class="p-4 text-neutral-400 font-mono">${o.waktu}</td>
+                    <td class="p-4 text-emerald-400 font-mono">Rp ${(o.harga_dibayar||0).toLocaleString('id-ID')}</td>
+                    <td class="p-4 text-neutral-400 font-mono">${(o.waktu||o.created_at||'').toString().substring(0,16).replace('T',' ')}</td>
                     <td class="p-4">${statusBadge}</td>
                     <td class="p-4 text-right">${actionBtn}</td>
                 `;
@@ -1055,20 +1044,21 @@
             const pendingCount = state.testimonials.filter(t => t.status === 'pending').length;
             document.getElementById('badge-pending-testi').innerText = pendingCount;
 
-            state.testimonials.forEach((t, idx) => {
+            state.testimonials.forEach((t) => {
                 const card = document.createElement('div');
                 card.className = "bg-neutral-900 border border-neutral-850 p-6 rounded-xl space-y-4 relative overflow-hidden";
                 
-                const stars = '★'.repeat(t.rating) + '☆'.repeat(5 - t.rating);
+                const stars = '★'.repeat(t.rating || 0) + '☆'.repeat(5 - (t.rating || 0));
                 let statusBadge = '';
                 let actionRow = '';
+                const reviewText = t.review || t.review_text || '-';
 
                 if (t.status === 'pending') {
                     statusBadge = `<span class="px-2 py-0.5 bg-amber-500/10 text-amber-400 text-[9px] font-bold uppercase tracking-wider rounded border border-amber-500/20 absolute top-4 right-4">PENDING</span>`;
                     actionRow = `
                         <div class="flex gap-2 justify-end pt-3 border-t border-neutral-850">
-                            <button onclick="approveTesti(${idx})" class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded text-[10px] font-bold uppercase transition">Setujui & Post</button>
-                            <button onclick="rejectTesti(${idx})" class="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-400 rounded text-[10px] font-bold uppercase transition">Tolak</button>
+                            <button onclick="approveTesti('${t.order_id}')" class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded text-[10px] font-bold uppercase transition">Setujui & Post</button>
+                            <button onclick="rejectTesti('${t.order_id}')" class="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-400 rounded text-[10px] font-bold uppercase transition">Tolak</button>
                         </div>
                     `;
                 } else if (t.status === 'approved') {
@@ -1080,28 +1070,31 @@
                 card.innerHTML = `
                     ${statusBadge}
                     <div class="space-y-1">
-                        <p class="font-bold text-neutral-200 text-xs">${t.user_name}</p>
+                        <p class="font-bold text-neutral-200 text-xs">${t.user_name || '–'}</p>
                         <p class="text-[9px] text-neutral-500">Order ID: <code class="font-mono">${t.order_id}</code></p>
                     </div>
                     <div class="text-amber-500 font-semibold text-xs tracking-widest">${stars}</div>
-                    <p class="text-xs text-neutral-300 italic">"${t.review}"</p>
+                    <p class="text-xs text-neutral-300 italic">"${reviewText}"</p>
                     ${actionRow}
                 `;
                 container.appendChild(card);
             });
         }
 
-        function approveTesti(idx) {
-            state.testimonials[idx].status = 'approved';
-            showToast("Ulasan disetujui & dipublikasikan ke channel!");
-            renderTestimonials();
-            renderStats();
+        async function approveTesti(orderId) {
+            try {
+                await apiCall(`/api/testimonials/${orderId}/action`, 'POST', { action: 'approve' });
+                showToast("Ulasan disetujui & dipublikasikan!");
+                await loadData();
+            } catch(e) { showToast('Gagal: ' + e.message, 'error'); }
         }
 
-        function rejectTesti(idx) {
-            state.testimonials[idx].status = 'rejected';
-            showToast("Ulasan ditolak dari sistem.", "error");
-            renderTestimonials();
+        async function rejectTesti(orderId) {
+            try {
+                await apiCall(`/api/testimonials/${orderId}/action`, 'POST', { action: 'reject' });
+                showToast("Ulasan ditolak.", "error");
+                await loadData();
+            } catch(e) { showToast('Gagal: ' + e.message, 'error'); }
         }
 
         // ================= KICK & SCAN USER GRUP =================
@@ -1151,47 +1144,42 @@
             const tbody = document.getElementById('banned-table-body');
             tbody.innerHTML = '';
 
-            state.bannedUsers.forEach((user, idx) => {
+            state.bannedUsers.forEach((user) => {
                 const tr = document.createElement('tr');
                 tr.className = "hover:bg-neutral-900/40 transition border-b border-neutral-850";
+                const bannedAt = user.banned_at ? String(user.banned_at).substring(0, 19) : '-';
                 tr.innerHTML = `
                     <td class="p-3 font-mono text-[10px] text-neutral-200"><code>${user.user_id}</code></td>
-                    <td class="p-3 text-neutral-300">${user.reason}</td>
-                    <td class="p-3 text-neutral-500 font-mono">${user.banned_at}</td>
+                    <td class="p-3 text-neutral-300">${user.reason || '-'}</td>
+                    <td class="p-3 text-neutral-500 font-mono">${bannedAt}</td>
                     <td class="p-3 text-right">
-                        <button onclick="unbanUser(${idx})" class="px-2 py-1 bg-neutral-850 hover:bg-neutral-800 text-emerald-400 transition rounded text-[10px] font-bold uppercase">Unban</button>
+                        <button onclick="unbanUser(${user.user_id})" class="px-2 py-1 bg-neutral-850 hover:bg-neutral-800 text-emerald-400 transition rounded text-[10px] font-bold uppercase">Unban</button>
                     </td>
                 `;
                 tbody.appendChild(tr);
             });
         }
 
-        function executeBan(event) {
+        async function executeBan(event) {
             event.preventDefault();
             const userId = parseInt(document.getElementById('ban-user-id').value);
             const reason = document.getElementById('ban-reason').value;
-
-            const exists = state.bannedUsers.find(u => u.user_id === userId);
-            if (exists) {
-                showToast("Pengguna ini sudah berada di daftar hitam!", "error");
-                return;
-            }
-
-            const now = new Date();
-            const timeStr = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')} - ${now.getDate().toString().padStart(2, '0')}/${(now.getMonth()+1).toString().padStart(2, '0')}/${now.getFullYear()}`;
-
-            state.bannedUsers.unshift({ user_id: userId, reason: reason, banned_at: timeStr });
-            document.getElementById('ban-user-id').value = '';
-            document.getElementById('ban-reason').value = '';
-            showToast(`ID ${userId} sukses dibanned.`);
-            renderBannedUsers();
+            if (!userId) { showToast("Masukkan User ID!", "error"); return; }
+            try {
+                await apiCall('/api/banned', 'POST', { user_id: userId, reason: reason });
+                document.getElementById('ban-user-id').value = '';
+                document.getElementById('ban-reason').value = '';
+                showToast(`ID ${userId} sukses dibanned.`);
+                await loadData();
+            } catch(e) { showToast('Gagal ban: ' + e.message, 'error'); }
         }
 
-        function unbanUser(idx) {
-            const user = state.bannedUsers[idx];
-            state.bannedUsers.splice(idx, 1);
-            showToast(`ID ${user.user_id} dipulihkan.`);
-            renderBannedUsers();
+        async function unbanUser(userId) {
+            try {
+                await apiCall(`/api/banned/${userId}`, 'DELETE');
+                showToast(`ID ${userId} dipulihkan.`);
+                await loadData();
+            } catch(e) { showToast('Gagal unban: ' + e.message, 'error'); }
         }
 
         // ================= KRU ADMINS =================
@@ -1199,16 +1187,17 @@
             const tbody = document.getElementById('admins-table-body');
             tbody.innerHTML = '';
 
-            state.admins.forEach((admin, idx) => {
+            state.admins.forEach((admin) => {
                 const tr = document.createElement('tr');
                 tr.className = "hover:bg-neutral-900/40 transition duration-150 border-b border-neutral-850";
+                const addedAt = admin.added_at ? String(admin.added_at).substring(0, 10) : '-';
                 tr.innerHTML = `
-                    <td class="p-4 font-semibold text-neutral-200">${admin.nama}</td>
+                    <td class="p-4 font-semibold text-neutral-200">${admin.nama || '-'}</td>
                     <td class="p-4 font-mono text-[10px]"><code>${admin.user_id}</code></td>
-                    <td class="p-4 font-mono text-[10px] text-neutral-400"><code>${admin.added_by}</code></td>
-                    <td class="p-4 text-neutral-400 font-mono">${admin.added_at}</td>
+                    <td class="p-4 font-mono text-[10px] text-neutral-400"><code>${admin.added_by || '-'}</code></td>
+                    <td class="p-4 text-neutral-400 font-mono">${addedAt}</td>
                     <td class="p-4 text-right">
-                        <button onclick="removeAdmin(${idx})" class="text-[10px] uppercase font-bold text-rose-500 hover:text-rose-400">Hapus</button>
+                        <button onclick="removeAdmin(${admin.user_id})" class="text-[10px] uppercase font-bold text-rose-500 hover:text-rose-400">Hapus</button>
                     </td>
                 `;
                 tbody.appendChild(tr);
@@ -1223,38 +1212,26 @@
             document.getElementById('admin-modal').classList.add('hidden');
         }
 
-        function saveAdmin(event) {
+        async function saveAdmin(event) {
             event.preventDefault();
-            const nama = document.getElementById('form-admin-name').value;
+            const nama    = document.getElementById('form-admin-name').value;
             const user_id = parseInt(document.getElementById('form-admin-id').value);
-
-            const exists = state.admins.find(a => a.user_id === user_id);
-            if (exists) {
-                showToast("ID Admin ini sudah terdaftar!", "error");
-                return;
-            }
-
-            const now = new Date();
-            const dateStr = `${now.getDate().toString().padStart(2, '0')}/${(now.getMonth()+1).toString().padStart(2, '0')}/${now.getFullYear()}`;
-
-            state.admins.push({
-                user_id: user_id,
-                nama: nama,
-                added_by: 12345678,
-                added_at: dateStr
-            });
-
-            closeAdminModal();
-            document.getElementById('admin-form').reset();
-            showToast(`Kru admin ${nama} sukses ditambahkan!`);
-            renderAdmins();
+            if (!user_id) { showToast("User ID tidak valid!", "error"); return; }
+            try {
+                await apiCall('/api/admins', 'POST', { user_id, nama });
+                closeAdminModal();
+                document.getElementById('admin-form').reset();
+                showToast(`Kru admin ${nama} sukses ditambahkan!`);
+                await loadData();
+            } catch(e) { showToast('Gagal tambah admin: ' + e.message, 'error'); }
         }
 
-        function removeAdmin(idx) {
-            const a = state.admins[idx];
-            state.admins.splice(idx, 1);
-            showToast(`Admin ${a.nama} dicabut aksesnya.`, 'error');
-            renderAdmins();
+        async function removeAdmin(userId) {
+            try {
+                await apiCall(`/api/admins/${userId}`, 'DELETE');
+                showToast(`Admin ${userId} dicabut aksesnya.`, 'error');
+                await loadData();
+            } catch(e) { showToast('Gagal hapus admin: ' + e.message, 'error'); }
         }
 
         // ================= BROADCAST LOGIC (SANDBOX) =================
@@ -1301,80 +1278,57 @@
             }
         }
 
-        function triggerBroadcast() {
+        async function triggerBroadcast() {
             const text = document.getElementById('broadcast-input').value;
-            if (!text.trim()) {
-                showToast("Pesan broadcast masih kosong!", "error");
-                return;
-            }
-
+            if (!text.trim()) { showToast("Pesan broadcast masih kosong!", "error"); return; }
             const alertEl = document.getElementById('html-validation-alert');
             if (!alertEl.classList.contains('hidden')) {
                 showToast("Perbaiki sintaks HTML yang rusak terlebih dahulu!", "error");
                 return;
             }
-
-            // Jalankan simulasi pengiriman asinkron masal
             const progressBar = document.getElementById('broadcast-progress-bar');
             progressBar.classList.remove('hidden');
-
-            let count = 0;
-            const max = 452;
-            
-            clearInterval(state.broadcastSimInterval);
-            state.broadcastSimInterval = setInterval(() => {
-                count += Math.floor(Math.random() * 40) + 10;
-                if (count >= max) {
-                    count = max;
-                    clearInterval(state.broadcastSimInterval);
-                    showToast("Pesan broadcast terkirim ke seluruh buyer terdaftar!");
-                    setTimeout(() => { progressBar.classList.add('hidden'); }, 2000);
-                }
-
-                const percent = Math.round((count / max) * 100);
-                document.getElementById('broadcast-percent').innerText = `${percent}%`;
-                document.getElementById('broadcast-progress-fill').style.width = `${percent}%`;
-                document.getElementById('broadcast-sent-count').innerText = `Terkirim: ${count} / ${max}`;
-            }, 150);
+            document.getElementById('broadcast-percent').innerText = '...';
+            document.getElementById('broadcast-sent-count').innerText = 'Mengirim ke backend...';
+            try {
+                const res = await apiCall('/api/broadcast', 'POST', { text });
+                const total = res.total_buyers || 0;
+                document.getElementById('broadcast-progress-fill').style.width = '100%';
+                document.getElementById('broadcast-percent').innerText = '100%';
+                document.getElementById('broadcast-sent-count').innerText = `Dikirim ke ${total} buyer — proses berjalan di server.`;
+                showToast(`Broadcast dimulai ke ${total} buyer terdaftar!`);
+                setTimeout(() => { progressBar.classList.add('hidden'); }, 4000);
+            } catch(e) {
+                progressBar.classList.add('hidden');
+                showToast('Gagal broadcast: ' + e.message, 'error');
+            }
         }
 
         function stopBroadcastSim() {
-            clearInterval(state.broadcastSimInterval);
             document.getElementById('broadcast-progress-bar').classList.add('hidden');
-            showToast("Progres broadcast dihentikan paksa admin.", "error");
+            showToast("Progres broadcast dihentikan.", "error");
         }
 
         // ================= DATABASE BACKUP & FILE MANAGER =================
         function simulateZipBackup() {
-            showToast("Berhasil mengonversi CSV. Mengunduh backup_20260606.zip...");
+            simulateJsonBackup();
         }
 
         function simulateJsonBackup() {
-            showToast("Berhasil mengekspor format data. Mengunduh export_20260606.json...");
+            showToast("Mengunduh backup JSON...");
+            const url = `/api/backup/json?key=${encodeURIComponent(API_KEY)}`;
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = '';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
         }
 
         function handleFileSelect(event) {
             const file = event.target.files[0];
             if (!file) return;
-
-            const reader = new FileReader();
-            reader.onload = function(e) {
-                try {
-                    const parsedData = JSON.parse(e.target.result);
-                    if (parsedData.products && parsedData.orders) {
-                        showToast(`Singkronisasi Berhasil! Memulihkan ${parsedData.products.length} Produk & ${parsedData.orders.length} Transaksi.`);
-                        state.products = parsedData.products;
-                        state.orders = parsedData.orders;
-                        renderAllData();
-                        updateCharts();
-                    } else {
-                        throw new Error();
-                    }
-                } catch (err) {
-                    showToast("Format JSON salah! Pastikan file berasal dari menu Export.", "error");
-                }
-            };
-            reader.readAsText(file);
+            showToast("Import via file hanya untuk referensi. Gunakan /import_json di bot untuk restore DB.", "error");
         }
 
         // ================= MODAL PRODUCT LOGIC =================
@@ -1430,136 +1384,119 @@
             document.getElementById('product-modal').classList.add('hidden');
         }
 
-        function saveProduct(event) {
+        async function saveProduct(event) {
             event.preventDefault();
-            const idx = document.getElementById('form-product-index').value;
-            const emoji = document.getElementById('form-product-emoji').value;
-            const nama = document.getElementById('form-product-name').value;
+            const editPaketId = document.getElementById('form-product-index').value;
+            const emoji    = document.getElementById('form-product-emoji').value;
+            const nama     = document.getElementById('form-product-name').value;
             const paket_id = document.getElementById('form-product-id').value;
-            const harga = parseInt(document.getElementById('form-product-price').value);
-            const group = document.getElementById('form-product-group').value || null;
+            const harga    = parseInt(document.getElementById('form-product-price').value);
+            const group    = document.getElementById('form-product-group').value || null;
 
-            // Dapatkan list prasyarat dari Checkboxes
             const checkedPrereqs = [];
-            const checkboxes = document.getElementsByName('prereq_items');
-            checkboxes.forEach(cb => {
+            document.getElementsByName('prereq_items').forEach(cb => {
                 if (cb.checked) checkedPrereqs.push(cb.value);
             });
-            const prereq_str = checkedPrereqs.length > 0 ? checkedPrereqs.join(',') : null;
+            const requires_paket_ids = checkedPrereqs.length > 0 ? checkedPrereqs.join(',') : null;
 
-            if (idx !== '') {
-                state.products[idx] = {
-                    ...state.products[idx],
-                    emoji, nama, paket_id, harga, group_chat_id: group, requires_paket_ids: prereq_str
-                };
-                showToast(`Produk "${nama}" sukses disimpan!`);
-            } else {
-                state.products.push({
-                    emoji, nama, paket_id, harga, link: "https://t.me/Kikukkvd", group_chat_id: group, requires_paket_ids: prereq_str, aktif: true
-                });
-                showToast(`Produk "${nama}" sukses terdaftar!`);
-            }
-
-            closeProductModal();
-            renderProducts();
-            updateCharts();
+            try {
+                if (editPaketId) {
+                    await apiCall(`/api/products/${editPaketId}`, 'PUT', { emoji, nama, harga, group_chat_id: group, requires_paket_ids });
+                    showToast(`Produk "${nama}" sukses disimpan!`);
+                } else {
+                    await apiCall('/api/products', 'POST', { emoji, nama, paket_id, harga, group_chat_id: group, requires_paket_ids });
+                    showToast(`Produk "${nama}" sukses terdaftar!`);
+                }
+                closeProductModal();
+                await loadData();
+            } catch(e) { showToast('Gagal simpan produk: ' + e.message, 'error'); }
         }
 
         // Toggle Status & Lainnya
-        function toggleProductStatus(idx) {
-            state.products[idx].aktif = !state.products[idx].aktif;
-            const status = state.products[idx].aktif ? "diaktifkan" : "dinonaktifkan";
-            showToast(`Status "${state.products[idx].nama}" ${status}!`);
-            renderProducts();
+        async function toggleProductStatus(paketId, currentAktif) {
+            try {
+                await apiCall(`/api/products/${paketId}`, 'PUT', { aktif: !currentAktif });
+                showToast(`Status produk diperbarui!`);
+                await loadData();
+            } catch(e) { showToast('Gagal update status: ' + e.message, 'error'); }
         }
 
-        function deleteProduct(idx) {
-            const p = state.products[idx];
-            state.products.splice(idx, 1);
-            showToast(`Produk "${p.nama}" deleted.`, 'error');
-            renderProducts();
-            updateCharts();
+        async function deleteProduct(paketId) {
+            if (!confirm(`Hapus produk "${paketId}"?`)) return;
+            try {
+                await apiCall(`/api/products/${paketId}`, 'DELETE');
+                showToast(`Produk "${paketId}" dihapus.`, 'error');
+                await loadData();
+            } catch(e) { showToast('Gagal hapus: ' + e.message, 'error'); }
         }
 
-        function manualConfirmOrder(orderId) {
-            const order = state.orders.find(o => o.order_id === orderId);
-            if (order) {
-                order.status = 'completed';
-                showToast(`Status Order ${orderId} diubah menjadi lunas!`);
-                renderAllData();
-                updateCharts();
-            }
+        async function manualConfirmOrder(orderId) {
+            try {
+                await apiCall(`/api/orders/${orderId}/confirm`, 'POST');
+                showToast(`Order ${orderId} dikonfirmasi lunas & link dikirim ke buyer!`);
+                await loadData();
+            } catch(e) { showToast('Gagal konfirmasi: ' + e.message, 'error'); }
         }
 
-        function manualCancelOrder(orderId) {
-            const order = state.orders.find(o => o.order_id === orderId);
-            if (order) {
-                order.status = 'cancelled';
+        async function manualCancelOrder(orderId) {
+            if (!confirm(`Batalkan order ${orderId}?`)) return;
+            try {
+                await apiCall(`/api/orders/${orderId}/cancel`, 'POST');
                 showToast(`Order ${orderId} dibatalkan.`, 'error');
-                renderAllData();
-            }
+                await loadData();
+            } catch(e) { showToast('Gagal batalkan: ' + e.message, 'error'); }
         }
 
-        function toggleMaintenanceMode() {
+        async function toggleMaintenanceMode() {
             const active = document.getElementById('cfg-maintenance-toggle').checked;
-            state.maintenance = active;
             const textEl = document.getElementById('maintenance-text-status');
-            
-            if (active) {
-                textEl.innerText = "Maintenance: ON";
-                textEl.className = "text-xs font-semibold text-rose-400";
-                showToast("Mode Maintenance aktif. Bot tidak melayani transaksi!", 'error');
-            } else {
-                textEl.innerText = "Maintenance: OFF";
-                textEl.className = "text-xs font-semibold text-neutral-200";
-                showToast("Mode Maintenance tidak aktif.");
-            }
+            try {
+                await apiCall('/api/settings', 'POST', { maintenance: active ? '1' : '0' });
+                if (active) {
+                    textEl.innerText = "Maintenance: ON";
+                    textEl.className = "text-xs font-semibold text-rose-400";
+                    showToast("Mode Maintenance aktif. Bot tidak melayani transaksi!", 'error');
+                } else {
+                    textEl.innerText = "Maintenance: OFF";
+                    textEl.className = "text-xs font-semibold text-neutral-200";
+                    showToast("Mode Maintenance tidak aktif.");
+                }
+            } catch(e) { showToast('Gagal toggle maintenance: ' + e.message, 'error'); }
         }
 
-        function saveConfiguration() {
-            showToast("Konfigurasi API, Webhook Secret & Channel ID diperbarui.");
+        async function saveConfiguration() {
+            const linkTesti  = document.getElementById('cfg-link-testi')?.value  || '';
+            const linkAdmin  = document.getElementById('cfg-link-admin')?.value  || '';
+            const notifCh    = document.getElementById('cfg-notif-channel')?.value || '';
+            const testiCh    = document.getElementById('cfg-testi-channel')?.value || '';
+            try {
+                await apiCall('/api/settings', 'POST', {
+                    link_testimoni: linkTesti,
+                    link_admin: linkAdmin,
+                    notif_channel_id: notifCh,
+                    testimoni_channel_id: testiCh
+                });
+                showToast("Konfigurasi berhasil disimpan ke database!");
+            } catch(e) { showToast('Gagal simpan konfigurasi: ' + e.message, 'error'); }
         }
 
         function copyToClipboard(text) {
-            const input = document.createElement('input');
-            input.setAttribute('value', text);
-            document.body.appendChild(input);
-            input.select();
-            document.execCommand('copy');
-            document.body.removeChild(input);
-            showToast("Order ID disalin ke clipboard!");
+            navigator.clipboard.writeText(text).then(() => {
+                showToast("Order ID disalin ke clipboard!");
+            }).catch(() => {
+                const input = document.createElement('input');
+                input.setAttribute('value', text);
+                document.body.appendChild(input);
+                input.select();
+                document.execCommand('copy');
+                document.body.removeChild(input);
+                showToast("Order ID disalin ke clipboard!");
+            });
         }
 
-        // Sinkronisasi data order masuk simulasi baru secara real-time untuk pengetesan omset hari ini
-        function syncSimulatedData() {
-            showToast("Kueri sync database ty.py sukses dipanggil.");
-            const now = new Date();
-            const dd = String(now.getDate()).padStart(2, '0');
-            const mm = String(now.getMonth() + 1).padStart(2, '0');
-            const yyyy = now.getFullYear();
-            const todayStr = `${dd}/${mm}/${yyyy}`;
-            
-            const timeStr = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')} - ${todayStr}`;
-            
-            const buyers = ["Ahmad Fauzi", "Wulandari", "Hendra Wijaya", "Rian Hidayat"];
-            const selectedUser = buyers[Math.floor(Math.random() * buyers.length)];
-            const selectedProd = state.products[Math.floor(Math.random() * state.products.length)];
-            const randomID = Math.floor(10000000 + Math.random() * 90000000);
-
-            // Transaksi masuk lunas otomatis untuk pengetesan live tracking omset hari ini
-            state.orders.unshift({
-                id: state.orders.length + 1,
-                user_id: randomID,
-                user_name: selectedUser,
-                paket_id: selectedProd.paket_id,
-                order_id: `HFB-${randomID}-${now.getFullYear()}${mm}${dd}-${Math.random().toString(36).substr(2, 4).toUpperCase()}`,
-                status: "completed", // disimulasikan sukses langsung agar omset hari ini bertambah secara dinamis
-                waktu: timeStr,
-                harga_dibayar: selectedProd.aktif ? selectedProd.harga : 5000
-            });
-
-            renderAllData();
-            updateCharts();
+        async function syncSimulatedData() {
+            showToast("Memuat ulang data dari database...");
+            await loadData();
         }
 
         // ================= CHART CONFIGURATION =================

@@ -1,0 +1,1795 @@
+<!DOCTYPE html>
+<html lang="id" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>HyperFamily - Premium Admin Dashboard</title>
+    <!-- Telegram Mini App SDK -->
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <!-- Google Fonts Plus Jakarta Sans & JetBrains Mono -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+    
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['Plus Jakarta Sans', 'sans-serif'],
+                        mono: ['JetBrains Mono', 'monospace'],
+                    },
+                    colors: {
+                        neutral: {
+                            950: '#07080a',
+                            900: '#0f1115',
+                            850: '#161920',
+                            800: '#1f242e',
+                            700: '#373f51',
+                            600: '#4a5568',
+                        },
+                        accent: {
+                            500: '#6366f1',
+                            600: '#4f46e5',
+                            glow: 'rgba(99, 102, 241, 0.15)',
+                        }
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        body {
+            font-family: 'Plus Jakarta Sans', sans-serif;
+            letter-spacing: -0.01em;
+            background-color: #07080a;
+        }
+        /* Custom premium scrollbar */
+        ::-webkit-scrollbar {
+            width: 5px;
+            height: 5px;
+        }
+        ::-webkit-scrollbar-track {
+            background: #07080a;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #1f242e;
+            border-radius: 99px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: #6366f1;
+        }
+        
+        /* Smooth glowing glassmorphism effects */
+        .glass-card {
+            background: rgba(22, 25, 32, 0.7);
+            backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.03);
+            box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
+        }
+
+        .glass-card-hover {
+            transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+
+        .glass-card-hover:hover {
+            border-color: rgba(99, 102, 241, 0.25);
+            box-shadow: 0 0 20px rgba(99, 102, 241, 0.08);
+            transform: translateY(-2px);
+        }
+
+        /* Loading Skeleton Animation */
+        .skeleton {
+            background: linear-gradient(90deg, #161920 25%, #1f242e 50%, #161920 75%);
+            background-size: 200% 100%;
+            animation: loading-skeleton 1.5s infinite;
+        }
+
+        @keyframes loading-skeleton {
+            0% { background-position: 200% 0; }
+            100% { background-position: -200% 0; }
+        }
+    </style>
+</head>
+<body class="text-neutral-100 min-h-screen flex flex-col lg:flex-row antialiased selection:bg-accent-600/30">
+
+    <!-- NOTIFIKASI TOAST FLOATING -->
+    <div id="toast-container" class="fixed top-6 right-6 z-[99] flex flex-col gap-3 pointer-events-none"></div>
+
+    <!-- CUSTOM CONFIRMATION DIALOG MODAL (No-Alert Guardrail) -->
+    <div id="confirm-modal" class="hidden fixed inset-0 z-[100] bg-black/85 backdrop-blur-sm flex items-center justify-center p-4 transition-all duration-300">
+        <div class="glass-card max-w-sm w-full rounded-2xl p-6 border border-neutral-850 space-y-5 transform scale-95 transition-transform duration-300" id="confirm-card">
+            <div class="flex items-center gap-3 text-indigo-400">
+                <div class="w-10 h-10 rounded-xl bg-indigo-500/10 flex items-center justify-center">
+                    <i data-lucide="help-circle" class="w-5 h-5 text-indigo-400"></i>
+                </div>
+                <h4 class="font-bold text-sm tracking-wide uppercase text-white" id="confirm-title">Konfirmasi Tindakan</h4>
+            </div>
+            <p class="text-xs text-neutral-300 leading-relaxed" id="confirm-message">Apakah Anda yakin ingin melanjutkan tindakan ini?</p>
+            <div class="flex items-center justify-end gap-3 pt-2">
+                <button id="confirm-btn-cancel" class="px-4 py-2 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 rounded-lg text-xs font-semibold transition">Batal</button>
+                <button id="confirm-btn-ok" class="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-xs font-semibold transition">Lanjutkan</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- MOBILE BOTTOM NAVIGATION (Khusus Tampilan Telegram WebApp di HP) -->
+    <nav class="lg:hidden fixed bottom-0 left-0 right-0 bg-neutral-900/90 backdrop-blur-md border-t border-neutral-800 z-40 px-2 py-1.5 flex justify-around items-center">
+        <button onclick="switchView('view-ringkasan')" class="mobile-nav-btn flex flex-col items-center gap-1 py-1 text-accent-500" id="mbtn-view-ringkasan">
+            <i data-lucide="layout-grid" class="w-4 h-4"></i>
+            <span class="text-[9px] font-medium">Dashboard</span>
+        </button>
+        <button onclick="switchView('view-produk')" class="mobile-nav-btn flex flex-col items-center gap-1 py-1 text-neutral-400" id="mbtn-view-produk">
+            <i data-lucide="package" class="w-4 h-4"></i>
+            <span class="text-[9px] font-medium">Produk</span>
+        </button>
+        <button onclick="switchView('view-pesanan')" class="mobile-nav-btn flex flex-col items-center gap-1 py-1 text-neutral-400" id="mbtn-view-pesanan">
+            <i data-lucide="banknote" class="w-4 h-4"></i>
+            <span class="text-[9px] font-medium">Order</span>
+        </button>
+        <button onclick="switchView('view-testimoni')" class="mobile-nav-btn flex flex-col items-center gap-1 py-1 text-neutral-400 relative" id="mbtn-view-testimoni">
+            <i data-lucide="heart-handshake" class="w-4 h-4"></i>
+            <span class="text-[9px] font-medium">Testi</span>
+            <span id="m-badge-pending-testi" class="absolute -top-1 -right-1 px-1.5 py-0.2 bg-rose-600 text-white text-[8px] rounded-full font-bold">0</span>
+        </button>
+        <button onclick="openMoreMobileMenu()" class="mobile-nav-btn flex flex-col items-center gap-1 py-1 text-neutral-400" id="mbtn-view-more">
+            <i data-lucide="menu" class="w-4 h-4"></i>
+            <span class="text-[9px] font-medium">Lainnya</span>
+        </button>
+    </nav>
+
+    <!-- DRAWER MENU MOBILE UNTUK SEKTOR LAINNYA -->
+    <div id="mobile-drawer" class="hidden fixed inset-0 z-50 bg-black/85 backdrop-blur-xs flex justify-end transition-opacity duration-300">
+        <div class="w-2/3 max-w-xs bg-neutral-900 h-full p-6 border-l border-neutral-850 flex flex-col gap-4 shadow-2xl transition-transform duration-300 translate-x-full" id="mobile-drawer-content">
+            <div class="flex items-center justify-between pb-4 border-b border-neutral-850">
+                <span class="text-xs font-bold text-neutral-400 uppercase tracking-widest">Kategori Menu</span>
+                <button onclick="closeMoreMobileMenu()" class="text-neutral-500"><i data-lucide="x" class="w-5 h-5"></i></button>
+            </div>
+            <nav class="flex flex-col gap-2">
+                <button onclick="switchView('view-pengguna'); closeMoreMobileMenu();" class="flex items-center gap-3 px-4 py-3 rounded-lg text-xs font-semibold text-neutral-300 hover:bg-neutral-850 transition">
+                    <i data-lucide="users" class="w-4 h-4"></i> <span>Grup & User</span>
+                </button>
+                <button onclick="switchView('view-broadcast'); closeMoreMobileMenu();" class="flex items-center gap-3 px-4 py-3 rounded-lg text-xs font-semibold text-neutral-300 hover:bg-neutral-850 transition">
+                    <i data-lucide="send" class="w-4 h-4"></i> <span>Broadcast</span>
+                </button>
+                <button onclick="switchView('view-backup'); closeMoreMobileMenu();" class="flex items-center gap-3 px-4 py-3 rounded-lg text-xs font-semibold text-neutral-300 hover:bg-neutral-850 transition">
+                    <i data-lucide="database" class="w-4 h-4"></i> <span>Database</span>
+                </button>
+                <button onclick="switchView('view-admin'); closeMoreMobileMenu();" class="flex items-center gap-3 px-4 py-3 rounded-lg text-xs font-semibold text-neutral-300 hover:bg-neutral-850 transition">
+                    <i data-lucide="fingerprint" class="w-4 h-4"></i> <span>Tim Admin</span>
+                </button>
+                <button onclick="switchView('view-pengaturan'); closeMoreMobileMenu();" class="flex items-center gap-3 px-4 py-3 rounded-lg text-xs font-semibold text-neutral-300 hover:bg-neutral-850 transition">
+                    <i data-lucide="sliders" class="w-4 h-4"></i> <span>Konfigurasi</span>
+                </button>
+            </nav>
+        </div>
+    </div>
+
+    <!-- SIDEBAR NAVIGASI DESKTOP (STICKY & PREMIUM) -->
+    <aside class="hidden lg:flex w-64 bg-neutral-900 border-r border-neutral-850 flex-col shrink-0 min-h-screen sticky top-0">
+        <!-- Logo & Brand Header -->
+        <div class="p-6 border-b border-neutral-850 flex items-center justify-between">
+            <div class="flex items-center gap-3">
+                <div class="w-9 h-9 rounded-xl bg-gradient-to-br from-indigo-500 to-accent-600 flex items-center justify-center text-white shadow-lg shadow-indigo-500/20">
+                    <i data-lucide="shield-check" class="w-5 h-5"></i>
+                </div>
+                <div>
+                    <h1 class="font-extrabold text-sm tracking-wider uppercase text-white">HyperFamily</h1>
+                    <span class="text-[9px] text-neutral-500 font-bold tracking-widest">CONTROL v3.0</span>
+                </div>
+            </div>
+            <!-- Indicator Status -->
+            <span class="relative flex h-2 w-2">
+                <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-indigo-400 opacity-75"></span>
+                <span class="relative inline-flex rounded-full h-2 w-2 bg-indigo-500"></span>
+            </span>
+        </div>
+
+        <!-- Menu Links -->
+        <nav class="p-4 flex flex-col gap-1 overflow-y-auto max-h-[calc(100vh-140px)]">
+            <button onclick="switchView('view-ringkasan')" id="btn-view-ringkasan" class="nav-btn w-full flex items-center gap-3 px-4 py-3 rounded-lg text-xs font-bold uppercase tracking-wider text-neutral-100 bg-neutral-800 border border-neutral-700 transition duration-150">
+                <i data-lucide="layout-grid" class="w-4 h-4"></i>
+                <span>Ringkasan</span>
+            </button>
+            <button onclick="switchView('view-produk')" id="btn-view-produk" class="nav-btn w-full flex items-center gap-3 px-4 py-3 rounded-lg text-xs font-bold uppercase tracking-wider text-neutral-400 hover:text-neutral-100 hover:bg-neutral-850/60 transition duration-150">
+                <i data-lucide="package" class="w-4 h-4"></i>
+                <span>Produk</span>
+            </button>
+            <button onclick="switchView('view-pesanan')" id="btn-view-pesanan" class="nav-btn w-full flex items-center gap-3 px-4 py-3 rounded-lg text-xs font-bold uppercase tracking-wider text-neutral-400 hover:text-neutral-100 hover:bg-neutral-850/60 transition duration-150">
+                <i data-lucide="banknote" class="w-4 h-4"></i>
+                <span>Pesanan</span>
+            </button>
+            <button onclick="switchView('view-testimoni')" id="btn-view-testimoni" class="nav-btn w-full flex items-center gap-3 px-4 py-3 rounded-lg text-xs font-bold uppercase tracking-wider text-neutral-400 hover:text-neutral-100 hover:bg-neutral-850/60 transition duration-150 relative">
+                <i data-lucide="heart-handshake" class="w-4 h-4"></i>
+                <span>Testimoni</span>
+                <span id="badge-pending-testi" class="absolute right-3 px-2 py-0.5 bg-rose-600/20 border border-rose-500/30 text-rose-400 text-[9px] rounded-full font-extrabold">0</span>
+            </button>
+            <button onclick="switchView('view-pengguna')" id="btn-view-pengguna" class="nav-btn w-full flex items-center gap-3 px-4 py-3 rounded-lg text-xs font-bold uppercase tracking-wider text-neutral-400 hover:text-neutral-100 hover:bg-neutral-850/60 transition duration-150">
+                <i data-lucide="users" class="w-4 h-4"></i>
+                <span>Grup & User</span>
+            </button>
+            <button onclick="switchView('view-broadcast')" id="btn-view-broadcast" class="nav-btn w-full flex items-center gap-3 px-4 py-3 rounded-lg text-xs font-bold uppercase tracking-wider text-neutral-400 hover:text-neutral-100 hover:bg-neutral-850/60 transition duration-150">
+                <i data-lucide="send" class="w-4 h-4"></i>
+                <span>Broadcast</span>
+            </button>
+            <button onclick="switchView('view-backup')" id="btn-view-backup" class="nav-btn w-full flex items-center gap-3 px-4 py-3 rounded-lg text-xs font-bold uppercase tracking-wider text-neutral-400 hover:text-neutral-100 hover:bg-neutral-850/60 transition duration-150">
+                <i data-lucide="database" class="w-4 h-4"></i>
+                <span>Database</span>
+            </button>
+            <button onclick="switchView('view-admin')" id="btn-view-admin" class="nav-btn w-full flex items-center gap-3 px-4 py-3 rounded-lg text-xs font-bold uppercase tracking-wider text-neutral-400 hover:text-neutral-100 hover:bg-neutral-850/60 transition duration-150">
+                <i data-lucide="fingerprint" class="w-4 h-4"></i>
+                <span>Tim Admin</span>
+            </button>
+            <button onclick="switchView('view-pengaturan')" id="btn-view-pengaturan" class="nav-btn w-full flex items-center gap-3 px-4 py-3 rounded-lg text-xs font-bold uppercase tracking-wider text-neutral-400 hover:text-neutral-100 hover:bg-neutral-850/60 transition duration-150">
+                <i data-lucide="sliders" class="w-4 h-4"></i>
+                <span>Konfigurasi</span>
+            </button>
+        </nav>
+
+        <!-- Footer Workspace -->
+        <div class="mt-auto p-4 border-t border-neutral-850 text-[10px] text-neutral-500 font-mono flex items-center justify-between">
+            <span>Core: PgSQL Pool</span>
+            <span class="px-1.5 py-0.5 bg-neutral-950 rounded border border-neutral-800">OK</span>
+        </div>
+    </aside>
+
+    <!-- CONTENT WRAPPER -->
+    <main class="flex-1 p-4 sm:p-6 lg:p-10 overflow-y-auto max-w-full pb-20 lg:pb-10">
+        <!-- TOP HEADER -->
+        <header class="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 mb-8 border-b border-neutral-850 pb-6">
+            <div>
+                <h2 id="view-title" class="text-xl font-bold tracking-tight text-white">Ringkasan Eksekutif</h2>
+                <p id="view-desc" class="text-xs text-neutral-400 mt-1">Status dan metrik performa toko HyperFamily Anda hari ini.</p>
+            </div>
+            <div class="flex items-center gap-3 w-full sm:w-auto">
+                <button onclick="syncDataFromServer()" class="w-full sm:w-auto px-4 py-2 border border-neutral-800 hover:border-neutral-700 hover:bg-neutral-900 text-xs font-bold tracking-wider uppercase rounded-lg transition flex items-center justify-center gap-2">
+                    <i data-lucide="refresh-cw" class="w-3.5 h-3.5" id="sync-icon"></i> <span>Sync Transaksi</span>
+                </button>
+            </div>
+        </header>
+
+        <!-- ================= VIEW 1: RINGKASAN ================= -->
+        <section id="view-ringkasan" class="space-y-8 block">
+            
+            <!-- SEKTOR 1: METRIK FINANSIAL -->
+            <div class="space-y-4">
+                <h4 class="text-[10px] font-bold uppercase tracking-widest text-neutral-500 flex items-center gap-2">
+                    <i data-lucide="coins" class="w-4 h-4"></i> Metrik Finansial Utama
+                </h4>
+                <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
+                    <div class="glass-card glass-card-hover rounded-xl p-5 flex items-center justify-between relative overflow-hidden group">
+                        <div class="space-y-1.5 z-10">
+                            <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400">Omzet Hari Ini</span>
+                            <h3 id="stat-omzet-hari-ini" class="text-xl font-extrabold font-mono text-white">Rp 0</h3>
+                            <p class="text-[10px] text-emerald-400 flex items-center gap-1 font-semibold">
+                                <span class="px-1.5 py-0.2 bg-emerald-500/10 border border-emerald-500/20 rounded text-[9px]">Live Track</span>
+                            </p>
+                        </div>
+                        <div class="w-10 h-10 bg-neutral-950 border border-neutral-850 rounded-xl flex items-center justify-center text-indigo-400">
+                            <i data-lucide="calendar-check" class="w-5 h-5"></i>
+                        </div>
+                    </div>
+                    <div class="glass-card glass-card-hover rounded-xl p-5 flex items-center justify-between">
+                        <div class="space-y-1.5">
+                            <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400">Omzet Bulan Ini</span>
+                            <h3 id="stat-omzet-bulan-ini" class="text-xl font-extrabold font-mono text-white">Rp 0</h3>
+                            <p class="text-[10px] text-neutral-500 font-semibold">Pace target berjalan</p>
+                        </div>
+                        <div class="w-10 h-10 bg-neutral-950 border border-neutral-850 rounded-xl flex items-center justify-center text-neutral-400">
+                            <i data-lucide="calendar" class="w-5 h-5"></i>
+                        </div>
+                    </div>
+                    <div class="glass-card glass-card-hover rounded-xl p-5 flex items-center justify-between">
+                        <div class="space-y-1.5">
+                            <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400">Total Omzet (All Time)</span>
+                            <h3 id="stat-omzet-all-time" class="text-xl font-extrabold font-mono text-white">Rp 0</h3>
+                            <p class="text-[10px] text-emerald-400 flex items-center gap-1 font-semibold">
+                                <i data-lucide="arrow-up-right" class="w-3 h-3"></i> Sync otomatis
+                            </p>
+                        </div>
+                        <div class="w-10 h-10 bg-neutral-950 border border-neutral-850 rounded-xl flex items-center justify-center text-neutral-400">
+                            <i data-lucide="wallet" class="w-5 h-5"></i>
+                        </div>
+                    </div>
+                    <div class="glass-card glass-card-hover rounded-xl p-5 flex items-center justify-between">
+                        <div class="space-y-1.5">
+                            <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400">Waiting (QRIS)</span>
+                            <h3 id="stat-waiting-queue" class="text-xl font-extrabold font-mono text-white">0 Antrean</h3>
+                            <p class="text-[10px] text-amber-500 flex items-center gap-1 font-semibold">
+                                <i data-lucide="activity" class="w-3 h-3"></i> Polling Aktif
+                            </p>
+                        </div>
+                        <div class="w-10 h-10 bg-neutral-950 border border-neutral-850 rounded-xl flex items-center justify-center text-neutral-400">
+                            <i data-lucide="clock" class="w-5 h-5"></i>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- SEKTOR 2: OPERASIONAL -->
+            <div class="space-y-4">
+                <h4 class="text-[10px] font-bold uppercase tracking-widest text-neutral-500 flex items-center gap-2">
+                    <i data-lucide="users" class="w-4 h-4"></i> Metrik Operasional & Retensi
+                </h4>
+                <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
+                    <div class="glass-card glass-card-hover rounded-xl p-5 flex items-center justify-between">
+                        <div class="space-y-1.5">
+                            <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400">Transaksi Selesai</span>
+                            <h3 id="stat-total-transaksi" class="text-xl font-extrabold font-mono text-white">0 Transaksi</h3>
+                            <p class="text-[10px] text-indigo-400 flex items-center gap-1 font-semibold">
+                                <i data-lucide="sparkles" class="w-3 h-3"></i> Konversi Valid
+                            </p>
+                        </div>
+                        <div class="w-10 h-10 bg-neutral-950 border border-neutral-850 rounded-xl flex items-center justify-center text-neutral-400">
+                            <i data-lucide="badge-check" class="w-5 h-5"></i>
+                        </div>
+                    </div>
+                    <div class="glass-card glass-card-hover rounded-xl p-5 flex items-center justify-between">
+                        <div class="space-y-1.5">
+                            <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400">AOV (Rata-Rata Order)</span>
+                            <h3 id="stat-aov" class="text-xl font-extrabold font-mono text-white">Rp 0</h3>
+                            <p class="text-[10px] text-neutral-500 font-semibold">Rata-rata per belanja</p>
+                        </div>
+                        <div class="w-10 h-10 bg-neutral-950 border border-neutral-850 rounded-xl flex items-center justify-center text-neutral-400">
+                            <i data-lucide="arrow-up-right" class="w-5 h-5"></i>
+                        </div>
+                    </div>
+                    <div class="glass-card glass-card-hover rounded-xl p-5 flex items-center justify-between">
+                        <div class="space-y-1.5">
+                            <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400">Pelanggan Unik</span>
+                            <h3 id="stat-unique-buyers" class="text-xl font-extrabold font-mono text-white">0 Pembeli</h3>
+                            <p class="text-[10px] text-emerald-400 flex items-center gap-1 font-semibold">Database terdaftar</p>
+                        </div>
+                        <div class="w-10 h-10 bg-neutral-950 border border-neutral-850 rounded-xl flex items-center justify-center text-neutral-400">
+                            <i data-lucide="user-check" class="w-5 h-5"></i>
+                        </div>
+                    </div>
+                    <div class="glass-card glass-card-hover rounded-xl p-5 flex items-center justify-between">
+                        <div class="space-y-1.5">
+                            <span class="text-[10px] font-bold uppercase tracking-wider text-neutral-400">Tingkat Repeat Order</span>
+                            <h3 id="stat-repeat-rate" class="text-xl font-extrabold font-mono text-white">0%</h3>
+                            <p class="text-[10px] text-indigo-400 flex items-center gap-1 font-semibold">Belanja > 1x</p>
+                        </div>
+                        <div class="w-10 h-10 bg-neutral-950 border border-neutral-850 rounded-xl flex items-center justify-center text-neutral-400">
+                            <i data-lucide="percent" class="w-5 h-5"></i>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Sektor 3: Analitik Grafik -->
+            <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                <div class="glass-card rounded-xl p-6 lg:col-span-2 space-y-4">
+                    <div class="flex items-center justify-between">
+                        <h4 class="font-bold text-sm text-white">Tren Grafik Finansial (7 Hari Terakhir)</h4>
+                        <span class="px-2 py-0.5 bg-neutral-950 border border-neutral-850 text-neutral-400 text-[10px] rounded-md font-mono">LIVE UPDATE</span>
+                    </div>
+                    <div class="h-72 w-full">
+                        <canvas id="trendChart"></canvas>
+                    </div>
+                </div>
+                <div class="glass-card rounded-xl p-6 flex flex-col justify-between">
+                    <div class="flex items-center justify-between mb-4">
+                        <h4 class="font-bold text-sm text-white">Porsi Penjualan Paket</h4>
+                        <span class="text-[10px] text-neutral-500 uppercase font-bold">Terlaris</span>
+                    </div>
+                    <div class="h-60 w-full flex items-center justify-center">
+                        <canvas id="productChart"></canvas>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ================= VIEW 2: PRODUK ================= -->
+        <section id="view-produk" class="hidden space-y-6">
+            <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+                <p class="text-xs text-neutral-400">Konfigurasikan detail emoji, harga paket, prasyarat, serta integrasi group Telegram VIP.</p>
+                <button onclick="openProductModal()" class="w-full sm:w-auto px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white transition text-xs font-bold uppercase tracking-wider rounded-lg flex items-center justify-center gap-2">
+                    <i data-lucide="plus" class="w-4 h-4"></i> Tambah Produk
+                </button>
+            </div>
+
+            <div class="glass-card rounded-xl overflow-hidden">
+                <div class="overflow-x-auto">
+                    <table class="w-full text-left border-collapse">
+                        <thead>
+                            <tr class="bg-neutral-950/40 border-b border-neutral-850 text-[10px] font-bold uppercase text-neutral-400 tracking-wider">
+                                <th class="p-4">Paket / Nama</th>
+                                <th class="p-4">Paket ID</th>
+                                <th class="p-4">Harga Satuan</th>
+                                <th class="p-4">Requires Prerequisite</th>
+                                <th class="p-4">Telegram Group ID</th>
+                                <th class="p-4">Status</th>
+                                <th class="p-4 text-right">Kelola</th>
+                            </tr>
+                        </thead>
+                        <tbody id="product-table-body" class="divide-y divide-neutral-850 text-xs">
+                            <!-- JS Inject -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
+
+        <!-- ================= VIEW 3: PESANAN ================= -->
+        <section id="view-pesanan" class="hidden space-y-6">
+            <!-- Filter & Search Bar -->
+            <div class="flex flex-col lg:flex-row gap-4 bg-neutral-900 border border-neutral-850 p-4 rounded-xl">
+                <div class="relative flex-1">
+                    <i data-lucide="search" class="w-4 h-4 text-neutral-500 absolute left-3.5 top-3.5"></i>
+                    <input type="text" id="order-search" oninput="filterOrders()" placeholder="Cari ID transaksi, nama pembeli, atau ID Telegram..." class="w-full pl-10 pr-4 py-2.5 bg-neutral-950 border border-neutral-850 rounded-lg text-xs text-neutral-200 placeholder-neutral-600 focus:outline-none focus:border-neutral-750 transition font-mono">
+                </div>
+                <div class="flex items-center gap-1.5 overflow-x-auto pb-2 lg:pb-0">
+                    <button onclick="setOrderFilter('all')" id="filter-all" class="order-filter-btn shrink-0 px-3.5 py-2 rounded-lg text-[10px] font-bold uppercase tracking-wider transition bg-neutral-800 border border-neutral-700 text-neutral-100">Semua</button>
+                    <button onclick="setOrderFilter('waiting')" id="filter-waiting" class="order-filter-btn shrink-0 px-3.5 py-2 rounded-lg text-[10px] font-bold uppercase tracking-wider transition text-neutral-400 hover:text-neutral-200 bg-transparent">Waiting</button>
+                    <button onclick="setOrderFilter('completed')" id="filter-completed" class="order-filter-btn shrink-0 px-3.5 py-2 rounded-lg text-[10px] font-bold uppercase tracking-wider transition text-neutral-400 hover:text-neutral-200 bg-transparent">Lunas</button>
+                    <button onclick="setOrderFilter('cancelled')" id="filter-cancelled" class="order-filter-btn shrink-0 px-3.5 py-2 rounded-lg text-[10px] font-bold uppercase tracking-wider transition text-neutral-400 hover:text-neutral-200 bg-transparent">Batal / Expired</button>
+                </div>
+            </div>
+
+            <!-- Tabel Pesanan -->
+            <div class="glass-card rounded-xl overflow-hidden shadow-sm">
+                <div class="overflow-x-auto">
+                    <table class="w-full text-left border-collapse">
+                        <thead>
+                            <tr class="bg-neutral-950/40 border-b border-neutral-850 text-[10px] font-bold uppercase text-neutral-400 tracking-wider">
+                                <th class="p-4">Pembeli</th>
+                                <th class="p-4">Paket ID</th>
+                                <th class="p-4">Order ID</th>
+                                <th class="p-4">Harga</th>
+                                <th class="p-4">Tanggal / Waktu</th>
+                                <th class="p-4">Status</th>
+                                <th class="p-4 text-right">Opsi Pengelolaan</th>
+                            </tr>
+                        </thead>
+                        <tbody id="orders-table-body" class="divide-y divide-neutral-850 text-xs">
+                            <!-- JS Inject -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
+
+        <!-- ================= VIEW 4: TESTIMONI ================= -->
+        <section id="view-testimoni" class="hidden space-y-6">
+            <p class="text-xs text-neutral-400">Verifikasi ulasan dari pembeli agar tampil di channel publik secara otomatis.</p>
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-6" id="testi-container">
+                <!-- JS Inject Testimonial Cards -->
+            </div>
+        </section>
+
+        <!-- ================= VIEW 5: GRUP & USER ================= -->
+        <section id="view-pengguna" class="hidden space-y-8">
+            <div class="glass-card rounded-xl p-6 space-y-5">
+                <div>
+                    <h4 class="font-bold text-sm text-neutral-100 uppercase tracking-wider">Pemeriksaan Anggota & Tindakan Kick</h4>
+                    <p class="text-xs text-neutral-400 mt-1">Cek secara langsung status keaktifan user di grup premium Telegram.</p>
+                </div>
+                <div class="flex flex-col sm:flex-row gap-3">
+                    <input type="number" id="group-scan-id" placeholder="ID Telegram user pembeli..." class="flex-1 px-4 py-2.5 bg-neutral-950 border border-neutral-850 rounded-lg text-xs text-neutral-200 focus:outline-none focus:border-neutral-750 font-mono">
+                    <button onclick="scanUserInGroups()" class="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white transition text-xs font-bold uppercase tracking-wider rounded-lg flex items-center justify-center gap-2">
+                        <i data-lucide="scan-eye" class="w-4 h-4"></i> Periksa Status Anggota
+                    </button>
+                </div>
+                
+                <div id="scan-result" class="hidden p-4 bg-neutral-950 border border-neutral-850 rounded-lg divide-y divide-neutral-900 space-y-3">
+                    <!-- JS Inject Scan Rows -->
+                </div>
+            </div>
+
+            <!-- Layout Ban & Blacklist -->
+            <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                <div class="glass-card rounded-xl p-6 space-y-5 h-fit">
+                    <div>
+                        <h4 class="font-bold text-sm text-neutral-100 uppercase tracking-wider">Blokir User (Ban)</h4>
+                        <p class="text-xs text-neutral-400 mt-1">Hentikan akses transaksi user ke dalam bot secara permanen.</p>
+                    </div>
+                    <form onsubmit="executeBan(event)" class="space-y-4">
+                        <div>
+                            <label class="block text-[10px] font-bold text-neutral-500 uppercase mb-2">User ID Telegram</label>
+                            <input type="number" id="ban-user-id" required placeholder="Contoh: 12345678" class="w-full px-4 py-2.5 bg-neutral-950 border border-neutral-850 rounded-lg text-xs text-neutral-200 focus:outline-none focus:border-neutral-750 font-mono">
+                        </div>
+                        <div>
+                            <label class="block text-[10px] font-bold text-neutral-500 uppercase mb-2">Alasan Blokir</label>
+                            <textarea id="ban-reason" required placeholder="Tindakan spamming atau pelanggaran syarat" rows="3" class="w-full px-4 py-2.5 bg-neutral-950 border border-neutral-850 rounded-lg text-xs text-neutral-200 focus:outline-none focus:border-neutral-750 resize-none"></textarea>
+                        </div>
+                        <button type="submit" class="w-full py-2.5 bg-rose-600 hover:bg-rose-500 text-white font-bold text-xs uppercase tracking-wider rounded-lg transition flex items-center justify-center gap-2">
+                            <i data-lucide="user-minus" class="w-4 h-4"></i> Blokir Pengguna
+                        </button>
+                    </form>
+                </div>
+
+                <div class="glass-card rounded-xl p-6 lg:col-span-2 space-y-4">
+                    <div>
+                        <h4 class="font-bold text-sm text-neutral-100 uppercase tracking-wider">Daftar Blacklist Aktif</h4>
+                        <p class="text-xs text-neutral-400 mt-1">Berikut adalah daftar pengguna yang saat ini diblokir dari bot.</p>
+                    </div>
+                    <div class="border border-neutral-850 rounded-lg overflow-hidden">
+                        <div class="overflow-x-auto">
+                            <table class="w-full text-left border-collapse">
+                                <thead class="bg-neutral-950/40 text-[10px] font-bold uppercase text-neutral-400 border-b border-neutral-850">
+                                    <tr>
+                                        <th class="p-3">User ID</th>
+                                        <th class="p-3">Alasan</th>
+                                        <th class="p-3">Waktu</th>
+                                        <th class="p-3 text-right">Pulihkan</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="banned-table-body" class="divide-y divide-neutral-850 text-xs">
+                                    <!-- JS Inject -->
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ================= VIEW 6: BROADCAST ================= -->
+        <section id="view-broadcast" class="hidden space-y-6">
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                <div class="glass-card rounded-xl p-6 space-y-4">
+                    <div>
+                        <h4 class="font-bold text-sm text-neutral-100 uppercase tracking-wider">Editor Siaran HTML</h4>
+                        <p class="text-[10px] text-neutral-500">Mendukung format tag: &lt;b&gt;, &lt;i&gt;, &lt;code&gt;</p>
+                    </div>
+                    <textarea id="broadcast-input" oninput="updateBroadcastPreview()" rows="10" placeholder="Ketik pesan siaran massal Anda di sini..." class="w-full p-4 bg-neutral-950 border border-neutral-850 rounded-lg text-xs text-neutral-200 focus:outline-none focus:border-neutral-750 font-mono resize-none"></textarea>
+                    
+                    <div class="flex items-center justify-between">
+                        <span class="text-xs text-neutral-400" id="broadcast-receiver-count font-semibold">Menargetkan database buyer</span>
+                        <button onclick="triggerBroadcast()" class="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white transition text-xs font-bold uppercase tracking-wider rounded-lg flex items-center gap-2">
+                            <i data-lucide="send-horizontal" class="w-4 h-4"></i> Mulai Broadcast
+                        </button>
+                    </div>
+                </div>
+
+                <div class="glass-card rounded-xl p-6 flex flex-col justify-between">
+                    <div class="space-y-4">
+                        <h4 class="font-bold text-sm text-neutral-100 uppercase tracking-wider">Visual Live Preview (Telegram Style)</h4>
+                        <div id="broadcast-preview-container" class="bg-neutral-950 border border-neutral-850 p-4 rounded-lg min-h-[200px] text-xs leading-relaxed text-neutral-200">
+                            <!-- Live Preview Text -->
+                        </div>
+                        <div id="html-validation-alert" class="hidden p-3 bg-rose-500/10 border border-rose-500/20 text-rose-400 text-xs rounded-lg flex items-center gap-2">
+                            <i data-lucide="info" class="w-4 h-4"></i> Terdapat tag HTML yang tidak ditutup dengan benar!
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ================= VIEW 7: DATABASE & BACKUP ================= -->
+        <section id="view-backup" class="hidden space-y-8">
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                <div class="glass-card rounded-xl p-6 space-y-6">
+                    <div>
+                        <h4 class="font-bold text-sm text-neutral-100 uppercase tracking-wider">Ekspor Database</h4>
+                        <p class="text-xs text-neutral-400 mt-1">Unduh backup database asinkron dalam format JSON yang kompatibel dengan bot.</p>
+                    </div>
+                    <button onclick="simulateJsonBackup()" class="w-full p-4 bg-neutral-950 hover:bg-neutral-900 border border-neutral-850 rounded-xl transition text-left space-y-2 flex items-center justify-between">
+                        <div class="space-y-1">
+                            <p class="text-xs font-bold text-white uppercase tracking-wider">Ekspor JSON</p>
+                            <p class="text-[10px] text-neutral-500">Cadangan tunggal terenkripsi</p>
+                        </div>
+                        <div class="w-10 h-10 rounded-lg bg-indigo-500/10 text-indigo-400 flex items-center justify-center">
+                            <i data-lucide="file-json" class="w-5 h-5"></i>
+                        </div>
+                    </button>
+                </div>
+
+                <div class="glass-card rounded-xl p-6 space-y-4 flex flex-col justify-between">
+                    <div>
+                        <h4 class="font-bold text-sm text-neutral-100 uppercase tracking-wider">Restorasi Database</h4>
+                        <p class="text-xs text-neutral-400 mt-1">Gunakan fitur unggah berkas untuk sinkronisasi database dari file cadangan sebelumnya.</p>
+                    </div>
+                    <div class="border-2 border-dashed border-neutral-800 hover:border-neutral-700 rounded-xl p-6 text-center cursor-pointer transition relative" id="drop-zone">
+                        <input type="file" id="json-file-input" onchange="handleFileSelect(event)" accept=".json" class="absolute inset-0 opacity-0 cursor-pointer">
+                        <div class="space-y-2 text-neutral-400 pointer-events-none">
+                            <i data-lucide="upload-cloud" class="w-8 h-8 mx-auto text-neutral-500"></i>
+                            <p class="text-xs font-semibold">Tarik file JSON atau ketuk di sini</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ================= VIEW 8: TIM ADMIN ================= -->
+        <section id="view-admin" class="hidden space-y-6">
+            <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+                <p class="text-xs text-neutral-400">Pemberian wewenang akses tim asisten admin dengan otorisasi terbatas.</p>
+                <button onclick="openAdminModal()" class="w-full sm:w-auto px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white transition text-xs font-bold uppercase tracking-wider rounded-lg flex items-center justify-center gap-2">
+                    <i data-lucide="user-plus" class="w-4 h-4"></i> Tambah Admin
+                </button>
+            </div>
+
+            <div class="glass-card rounded-xl overflow-hidden">
+                <div class="overflow-x-auto">
+                    <table class="w-full text-left border-collapse">
+                        <thead>
+                            <tr class="bg-neutral-950/40 border-b border-neutral-850 text-[10px] font-bold uppercase text-neutral-400 tracking-wider">
+                                <th class="p-4">Nama Admin</th>
+                                <th class="p-4">User ID Telegram</th>
+                                <th class="p-4">Ditambahkan Oleh</th>
+                                <th class="p-4">Tanggal Gabung</th>
+                                <th class="p-4 text-right">Opsi</th>
+                            </tr>
+                        </thead>
+                        <tbody id="admins-table-body" class="divide-y divide-neutral-850 text-xs">
+                            <!-- JS Inject -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
+
+        <!-- ================= VIEW 9: PENGATURAN ================= -->
+        <section id="view-pengaturan" class="hidden space-y-6">
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                <!-- Sektor Gateway -->
+                <div class="glass-card rounded-xl p-6 space-y-5">
+                    <h4 class="font-bold text-xs text-white border-b border-neutral-850 pb-3 uppercase tracking-widest">
+                        Sistem Integrasi Gateway
+                    </h4>
+                    <div class="space-y-4">
+                        <div>
+                            <label class="block text-[10px] font-bold text-neutral-500 uppercase mb-2">Pakasir Webhook Secret</label>
+                            <input type="password" id="cfg-webhook-secret" class="w-full px-4 py-2.5 bg-neutral-950 border border-neutral-850 rounded-lg text-xs text-neutral-200 focus:outline-none focus:border-neutral-750 font-mono">
+                        </div>
+                        <div>
+                            <label class="block text-[10px] font-bold text-neutral-500 uppercase mb-2">Tautan Admin / CS Utama</label>
+                            <input type="text" id="cfg-link-admin" class="w-full px-4 py-2.5 bg-neutral-950 border border-neutral-850 rounded-lg text-xs text-neutral-200 focus:outline-none focus:border-neutral-750 font-mono">
+                        </div>
+                        <div>
+                            <label class="block text-[10px] font-bold text-neutral-500 uppercase mb-2">Tautan Channel Testimoni</label>
+                            <input type="text" id="cfg-link-testi" class="w-full px-4 py-2.5 bg-neutral-950 border border-neutral-850 rounded-lg text-xs text-neutral-200 focus:outline-none focus:border-neutral-750 font-mono">
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Sektor Channels -->
+                <div class="glass-card rounded-xl p-6 space-y-5">
+                    <h4 class="font-bold text-xs text-white border-b border-neutral-850 pb-3 uppercase tracking-widest">
+                        Integrasi Telegram Channel
+                    </h4>
+                    <div class="space-y-4">
+                        <div>
+                            <label class="block text-[10px] font-bold text-neutral-500 uppercase mb-2">ID Channel Notifikasi Order</label>
+                            <input type="text" id="cfg-channel-notif" class="w-full px-4 py-2.5 bg-neutral-950 border border-neutral-850 rounded-lg text-xs text-neutral-200 focus:outline-none focus:border-neutral-750 font-mono">
+                        </div>
+                        <div>
+                            <label class="block text-[10px] font-bold text-neutral-500 uppercase mb-2">ID Channel Testimoni</label>
+                            <input type="text" id="cfg-channel-testi" class="w-full px-4 py-2.5 bg-neutral-950 border border-neutral-850 rounded-lg text-xs text-neutral-200 focus:outline-none focus:border-neutral-750 font-mono">
+                        </div>
+                        
+                        <!-- Toggle Maintenance -->
+                        <div class="pt-2">
+                            <label class="block text-[10px] font-bold text-neutral-500 uppercase mb-2">Status Operasional Bot</label>
+                            <div class="bg-neutral-950 border border-neutral-850 p-4 rounded-lg flex items-center justify-between">
+                                <div>
+                                    <p class="text-xs font-semibold text-neutral-200" id="maintenance-text-status">Maintenance: OFF</p>
+                                    <p class="text-[9px] text-neutral-500 mt-0.5">Bot merespon perintah user secara normal.</p>
+                                </div>
+                                <label class="relative inline-flex items-center cursor-pointer">
+                                    <input type="checkbox" id="cfg-maintenance-toggle" onchange="toggleMaintenanceMode()" class="sr-only peer">
+                                    <div class="w-9 h-5 bg-neutral-800 rounded-full peer peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-neutral-400 after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-indigo-600 peer-checked:after:bg-white"></div>
+                                </label>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="flex justify-end">
+                <button onclick="saveConfiguration()" class="w-full sm:w-auto px-5 py-3 bg-neutral-100 hover:bg-neutral-200 text-neutral-950 font-bold text-xs uppercase tracking-wider rounded-lg transition shadow-lg">
+                    Simpan Seluruh Konfigurasi
+                </button>
+            </div>
+        </section>
+    </main>
+
+    <!-- ================= MODAL: TAMBAH / EDIT PRODUK ================= -->
+    <div id="product-modal" class="hidden fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+        <div class="glass-card rounded-xl w-full max-w-lg overflow-hidden shadow-2xl border border-neutral-800">
+            <div class="p-6 border-b border-neutral-850 flex items-center justify-between">
+                <h3 id="modal-title" class="text-xs font-bold text-white uppercase tracking-widest">Tambah Produk</h3>
+                <button onclick="closeProductModal()" class="text-neutral-400 hover:text-white transition">
+                    <i data-lucide="x" class="w-5 h-5"></i>
+                </button>
+            </div>
+            
+            <form id="product-form" onsubmit="saveProduct(event)" class="p-6 space-y-4">
+                <input type="hidden" id="form-product-index">
+                <div class="grid grid-cols-3 gap-4">
+                    <div class="col-span-1">
+                        <label class="block text-[10px] font-bold text-neutral-500 uppercase mb-2">Emoji</label>
+                        <input type="text" id="form-product-emoji" required placeholder="🔥" class="w-full px-4 py-2.5 bg-neutral-950 border border-neutral-850 rounded-lg text-xs text-center text-neutral-200 focus:outline-none focus:border-neutral-750 transition">
+                    </div>
+                    <div class="col-span-2">
+                        <label class="block text-[10px] font-bold text-neutral-500 uppercase mb-2">Nama Produk</label>
+                        <input type="text" id="form-product-name" required placeholder="GB Standard" class="w-full px-4 py-2.5 bg-neutral-950 border border-neutral-850 rounded-lg text-xs text-neutral-200 focus:outline-none focus:border-neutral-750 transition">
+                    </div>
+                </div>
+                <div class="grid grid-cols-2 gap-4">
+                    <div>
+                        <label class="block text-[10px] font-bold text-neutral-500 uppercase mb-2">Paket ID</label>
+                        <input type="text" id="form-product-id" required placeholder="gb_standard" class="w-full px-4 py-2.5 bg-neutral-950 border border-neutral-850 rounded-lg text-xs text-neutral-200 focus:outline-none focus:border-neutral-750 transition font-mono">
+                    </div>
+                    <div>
+                        <label class="block text-[10px] font-bold text-neutral-500 uppercase mb-2">Harga (Rp)</label>
+                        <input type="number" id="form-product-price" required placeholder="15000" class="w-full px-4 py-2.5 bg-neutral-950 border border-neutral-850 rounded-lg text-xs text-neutral-200 focus:outline-none focus:border-neutral-750 transition font-mono">
+                    </div>
+                </div>
+                <div>
+                    <label class="block text-[10px] font-bold text-neutral-500 uppercase mb-2">Group ID Telegram (Grup VIP)</label>
+                    <input type="text" id="form-product-group" placeholder="-100xxxxxxxxxx" class="w-full px-4 py-2.5 bg-neutral-950 border border-neutral-850 rounded-lg text-xs text-neutral-200 focus:outline-none focus:border-neutral-750 transition font-mono">
+                </div>
+                <div>
+                    <label class="block text-[10px] font-bold text-neutral-500 uppercase mb-2">Prasyarat Pembelian (Prerequisites)</label>
+                    <div id="prereq-checkboxes" class="p-3 bg-neutral-950 border border-neutral-850 rounded-lg space-y-2 max-h-32 overflow-y-auto">
+                        <!-- JS Inject Checkboxes -->
+                    </div>
+                </div>
+
+                <div class="flex justify-end gap-3 pt-4 border-t border-neutral-850">
+                    <button type="button" onclick="closeProductModal()" class="px-4 py-2 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 rounded-lg text-xs font-semibold transition">Batal</button>
+                    <button type="submit" class="px-5 py-2 bg-neutral-100 hover:bg-neutral-200 text-neutral-950 rounded-lg text-xs font-semibold transition font-bold uppercase tracking-wider">Simpan</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- ================= MODAL: TAMBAH ADMIN ================= -->
+    <div id="admin-modal" class="hidden fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+        <div class="glass-card rounded-xl w-full max-w-sm overflow-hidden shadow-2xl border border-neutral-800">
+            <div class="p-6 border-b border-neutral-850 flex items-center justify-between">
+                <h3 class="text-xs font-bold text-white uppercase tracking-widest">Tambah Admin</h3>
+                <button onclick="closeAdminModal()" class="text-neutral-400 hover:text-white transition">
+                    <i data-lucide="x" class="w-5 h-5"></i>
+                </button>
+            </div>
+            <form id="admin-form" onsubmit="saveAdmin(event)" class="p-6 space-y-4">
+                <div>
+                    <label class="block text-[10px] font-bold text-neutral-500 uppercase mb-2">Nama Lengkap</label>
+                    <input type="text" id="form-admin-name" required placeholder="Kru Tambahan" class="w-full px-4 py-2.5 bg-neutral-950 border border-neutral-850 rounded-lg text-xs text-neutral-200 focus:outline-none focus:border-neutral-750 transition">
+                </div>
+                <div>
+                    <label class="block text-[10px] font-bold text-neutral-500 uppercase mb-2">User ID Telegram</label>
+                    <input type="number" id="form-admin-id" required placeholder="Contoh: 87654321" class="w-full px-4 py-2.5 bg-neutral-950 border border-neutral-850 rounded-lg text-xs text-neutral-200 focus:outline-none focus:border-neutral-750 transition font-mono">
+                </div>
+                <div class="flex justify-end gap-3 pt-4 border-t border-neutral-850">
+                    <button type="button" onclick="closeAdminModal()" class="px-4 py-2 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 rounded-lg text-xs font-semibold transition">Batal</button>
+                    <button type="submit" class="px-5 py-2 bg-neutral-100 hover:bg-neutral-200 text-neutral-950 rounded-lg text-xs font-semibold transition font-bold uppercase tracking-wider">Simpan</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- ================= JAVASCRIPT LOGICAL WORKSPACE ================= -->
+    <script>
+        // ===== AUDIO SYNTHESIZER UTILITY CLASS (Web Audio API) =====
+        class SoundEngine {
+            constructor() {
+                this.ctx = null;
+            }
+            init() {
+                if (!this.ctx) {
+                    this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+                }
+            }
+            play(type = 'click') {
+                this.init();
+                if (!this.ctx) return;
+                
+                const osc = this.ctx.createOscillator();
+                const gain = this.ctx.createGain();
+                osc.connect(gain);
+                gain.connect(this.ctx.destination);
+                
+                const now = this.ctx.currentTime;
+                
+                if (type === 'click') {
+                    osc.type = 'sine';
+                    osc.frequency.setValueAtTime(800, now);
+                    osc.frequency.exponentialRampToValueAtTime(1200, now + 0.04);
+                    gain.gain.setValueAtTime(0.04, now);
+                    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.05);
+                    osc.start(now);
+                    osc.stop(now + 0.05);
+                } else if (type === 'success') {
+                    osc.type = 'triangle';
+                    osc.frequency.setValueAtTime(600, now);
+                    osc.frequency.setValueAtTime(800, now + 0.08);
+                    osc.frequency.setValueAtTime(1100, now + 0.16);
+                    gain.gain.setValueAtTime(0.08, now);
+                    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.35);
+                    osc.start(now);
+                    osc.stop(now + 0.35);
+                } else if (type === 'error') {
+                    osc.type = 'sawtooth';
+                    osc.frequency.setValueAtTime(180, now);
+                    osc.frequency.linearRampToValueAtTime(100, now + 0.15);
+                    gain.gain.setValueAtTime(0.08, now);
+                    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.2);
+                    osc.start(now);
+                    osc.stop(now + 0.2);
+                } else if (type === 'toggle') {
+                    osc.type = 'sine';
+                    osc.frequency.setValueAtTime(500, now);
+                    osc.frequency.exponentialRampToValueAtTime(900, now + 0.12);
+                    gain.gain.setValueAtTime(0.05, now);
+                    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.15);
+                    osc.start(now);
+                    osc.stop(now + 0.15);
+                }
+            }
+        }
+        const sfx = new SoundEngine();
+
+        // ===== TELEGRAM MINI APP INITIALIZATION =====
+        const tg = window.Telegram?.WebApp;
+        if (tg) {
+            tg.expand();
+            tg.ready();
+            tg.BackButton.show();
+            tg.BackButton.onClick(() => tg.close());
+        }
+
+        // ===== API SECURITY AUTHENTICATION =====
+        const _INJECTED_KEY = 'kikuk_super_secret_12345';
+        let API_KEY = localStorage.getItem('admin_api_key') || _INJECTED_KEY;
+
+        function getAuthHeader() {
+            if (tg && tg.initData) return `tma ${tg.initData}`;
+            return `Bearer ${API_KEY}`;
+        }
+
+        const API_BASE = '';
+
+        async function apiCall(endpoint, method = 'GET', body = null) {
+            const opts = {
+                method,
+                headers: { 
+                    'Authorization': getAuthHeader(), 
+                    'Content-Type': 'application/json' 
+                }
+            };
+            if (body) opts.body = JSON.stringify(body);
+            const res = await fetch(API_BASE + endpoint, opts);
+            if (res.status === 401) {
+                sfx.play('error');
+                throw new Error('Otoritas akses ditolak. Periksa kembali API Key Anda.');
+            }
+            if (!res.ok) {
+                let errMsg = `HTTP ${res.status}`;
+                try { const d = await res.json(); errMsg = d.error || errMsg; } catch(e) {}
+                throw new Error(errMsg);
+            }
+            return res.json();
+        }
+
+        // ===== SYSTEM CONFIRMATION MODAL (No-Alert Guardrail) =====
+        function showCustomConfirm(title, message, onOk, onCancel = null) {
+            sfx.play('toggle');
+            const modal = document.getElementById('confirm-modal');
+            const card = document.getElementById('confirm-card');
+            
+            document.getElementById('confirm-title').innerText = title;
+            document.getElementById('confirm-message').innerText = message;
+            
+            modal.classList.remove('hidden');
+            setTimeout(() => {
+                card.classList.remove('scale-95');
+                card.classList.add('scale-100');
+            }, 10);
+
+            const btnOk = document.getElementById('confirm-btn-ok');
+            const btnCancel = document.getElementById('confirm-btn-cancel');
+
+            const cleanOk = btnOk.cloneNode(true);
+            const cleanCancel = btnCancel.cloneNode(true);
+            btnOk.parentNode.replaceChild(cleanOk, btnOk);
+            btnCancel.parentNode.replaceChild(cleanCancel, btnCancel);
+
+            cleanOk.addEventListener('click', () => {
+                sfx.play('click');
+                modal.classList.add('hidden');
+                if (onOk) onOk();
+            });
+
+            cleanCancel.addEventListener('click', () => {
+                sfx.play('click');
+                modal.classList.add('hidden');
+                if (onCancel) onCancel();
+            });
+        }
+
+        // ===== CORE STATE =====
+        let state = {
+            products: [],
+            orders: [],
+            bannedUsers: [],
+            testimonials: [],
+            admins: [],
+            groups: [],
+            currentOrderFilter: 'all',
+            apiStats: null
+        };
+
+        let trendChartInstance = null;
+        let productChartInstance = null;
+
+        // ===== DATABOUND SYNCHRONIZATION =====
+        async function loadData() {
+            try {
+                const syncIcon = document.getElementById('sync-icon');
+                if (syncIcon) syncIcon.classList.add('animate-spin');
+
+                const [products, orders, testimonials, banned, admins, stats, groups] = await Promise.all([
+                    apiCall('/api/products'),
+                    apiCall('/api/orders'),
+                    apiCall('/api/testimonials'),
+                    apiCall('/api/banned'),
+                    apiCall('/api/admins'),
+                    apiCall('/api/stats'),
+                    apiCall('/api/groups').catch(() => []) // Fallback jika endpoint grup belum aktif
+                ]);
+
+                state.products     = products;
+                state.orders       = orders;
+                state.testimonials = testimonials;
+                state.bannedUsers  = banned;
+                state.admins       = admins;
+                state.apiStats     = stats;
+                state.groups       = groups;
+
+                renderAllData();
+                updateCharts();
+                
+                if (syncIcon) syncIcon.classList.remove('animate-spin');
+            } catch (e) {
+                showToast(e.message, 'error');
+                const syncIcon = document.getElementById('sync-icon');
+                if (syncIcon) syncIcon.classList.remove('animate-spin');
+            }
+        }
+
+        async function syncDataFromServer() {
+            sfx.play('click');
+            await loadData();
+            showToast("Sinkronisasi database sukses!");
+        }
+
+        window.onload = function() {
+            lucide.createIcons();
+            initCharts();
+            updateBroadcastPreview();
+            loadData();
+        };
+
+        // ===== SPA VIEW CONTROL =====
+        function switchView(viewId) {
+            sfx.play('click');
+            const views = ['view-ringkasan', 'view-produk', 'view-pesanan', 'view-testimoni', 'view-pengguna', 'view-broadcast', 'view-backup', 'view-admin', 'view-pengaturan'];
+            views.forEach(v => {
+                const el = document.getElementById(v);
+                if (v === viewId) {
+                    el.classList.remove('hidden');
+                    el.classList.add('block');
+                } else {
+                    el.classList.remove('block');
+                    el.classList.add('hidden');
+                }
+
+                const btn = document.getElementById('btn-' + v);
+                if (btn) {
+                    if (v === viewId) {
+                        btn.className = "nav-btn w-full flex items-center gap-3 px-4 py-3 rounded-lg text-xs font-bold uppercase tracking-wider text-neutral-100 bg-neutral-800 border border-neutral-700 transition duration-150";
+                    } else {
+                        btn.className = "nav-btn w-full flex items-center gap-3 px-4 py-3 rounded-lg text-xs font-bold uppercase tracking-wider text-neutral-400 hover:text-neutral-100 hover:bg-neutral-850/60 transition duration-150";
+                    }
+                }
+
+                // Mobile Navigation Button Active State
+                const mbtn = document.getElementById('mbtn-' + v);
+                if (mbtn) {
+                    if (v === viewId) {
+                        mbtn.classList.add('text-indigo-400');
+                        mbtn.classList.remove('text-neutral-400');
+                    } else {
+                        mbtn.classList.remove('text-indigo-400');
+                        mbtn.classList.add('text-neutral-400');
+                    }
+                }
+            });
+
+            const titleMap = {
+                'view-ringkasan': 'Ringkasan Eksekutif',
+                'view-produk': 'Katalog & Alur Paket Produk',
+                'view-pesanan': 'Laporan Riwayat Pesanan',
+                'view-testimoni': 'Moderasi Testimoni Pembeli',
+                'view-pengguna': 'Grup & Manajemen Blacklist',
+                'view-broadcast': 'Kirim Broadcast Pesan',
+                'view-backup': 'Backup & Restore Database',
+                'view-admin': 'Sub-Admin Tambahan',
+                'view-pengaturan': 'Konfigurasi Server & Bot'
+            };
+            const descMap = {
+                'view-ringkasan': 'Status dan metrik performa toko HyperFamily Anda hari ini.',
+                'view-produk': 'Ubah paket, tautan grup privat, serta alur prasyarat pembeli.',
+                'view-pesanan': 'Konfirmasi secara manual atau batalkan pesanan pembeli.',
+                'view-testimoni': 'Lihat, terima, atau tolak ulasan pembeli sebelum dikirim ke channel.',
+                'view-pengguna': 'Kelola pengguna di dalam grup Telegram dan pemblokiran akses transaksi.',
+                'view-broadcast': 'Kirim pesan siaran HTML massal ke seluruh pembeli di database.',
+                'view-backup': 'Unduh cadangan CSV/JSON atau kembalikan database menggunakan backup.',
+                'view-admin': 'Kru admin tambahan dengan akses terbatas ke panel kontrol.',
+                'view-pengaturan': 'Atur kunci HMAC, webhook token, dan mode maintenance.'
+            };
+            document.getElementById('view-title').innerText = titleMap[viewId];
+            document.getElementById('view-desc').innerText = descMap[viewId];
+        }
+
+        // Drawer Menu Mobile Control
+        function openMoreMobileMenu() {
+            sfx.play('click');
+            const drawer = document.getElementById('mobile-drawer');
+            const content = document.getElementById('mobile-drawer-content');
+            drawer.classList.remove('hidden');
+            setTimeout(() => {
+                content.classList.remove('translate-x-full');
+            }, 10);
+        }
+
+        function closeMoreMobileMenu() {
+            sfx.play('click');
+            const drawer = document.getElementById('mobile-drawer');
+            const content = document.getElementById('mobile-drawer-content');
+            content.classList.add('translate-x-full');
+            setTimeout(() => {
+                drawer.classList.add('hidden');
+            }, 300);
+        }
+
+        // ===== FLOATING TOAST NOTIFICATION =====
+        function showToast(message, type = 'success') {
+            const container = document.getElementById('toast-container');
+            const toast = document.createElement('div');
+            
+            const borderClass = type === 'success' ? 'border-indigo-500/20 text-indigo-300 bg-neutral-900/90' : 'border-rose-500/20 text-rose-300 bg-neutral-900/90';
+            const icon = type === 'success' ? 'sparkles' : 'alert-circle';
+
+            toast.className = `flex items-center gap-3 px-4 py-3.5 border rounded-xl shadow-2xl transition duration-300 transform translate-y-2 opacity-0 pointer-events-auto min-w-[280px] ${borderClass} backdrop-blur-md`;
+            toast.innerHTML = `
+                <i data-lucide="${icon}" class="w-4 h-4 shrink-0"></i>
+                <span class="text-xs font-semibold tracking-wide">${message}</span>
+            `;
+            
+            container.appendChild(toast);
+            lucide.createIcons({attrs: {'class': 'w-4 h-4'}});
+
+            setTimeout(() => {
+                toast.classList.remove('translate-y-2', 'opacity-0');
+            }, 10);
+
+            setTimeout(() => {
+                toast.classList.add('translate-y-2', 'opacity-0');
+                setTimeout(() => { toast.remove(); }, 300);
+            }, 3500);
+        }
+
+        // ===== DATA RENDERING ENGINE =====
+        function renderAllData() {
+            renderStats();
+            renderProducts();
+            renderOrders();
+            renderTestimonials();
+            renderBannedUsers();
+            renderAdmins();
+        }
+
+        function renderStats() {
+            const s = state.apiStats;
+            if (!s) return;
+
+            const fmt = (n) => "Rp " + (n || 0).toLocaleString('id-ID');
+            const repeatRate = s.total_buyers > 0 ? Math.round((s.repeat_buyers / s.total_buyers) * 100) : 0;
+
+            document.getElementById('stat-omzet-hari-ini').innerText  = fmt(s.today_revenue);
+            document.getElementById('stat-omzet-bulan-ini').innerText = fmt(s.month_revenue);
+            document.getElementById('stat-omzet-all-time').innerText  = fmt(s.total_revenue);
+            document.getElementById('stat-waiting-queue').innerText   = (s.active_count || 0) + " Antrean";
+            document.getElementById('stat-total-transaksi').innerText = (s.total_orders || 0) + " Transaksi";
+            document.getElementById('stat-aov').innerText             = fmt(s.aov);
+            document.getElementById('stat-unique-buyers').innerText   = (s.total_buyers || 0) + " Pembeli";
+            document.getElementById('stat-repeat-rate').innerText     = repeatRate + "%";
+        }
+
+        function renderProducts() {
+            const tbody = document.getElementById('product-table-body');
+            tbody.innerHTML = '';
+
+            state.products.forEach((p, idx) => {
+                const tr = document.createElement('tr');
+                tr.className = "hover:bg-neutral-900/40 transition duration-150 border-b border-neutral-850";
+                
+                const groupLabel = p.group_chat_id ? `<code class="bg-neutral-950 px-2 py-0.5 border border-neutral-800 rounded text-[10px] text-indigo-400 font-mono">${p.group_chat_id}</code>` : `<span class="text-[10px] text-neutral-500 italic">Tanpa Grup</span>`;
+                const prereqLabel = p.requires_paket_ids ? `<code class="bg-neutral-950 px-2 py-0.5 border border-neutral-800 rounded text-[10px] text-rose-400 font-mono">${p.requires_paket_ids}</code>` : `<span class="text-[10px] text-neutral-500 italic">Tanpa Syarat</span>`;
+                const statusBadge = p.aktif ? `<span class="px-2 py-0.5 bg-indigo-500/10 text-indigo-400 text-[10px] font-bold uppercase tracking-wider rounded-md border border-indigo-500/20">Aktif</span>` : `<span class="px-2 py-0.5 bg-neutral-800 text-neutral-500 text-[10px] font-bold uppercase tracking-wider rounded-md border border-neutral-700">Nonaktif</span>`;
+                const statusBtnText = p.aktif ? 'Matikan' : 'Aktifkan';
+
+                tr.innerHTML = `
+                    <td class="p-4 font-semibold text-neutral-200 flex items-center gap-2">
+                        <span class="text-base">${p.emoji}</span> ${p.nama}
+                    </td>
+                    <td class="p-4 font-mono text-[10px] text-neutral-400"><code>${p.paket_id}</code></td>
+                    <td class="p-4 font-mono text-neutral-300">Rp ${(p.harga||0).toLocaleString('id-ID')}</td>
+                    <td class="p-4">${prereqLabel}</td>
+                    <td class="p-4">${groupLabel}</td>
+                    <td class="p-4">${statusBadge}</td>
+                    <td class="p-4 text-right space-x-3">
+                        <button onclick="toggleProductStatus('${p.paket_id}', ${p.aktif})" class="text-[10px] uppercase font-bold text-neutral-400 hover:text-white transition">${statusBtnText}</button>
+                        <button onclick="openProductModal(${idx})" class="text-[10px] uppercase font-bold text-indigo-400 hover:text-indigo-300 transition">Edit</button>
+                        <button onclick="deleteProduct('${p.paket_id}')" class="text-[10px] uppercase font-bold text-rose-500 hover:text-rose-400 transition font-extrabold">Hapus</button>
+                    </td>
+                `;
+                tbody.appendChild(tr);
+            });
+        }
+
+        function renderOrders() {
+            const tbody = document.getElementById('orders-table-body');
+            tbody.innerHTML = '';
+
+            const filtered = state.orders.filter(o => {
+                if (state.currentOrderFilter === 'all') return true;
+                return o.status === state.currentOrderFilter;
+            });
+
+            filtered.forEach(o => {
+                const tr = document.createElement('tr');
+                tr.className = "hover:bg-neutral-900/40 transition duration-150 border-b border-neutral-850";
+
+                let statusBadge = '';
+                let actionBtn = '';
+
+                if (o.status === 'completed') {
+                    statusBadge = `<span class="px-2 py-0.5 bg-emerald-500/10 text-emerald-400 text-[10px] font-bold uppercase tracking-wider rounded-md border border-emerald-500/20">Lunas</span>`;
+                    actionBtn = `<button onclick="copyToClipboard('${o.order_id}')" class="px-2.5 py-1.5 bg-neutral-850 hover:bg-neutral-800 border border-neutral-800 rounded-lg text-[10px] font-bold text-neutral-300 uppercase transition">Salin ID</button>`;
+                } else if (o.status === 'waiting') {
+                    statusBadge = `<span class="px-2 py-0.5 bg-amber-500/10 text-amber-400 text-[10px] font-bold uppercase tracking-wider rounded-md border border-amber-500/20">Waiting</span>`;
+                    actionBtn = `
+                        <div class="flex items-center gap-1.5 justify-end">
+                            <button onclick="manualConfirmOrder('${o.order_id}')" class="px-2.5 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-[10px] font-bold uppercase transition">Konfirm</button>
+                            <button onclick="manualCancelOrder('${o.order_id}')" class="px-2.5 py-1.5 bg-neutral-850 hover:bg-neutral-800 text-neutral-400 border border-neutral-800 rounded-lg text-[10px] font-bold uppercase transition">Batal</button>
+                        </div>
+                    `;
+                } else {
+                    statusBadge = `<span class="px-2 py-0.5 bg-neutral-850 text-neutral-500 text-[10px] font-bold uppercase tracking-wider rounded-md border border-neutral-800">Gagal</span>`;
+                    actionBtn = `<span class="text-xs text-neutral-600 italic font-mono">-</span>`;
+                }
+
+                tr.innerHTML = `
+                    <td class="p-4">
+                        <p class="font-semibold text-neutral-200">${o.user_name}</p>
+                        <p class="text-[9px] text-neutral-500 font-mono">ID: <code>${o.user_id}</code></p>
+                    </td>
+                    <td class="p-4 font-mono text-[10px] text-neutral-300"><code>${o.paket_id}</code></td>
+                    <td class="p-4 font-mono text-[10px] text-neutral-400"><code>${o.order_id}</code></td>
+                    <td class="p-4 text-emerald-400 font-mono">Rp ${(o.harga_dibayar||0).toLocaleString('id-ID')}</td>
+                    <td class="p-4 text-neutral-400 font-mono text-[11px]">${o.waktu || ''}</td>
+                    <td class="p-4">${statusBadge}</td>
+                    <td class="p-4 text-right">${actionBtn}</td>
+                `;
+                tbody.appendChild(tr);
+            });
+        }
+
+        function filterOrders() {
+            const query = document.getElementById('order-search').value.toLowerCase().trim();
+            const tbody = document.getElementById('orders-table-body');
+            const rows = tbody.getElementsByTagName('tr');
+
+            for (let i = 0; i < rows.length; i++) {
+                const text = rows[i].textContent.toLowerCase();
+                if (text.includes(query)) {
+                    rows[i].classList.remove('hidden');
+                } else {
+                    rows[i].classList.add('hidden');
+                }
+            }
+        }
+
+        function setOrderFilter(filterType) {
+            sfx.play('click');
+            state.currentOrderFilter = filterType;
+            const filterButtons = document.getElementsByClassName('order-filter-btn');
+            for (let btn of filterButtons) {
+                btn.className = "order-filter-btn shrink-0 px-3.5 py-2 rounded-lg text-[10px] font-bold uppercase tracking-wider transition text-neutral-400 hover:text-neutral-200 bg-transparent";
+            }
+            document.getElementById('filter-' + filterType).className = "order-filter-btn shrink-0 px-3.5 py-2 rounded-lg text-[10px] font-bold uppercase tracking-wider transition bg-neutral-800 border border-neutral-700 text-neutral-100";
+            renderOrders();
+        }
+
+        // ================= TESTIMONI MODERATION =================
+        function renderTestimonials() {
+            const container = document.getElementById('testi-container');
+            container.innerHTML = '';
+            
+            const pendingCount = state.testimonials.filter(t => t.status === 'pending').length;
+            document.getElementById('badge-pending-testi').innerText = pendingCount;
+
+            // Update badge pending versi mobile juga
+            const mbadge = document.getElementById('m-badge-pending-testi');
+            if (mbadge) mbadge.innerText = pendingCount;
+
+            state.testimonials.forEach((t) => {
+                const card = document.createElement('div');
+                card.className = "glass-card p-6 rounded-xl space-y-4 relative overflow-hidden";
+                
+                const stars = '★'.repeat(t.rating || 0) + '☆'.repeat(5 - (t.rating || 0));
+                let statusBadge = '';
+                let actionRow = '';
+                const reviewText = t.review || t.review_text || '-';
+
+                if (t.status === 'pending') {
+                    statusBadge = `<span class="px-2 py-0.5 bg-amber-500/10 text-amber-400 text-[9px] font-bold uppercase tracking-wider rounded border border-amber-500/20 absolute top-4 right-4">PENDING</span>`;
+                    actionRow = `
+                        <div class="flex gap-2 justify-end pt-3 border-t border-neutral-850">
+                            <button onclick="approveTesti('${t.order_id}')" class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-[10px] font-bold uppercase transition">Setujui & Post</button>
+                            <button onclick="rejectTesti('${t.order_id}')" class="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-400 rounded-lg text-[10px] font-bold uppercase transition">Tolak</button>
+                        </div>
+                    `;
+                } else if (t.status === 'approved') {
+                    statusBadge = `<span class="px-2 py-0.5 bg-emerald-500/10 text-emerald-400 text-[9px] font-bold uppercase tracking-wider rounded border border-emerald-500/20 absolute top-4 right-4">APPROVED</span>`;
+                } else {
+                    statusBadge = `<span class="px-2 py-0.5 bg-neutral-800 text-neutral-500 text-[9px] font-bold uppercase tracking-wider rounded border border-neutral-700 absolute top-4 right-4">REJECTED</span>`;
+                }
+
+                card.innerHTML = `
+                    ${statusBadge}
+                    <div class="space-y-1">
+                        <p class="font-bold text-neutral-200 text-xs">${t.user_name || '–'}</p>
+                        <p class="text-[9px] text-neutral-500">Order ID: <code class="font-mono">${t.order_id}</code></p>
+                    </div>
+                    <div class="text-amber-500 font-semibold text-xs tracking-widest">${stars}</div>
+                    <p class="text-xs text-neutral-300 italic">"${reviewText}"</p>
+                    ${actionRow}
+                `;
+                container.appendChild(card);
+            });
+        }
+
+        async function approveTesti(orderId) {
+            sfx.play('click');
+            try {
+                await apiCall(`/api/testimonials/${orderId}/action`, 'POST', { action: 'approve' });
+                showToast("Ulasan disetujui & dipublikasikan!");
+                await loadData();
+            } catch(e) { showToast('Gagal: ' + e.message, 'error'); }
+        }
+
+        async function rejectTesti(orderId) {
+            sfx.play('click');
+            try {
+                await apiCall(`/api/testimonials/${orderId}/action`, 'POST', { action: 'reject' });
+                showToast("Ulasan ditolak.", "error");
+                await loadData();
+            } catch(e) { showToast('Gagal: ' + e.message, 'error'); }
+        }
+
+        // ================= KICK & SCAN USER GRUP VIP =================
+        async function scanUserInGroups() {
+            sfx.play('click');
+            const userId = parseInt(document.getElementById('group-scan-id').value);
+            if (!userId) {
+                showToast("Masukkan User ID terlebih dahulu!", "error");
+                return;
+            }
+
+            const resultsContainer = document.getElementById('scan-result');
+            resultsContainer.innerHTML = '<p class="text-neutral-500 text-xs animate-pulse">Menghubungi server...</p>';
+            resultsContainer.classList.remove('hidden');
+
+            try {
+                // Endpoint sync untuk mencari member dalam grup premium
+                const response = await apiCall(`/api/kick/check/${userId}`);
+                resultsContainer.innerHTML = '';
+                
+                if (response.groups && response.groups.length > 0) {
+                    response.groups.forEach(group => {
+                        const isMember = group.is_member;
+                        const tr = document.createElement('div');
+                        tr.className = "flex items-center justify-between py-3 text-xs";
+
+                        const icon = isMember ? `<span class="text-emerald-400 font-bold flex items-center gap-1"><i data-lucide="check-circle" class="w-3.5 h-3.5"></i> Terdaftar</span>` : `<span class="text-neutral-500 flex items-center gap-1"><i data-lucide="circle-dashed" class="w-3.5 h-3.5"></i> Tidak Ada</span>`;
+                        const kickBtn = isMember ? `<button onclick="kickUserFromRealGroup(${userId}, '${group.chat_id}')" class="px-2.5 py-1.5 bg-rose-600/10 hover:bg-rose-600/20 text-rose-400 border border-rose-500/20 text-[10px] font-bold uppercase tracking-wider rounded transition">Kick</button>` : `<span class="text-[10px] text-neutral-600 italic">No Action</span>`;
+
+                        tr.innerHTML = `
+                            <div class="space-y-0.5">
+                                <p class="font-semibold text-neutral-200">${group.title}</p>
+                                <p class="text-[9px] text-neutral-500 font-mono">ID: ${group.chat_id}</p>
+                            </div>
+                            <div>${icon}</div>
+                            <div>${kickBtn}</div>
+                        `;
+                        resultsContainer.appendChild(tr);
+                    });
+                } else {
+                    resultsContainer.innerHTML = '<p class="text-neutral-400 text-xs italic">Bot tidak mendeteksi keanggotaan user ini di semua grup yang dikelola.</p>';
+                }
+                lucide.createIcons();
+            } catch (err) {
+                showToast(err.message, 'error');
+                resultsContainer.innerHTML = `<p class="text-rose-500 text-xs italic">Error: ${err.message}</p>`;
+            }
+        }
+
+        async function kickUserFromRealGroup(userId, groupId) {
+            showCustomConfirm(
+                "Kick Anggota",
+                `Yakin ingin mengeluarkan user ${userId} dari grup ${groupId}?`,
+                async () => {
+                    try {
+                        await apiCall('/api/kick/execute', 'POST', { user_id: userId, chat_id: groupId });
+                        showToast(`User ${userId} berhasil ditendang dari grup!`);
+                        await scanUserInGroups();
+                    } catch (e) {
+                        showToast(e.message, 'error');
+                    }
+                }
+            );
+        }
+
+        // ================= BLACKLIST / BANNED =================
+        function renderBannedUsers() {
+            const tbody = document.getElementById('banned-table-body');
+            tbody.innerHTML = '';
+
+            state.bannedUsers.forEach((user) => {
+                const tr = document.createElement('tr');
+                tr.className = "hover:bg-neutral-900/40 transition border-b border-neutral-850";
+                tr.innerHTML = `
+                    <td class="p-3 font-mono text-[10px] text-neutral-200"><code>${user.user_id}</code></td>
+                    <td class="p-3 text-neutral-300">${user.reason || '-'}</td>
+                    <td class="p-3 text-neutral-500 font-mono">${user.banned_at || ''}</td>
+                    <td class="p-3 text-right">
+                        <button onclick="unbanUser(${user.user_id})" class="px-2 py-1 bg-neutral-850 hover:bg-neutral-800 text-emerald-400 transition rounded text-[10px] font-bold uppercase">Unban</button>
+                    </td>
+                `;
+                tbody.appendChild(tr);
+            });
+        }
+
+        async function executeBan(event) {
+            event.preventDefault();
+            const userId = parseInt(document.getElementById('ban-user-id').value);
+            const reason = document.getElementById('ban-reason').value;
+            if (!userId) { showToast("Masukkan User ID!", "error"); return; }
+            try {
+                await apiCall('/api/banned', 'POST', { user_id: userId, reason: reason });
+                document.getElementById('ban-user-id').value = '';
+                document.getElementById('ban-reason').value = '';
+                showToast(`ID ${userId} sukses dibanned.`);
+                await loadData();
+            } catch(e) { showToast('Gagal ban: ' + e.message, 'error'); }
+        }
+
+        async function unbanUser(userId) {
+            sfx.play('click');
+            try {
+                await apiCall(`/api/banned/${userId}`, 'DELETE');
+                showToast(`ID ${userId} dipulihkan.`);
+                await loadData();
+            } catch(e) { showToast('Gagal unban: ' + e.message, 'error'); }
+        }
+
+        // ================= KRU ADMINS =================
+        function renderAdmins() {
+            const tbody = document.getElementById('admins-table-body');
+            tbody.innerHTML = '';
+
+            state.admins.forEach((admin) => {
+                const tr = document.createElement('tr');
+                tr.className = "hover:bg-neutral-900/40 transition duration-150 border-b border-neutral-850";
+                tr.innerHTML = `
+                    <td class="p-4 font-semibold text-neutral-200">${admin.nama || '-'}</td>
+                    <td class="p-4 font-mono text-[10px]"><code>${admin.user_id}</code></td>
+                    <td class="p-4 font-mono text-[10px] text-neutral-400"><code>${admin.added_by || '-'}</code></td>
+                    <td class="p-4 text-neutral-400 font-mono">${admin.added_at || ''}</td>
+                    <td class="p-4 text-right">
+                        <button onclick="removeAdmin(${admin.user_id})" class="text-[10px] uppercase font-bold text-rose-500 hover:text-rose-400 font-bold">Hapus</button>
+                    </td>
+                `;
+                tbody.appendChild(tr);
+            });
+        }
+
+        function openAdminModal() {
+            sfx.play('click');
+            document.getElementById('admin-modal').classList.remove('hidden');
+        }
+
+        function closeAdminModal() {
+            sfx.play('click');
+            document.getElementById('admin-modal').classList.add('hidden');
+        }
+
+        async function saveAdmin(event) {
+            event.preventDefault();
+            const nama    = document.getElementById('form-admin-name').value;
+            const user_id = parseInt(document.getElementById('form-admin-id').value);
+            if (!user_id) { showToast("User ID tidak valid!", "error"); return; }
+            try {
+                await apiCall('/api/admins', 'POST', { user_id, nama });
+                closeAdminModal();
+                document.getElementById('admin-form').reset();
+                showToast(`Kru admin ${nama} sukses ditambahkan!`);
+                await loadData();
+            } catch(e) { showToast('Gagal tambah admin: ' + e.message, 'error'); }
+        }
+
+        async function removeAdmin(userId) {
+            showCustomConfirm(
+                "Hapus Kru Admin",
+                `Yakin ingin mencabut wewenang asisten admin dari User ID: ${userId}?`,
+                async () => {
+                    try {
+                        await apiCall(`/api/admins/${userId}`, 'DELETE');
+                        showToast(`Akses admin ${userId} telah dicabut.`, 'error');
+                        await loadData();
+                    } catch(e) { showToast('Gagal hapus admin: ' + e.message, 'error'); }
+                }
+            );
+        }
+
+        // ================= BROADCAST WORKSPACE =================
+        function updateBroadcastPreview() {
+            const text = document.getElementById('broadcast-input').value;
+            const previewContainer = document.getElementById('broadcast-preview-container');
+            const alertEl = document.getElementById('html-validation-alert');
+            
+            if (!text.trim()) {
+                previewContainer.innerHTML = `<span class="text-neutral-600 italic">Ketik teks broadcast Anda di editor sebelah kiri untuk melihat simulasi visual di sini...</span>`;
+                alertEl.classList.add('hidden');
+                return;
+            }
+
+            try {
+                const basicTags = ['b', 'i', 'code'];
+                basicTags.forEach(tag => {
+                    const openCount = (text.match(new RegExp(`<${tag}>`, 'g')) || []).length;
+                    const closeCount = (text.match(new RegExp(`</${tag}>`, 'g')) || []).length;
+                    if (openCount !== closeCount) {
+                        throw new Error(`Keseimbangan tag <${tag}> tidak cocok.`);
+                    }
+                });
+
+                let rendered = text
+                    .replace(/&/g, "&amp;")
+                    .replace(/</g, "&lt;")
+                    .replace(/>/g, "&gt;")
+                    .replace(/&lt;b&gt;/g, "<b>")
+                    .replace(/&lt;\/b&gt;/g, "</b>")
+                    .replace(/&lt;i&gt;/g, "<i>")
+                    .replace(/&lt;\/i&gt;/g, "</i>")
+                    .replace(/&lt;code&gt;/g, "<code class='bg-neutral-800 px-1.5 py-0.5 border border-neutral-700 rounded font-mono text-[10px] text-amber-400'>")
+                    .replace(/&lt;\/code&gt;/g, "</code>");
+
+                previewContainer.innerHTML = rendered.replace(/\n/g, '<br>');
+                alertEl.classList.add('hidden');
+            } catch (err) {
+                previewContainer.innerHTML = `<span class="text-rose-500 italic font-mono">[SINTAKS ERROR]: ${err.message}</span>`;
+                alertEl.classList.remove('hidden');
+            }
+        }
+
+        async function triggerBroadcast() {
+            const text = document.getElementById('broadcast-input').value;
+            if (!text.trim()) { showToast("Pesan broadcast masih kosong!", "error"); return; }
+            const alertEl = document.getElementById('html-validation-alert');
+            if (!alertEl.classList.contains('hidden')) {
+                showToast("Perbaiki sintaks HTML yang rusak terlebih dahulu!", "error");
+                return;
+            }
+            try {
+                const res = await apiCall('/api/broadcast', 'POST', { text });
+                showToast(`Proses broadcast dimulai ke ${res.total_buyers || 0} buyer!`);
+            } catch(e) {
+                showToast('Gagal broadcast: ' + e.message, 'error');
+            }
+        }
+
+        // ================= BACKUP & EXPORT =================
+        function simulateJsonBackup() {
+            sfx.play('click');
+            showToast("Mengunduh backup JSON...");
+            const url = `/api/backup/json?key=${encodeURIComponent(API_KEY)}`;
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = '';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+        }
+
+        function handleFileSelect(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+            showToast("Gunakan fitur /import_json langsung di Telegram Bot untuk memproses restorasi file .json", "error");
+        }
+
+        // ================= PRODUCT MANAGER MODAL =================
+        function openProductModal(idx = null) {
+            sfx.play('click');
+            const modal = document.getElementById('product-modal');
+            modal.classList.remove('hidden');
+
+            const prereqContainer = document.getElementById('prereq-checkboxes');
+            prereqContainer.innerHTML = '';
+
+            if (idx !== null) {
+                const p = state.products[idx];
+                document.getElementById('modal-title').innerText = "Edit Produk";
+                document.getElementById('form-product-index').value = idx;
+                document.getElementById('form-product-emoji').value = p.emoji;
+                document.getElementById('form-product-name').value = p.nama;
+                document.getElementById('form-product-id').value = p.paket_id;
+                document.getElementById('form-product-price').value = p.harga;
+                document.getElementById('form-product-group').value = p.group_chat_id || '';
+
+                state.products.forEach(otherProd => {
+                    if (otherProd.paket_id !== p.paket_id) {
+                        const isChecked = p.requires_paket_ids && p.requires_paket_ids.split(',').includes(otherProd.paket_id);
+                        prereqContainer.innerHTML += `
+                            <label class="flex items-center gap-2 text-xs text-neutral-300 cursor-pointer">
+                                <input type="checkbox" name="prereq_items" value="${otherProd.paket_id}" ${isChecked ? 'checked' : ''} class="rounded border-neutral-850 bg-neutral-950 text-indigo-600 focus:ring-0">
+                                <span>${otherProd.emoji} ${otherProd.nama} (${otherProd.paket_id})</span>
+                            </label>
+                        `;
+                    }
+                });
+            } else {
+                document.getElementById('modal-title').innerText = "Tambah Produk Baru";
+                document.getElementById('product-form').reset();
+                document.getElementById('form-product-index').value = '';
+
+                state.products.forEach(otherProd => {
+                    prereqContainer.innerHTML += `
+                        <label class="flex items-center gap-2 text-xs text-neutral-300 cursor-pointer">
+                            <input type="checkbox" name="prereq_items" value="${otherProd.paket_id}" class="rounded border-neutral-850 bg-neutral-950 text-indigo-600 focus:ring-0">
+                            <span>${otherProd.emoji} ${otherProd.nama} (${otherProd.paket_id})</span>
+                        </label>
+                    `;
+                });
+            }
+        }
+
+        function closeProductModal() {
+            sfx.play('click');
+            document.getElementById('product-modal').classList.add('hidden');
+        }
+
+        async function saveProduct(event) {
+            event.preventDefault();
+            const idx = document.getElementById('form-product-index').value;
+            const emoji    = document.getElementById('form-product-emoji').value;
+            const nama     = document.getElementById('form-product-name').value;
+            const paket_id = document.getElementById('form-product-id').value;
+            const harga    = parseInt(document.getElementById('form-product-price').value);
+            const group    = document.getElementById('form-product-group').value || null;
+
+            const checkedPrereqs = [];
+            document.getElementsByName('prereq_items').forEach(cb => {
+                if (cb.checked) checkedPrereqs.push(cb.value);
+            });
+            const requires_paket_ids = checkedPrereqs.length > 0 ? checkedPrereqs.join(',') : null;
+
+            try {
+                if (idx !== '') {
+                    // Update existing
+                    await apiCall(`/api/products/${paket_id}`, 'PUT', { emoji, nama, harga, group_chat_id: group, requires_paket_ids });
+                    showToast(`Produk "${nama}" sukses disimpan!`);
+                } else {
+                    // Create new
+                    await apiCall('/api/products', 'POST', { emoji, nama, paket_id, harga, group_chat_id: group, requires_paket_ids });
+                    showToast(`Produk "${nama}" sukses terdaftar!`);
+                }
+                closeProductModal();
+                await loadData();
+            } catch(e) { showToast('Gagal simpan produk: ' + e.message, 'error'); }
+        }
+
+        async function toggleProductStatus(paketId, currentAktif) {
+            sfx.play('toggle');
+            try {
+                await apiCall(`/api/products/${paketId}`, 'PUT', { aktif: !currentAktif });
+                showToast(`Status produk diperbarui!`);
+                await loadData();
+            } catch(e) { showToast('Gagal update status: ' + e.message, 'error'); }
+        }
+
+        async function deleteProduct(paketId) {
+            showCustomConfirm(
+                "Hapus Paket Produk",
+                `Yakin ingin menghapus produk dengan Paket ID: ${paketId}? Tindakan ini permanen.`,
+                async () => {
+                    try {
+                        await apiCall(`/api/products/${paketId}`, 'DELETE');
+                        showToast(`Produk "${paketId}" dihapus.`, 'error');
+                        await loadData();
+                    } catch(e) { showToast('Gagal hapus: ' + e.message, 'error'); }
+                }
+            );
+        }
+
+        async function manualConfirmOrder(orderId) {
+            showCustomConfirm(
+                "Konfirmasi Lunas Manual",
+                `Yakin ingin menandai transaksi ${orderId} sebagai LUNAS? Sistem akan langsung membuatkan link grup khusus untuk buyer.`,
+                async () => {
+                    try {
+                        await apiCall(`/api/orders/${orderId}/confirm`, 'POST');
+                        showToast(`Order ${orderId} berhasil dikonfirmasi manual!`);
+                        await loadData();
+                    } catch(e) { showToast('Gagal konfirmasi: ' + e.message, 'error'); }
+                }
+            );
+        }
+
+        async function manualCancelOrder(orderId) {
+            showCustomConfirm(
+                "Batalkan Transaksi",
+                `Yakin ingin membatalkan transaksi ${orderId}? Buyer akan otomatis dikenakan cooldown belanja.`,
+                async () => {
+                    try {
+                        await apiCall(`/api/orders/${orderId}/cancel`, 'POST');
+                        showToast(`Order ${orderId} berhasil dibatalkan.`, 'error');
+                        await loadData();
+                    } catch(e) { showToast('Gagal batalkan: ' + e.message, 'error'); }
+                }
+            );
+        }
+
+        async function toggleMaintenanceMode() {
+            sfx.play('toggle');
+            const active = document.getElementById('cfg-maintenance-toggle').checked;
+            const textEl = document.getElementById('maintenance-text-status');
+            try {
+                await apiCall('/api/settings', 'POST', { maintenance: active ? '1' : '0' });
+                if (active) {
+                    textEl.innerText = "Maintenance: ON";
+                    textEl.className = "text-xs font-semibold text-rose-400";
+                    showToast("Mode Maintenance aktif. Bot tidak melayani transaksi!", 'error');
+                } else {
+                    textEl.innerText = "Maintenance: OFF";
+                    textEl.className = "text-xs font-semibold text-neutral-200";
+                    showToast("Mode Maintenance tidak aktif.");
+                }
+            } catch(e) { showToast('Gagal toggle maintenance: ' + e.message, 'error'); }
+        }
+
+        async function saveConfiguration() {
+            sfx.play('click');
+            const linkTesti  = document.getElementById('cfg-link-testi')?.value  || '';
+            const linkAdmin  = document.getElementById('cfg-link-admin')?.value  || '';
+            const notifCh    = document.getElementById('cfg-channel-notif')?.value || '';
+            const testiCh    = document.getElementById('cfg-channel-testi')?.value || '';
+            const secret     = document.getElementById('cfg-webhook-secret')?.value || '';
+            
+            try {
+                await apiCall('/api/settings', 'POST', {
+                    link_testimoni: linkTesti,
+                    link_admin: linkAdmin,
+                    notif_channel_id: notifCh,
+                    testimoni_channel_id: testiCh,
+                    webhook_secret: secret
+                });
+                showToast("Konfigurasi berhasil disimpan ke database!");
+            } catch(e) { showToast('Gagal simpan konfigurasi: ' + e.message, 'error'); }
+        }
+
+        function copyToClipboard(text) {
+            sfx.play('click');
+            const dummy = document.createElement("textarea");
+            document.body.appendChild(dummy);
+            dummy.value = text;
+            dummy.select();
+            document.execCommand("copy");
+            document.body.removeChild(dummy);
+            showToast("Order ID disalin ke clipboard!");
+        }
+
+        // ================= CHART CONFIGURATION =================
+        function initCharts() {
+            const trendCtx = document.getElementById('trendChart').getContext('2d');
+            trendChartInstance = new Chart(trendCtx, {
+                type: 'line',
+                data: {
+                    labels: ['Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu', 'Minggu'],
+                    datasets: [{
+                        label: 'Omzet harian',
+                        data: [0, 0, 0, 0, 0, 0, 0],
+                        borderColor: '#6366f1',
+                        backgroundColor: 'rgba(99, 102, 241, 0.05)',
+                        borderWidth: 2,
+                        fill: true,
+                        tension: 0.4
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: { legend: { display: false } },
+                    scales: {
+                        y: { grid: { color: '#161920' }, ticks: { color: '#4a5568', font: { size: 10 } } },
+                        x: { grid: { display: false }, ticks: { color: '#4a5568', font: { size: 10 } } }
+                    }
+                }
+            });
+
+            const productCtx = document.getElementById('productChart').getContext('2d');
+            productChartInstance = new Chart(productCtx, {
+                type: 'doughnut',
+                data: getProductChartData(),
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                            position: 'bottom',
+                            labels: { color: '#4a5568', boxWidth: 10, font: { size: 10 } }
+                        }
+                    },
+                    cutout: '75%'
+                }
+            });
+        }
+
+        function getProductChartData() {
+            const labels = state.products.map(p => p.nama);
+            const data = state.products.map(p => {
+                return state.orders
+                    .filter(o => o.paket_id === p.paket_id && o.status === 'completed')
+                    .reduce((sum, o) => sum + (o.harga_dibayar || 0), 0);
+            });
+
+            return {
+                labels: labels,
+                datasets: [{
+                    data: data.length ? data : [1], // fallback visual jika kosong
+                    backgroundColor: ['#6366f1', '#10b981', '#f59e0b', '#ec4899', '#3b82f6'],
+                    borderWidth: 0
+                }]
+            };
+        }
+
+        function updateCharts() {
+            if (trendChartInstance && productChartInstance) {
+                productChartInstance.data = getProductChartData();
+                productChartInstance.update();
+
+                // Plot statistik omzet 7 hari terakhir dari API jika ada
+                if (state.apiStats && state.apiStats.trend_7d) {
+                    const trends = state.apiStats.trend_7d;
+                    const labels = [];
+                    const data = [];
+                    trends.forEach(day => {
+                        labels.push(day.hari);
+                        data.push(day.rev);
+                    });
+                    if (data.length > 0) {
+                        trendChartInstance.data.labels = labels;
+                        trendChartInstance.data.datasets[0].data = data;
+                        trendChartInstance.update();
+                    }
+                }
+            }
+        }
+    </script>
+</body>
+</html>

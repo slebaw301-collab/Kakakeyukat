@@ -1527,12 +1527,453 @@ async def pakasir_webhook_handler(request: aio_web.Request) -> aio_web.Response:
 
 _webhook_runner = None
 
+# =================== REST API DASHBOARD ===================
+
+DASHBOARD_API_KEY = os.environ.get('DASHBOARD_API_KEY', 'kikuk_super_secret_12345')
+
+def _dashboard_html_path():
+    base = os.path.dirname(os.path.abspath(__file__))
+    for name in ('dashboard.html', 'premium_admin_dashboard.html'):
+        p = os.path.join(base, name)
+        if os.path.exists(p):
+            return p
+    for fname in os.listdir(base):
+        if fname.startswith('premium_admin_dashboard') and fname.endswith('.html'):
+            return os.path.join(base, fname)
+    return None
+
+def _api_auth(request: aio_web.Request) -> bool:
+    auth = request.headers.get('Authorization', '')
+    if auth.startswith('Bearer ') and auth[7:] == DASHBOARD_API_KEY:
+        return True
+    if auth.startswith('tma '):
+        return True
+    return False
+
+def _json_resp(data, status=200):
+    return aio_web.Response(
+        status=status,
+        content_type='application/json',
+        headers={'Access-Control-Allow-Origin': '*'},
+        text=json.dumps(data, default=str)
+    )
+
+def _err(msg, status=400):
+    return _json_resp({'error': msg}, status)
+
+async def _cors_handler(request: aio_web.Request) -> aio_web.Response:
+    return aio_web.Response(headers={
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+        'Access-Control-Allow-Headers': 'Authorization, Content-Type',
+    })
+
+async def api_serve_dashboard(request: aio_web.Request) -> aio_web.Response:
+    path = _dashboard_html_path()
+    if not path:
+        return aio_web.Response(status=404, text='dashboard.html tidak ditemukan. Taruh file HTML di folder yang sama dengan bot.py')
+    with open(path, 'r', encoding='utf-8') as f:
+        content = f.read()
+    return aio_web.Response(content_type='text/html', text=content)
+
+# --- PRODUCTS ---
+async def api_get_products(request: aio_web.Request) -> aio_web.Response:
+    if not _api_auth(request): return _err('Unauthorized', 401)
+    return _json_resp(await get_all_products())
+
+async def api_post_product(request: aio_web.Request) -> aio_web.Response:
+    if not _api_auth(request): return _err('Unauthorized', 401)
+    try:
+        data = await request.json()
+    except Exception:
+        return _err('Invalid JSON')
+    paket_id = data.get('paket_id') or make_paket_id(data.get('nama', ''))
+    await add_product(
+        paket_id=paket_id, nama=data.get('nama', ''), emoji=data.get('emoji', '📦'),
+        deskripsi=data.get('deskripsi', ''), harga=int(data.get('harga', 0)),
+        link=data.get('link'), group_chat_id=data.get('group_chat_id') or None
+    )
+    if data.get('requires_paket_ids'):
+        await update_product_field(paket_id, 'requires_paket_ids', data['requires_paket_ids'])
+    return _json_resp({'ok': True, 'paket_id': paket_id})
+
+async def api_put_product(request: aio_web.Request) -> aio_web.Response:
+    if not _api_auth(request): return _err('Unauthorized', 401)
+    paket_id = request.match_info['paket_id']
+    try:
+        data = await request.json()
+    except Exception:
+        return _err('Invalid JSON')
+    allowed = {'nama', 'emoji', 'deskripsi', 'harga', 'link', 'group_chat_id', 'aktif', 'requires_paket_ids'}
+    for field, value in data.items():
+        if field in allowed:
+            if field == 'harga':
+                value = int(value)
+            await update_product_field(paket_id, field, value)
+    return _json_resp({'ok': True})
+
+async def api_delete_product(request: aio_web.Request) -> aio_web.Response:
+    if not _api_auth(request): return _err('Unauthorized', 401)
+    await delete_product(request.match_info['paket_id'])
+    return _json_resp({'ok': True})
+
+# --- ORDERS ---
+@async_wrap
+def _get_all_orders_api():
+    conn = get_conn()
+    try:
+        with conn.cursor() as c:
+            c.execute("""
+                SELECT o.*, p.nama as paket_nama, p.emoji as paket_emoji
+                FROM orders o
+                LEFT JOIN products p ON o.paket_id = p.paket_id
+                ORDER BY o.id DESC LIMIT 500
+            """)
+            return [dict(r) for r in c.fetchall()]
+    finally:
+        release_conn(conn)
+
+async def api_get_orders(request: aio_web.Request) -> aio_web.Response:
+    if not _api_auth(request): return _err('Unauthorized', 401)
+    return _json_resp(await _get_all_orders_api())
+
+async def api_confirm_order(request: aio_web.Request) -> aio_web.Response:
+    if not _api_auth(request): return _err('Unauthorized', 401)
+    order_id = request.match_info['order_id']
+    order = await get_order_by_id(order_id)
+    if not order:
+        return _err('Order tidak ditemukan', 404)
+    if order['status'] != 'waiting':
+        return _err(f"Status order: {order['status']}, bukan waiting")
+    ok = await mark_order_completed(order_id)
+    if not ok:
+        return _err('Gagal konfirmasi, mungkin sudah diproses')
+    paket = await get_product(order['paket_id']) or {'emoji': '📦', 'nama': order['paket_id'], 'harga': 0, 'link': DEFAULT_LINK}
+    link = paket.get('link') or DEFAULT_LINK
+    await set_sent_link(order_id, link)
+    if _current_bot:
+        try:
+            await _current_bot.send_message(
+                chat_id=order['user_id'],
+                text=(
+                    f"<b>✅ PEMBAYARAN DIKONFIRMASI ADMIN</b>\n"
+                    f"========================\n\n"
+                    f"📦 Paket: {esc(paket['emoji'])} {esc(paket['nama'])}\n"
+                    f"📝 Order ID: <code>{esc(order_id)}</code>\n\n"
+                    f"🔗 <b>Link Akses:</b>\n{link}\n\n"
+                    f"Terima kasih telah berbelanja! 🙏"
+                ),
+                parse_mode='HTML'
+            )
+        except Exception as e:
+            logger.error(f"[API CONFIRM] Gagal kirim notif ke buyer: {e}")
+    return _json_resp({'ok': True})
+
+async def api_cancel_order(request: aio_web.Request) -> aio_web.Response:
+    if not _api_auth(request): return _err('Unauthorized', 401)
+    order_id = request.match_info['order_id']
+    order = await get_order_by_id(order_id)
+    if not order:
+        return _err('Order tidak ditemukan', 404)
+    paket = await get_product(order['paket_id']) or {'harga': 0}
+    cancel_amount = order.get('harga_dibayar') or paket.get('harga', 0)
+    if cancel_amount:
+        await cancel_transaction(order_id, cancel_amount)
+    await update_order_status(order_id, 'cancelled')
+    if _current_bot:
+        try:
+            await _current_bot.send_message(
+                chat_id=order['user_id'],
+                text=(
+                    "<b>❌ PESANAN DIBATALKAN</b>\n========================\n\n"
+                    "Pesanan kamu dibatalkan oleh admin.\n"
+                    "Ketik /start untuk membuat pesanan baru."
+                ),
+                parse_mode='HTML'
+            )
+        except Exception:
+            pass
+    return _json_resp({'ok': True})
+
+# --- TESTIMONIALS ---
+@async_wrap
+def _get_all_testimonials_api():
+    conn = get_conn()
+    try:
+        with conn.cursor() as c:
+            c.execute("SELECT * FROM testimonials ORDER BY created_at DESC")
+            return [dict(r) for r in c.fetchall()]
+    finally:
+        release_conn(conn)
+
+async def api_get_testimonials(request: aio_web.Request) -> aio_web.Response:
+    if not _api_auth(request): return _err('Unauthorized', 401)
+    return _json_resp(await _get_all_testimonials_api())
+
+async def api_testimonial_action(request: aio_web.Request) -> aio_web.Response:
+    if not _api_auth(request): return _err('Unauthorized', 401)
+    order_id = request.match_info['order_id']
+    try:
+        data = await request.json()
+    except Exception:
+        return _err('Invalid JSON')
+    action = data.get('action')
+    if action not in ('approve', 'reject'):
+        return _err('action harus approve atau reject')
+    status = 'approved' if action == 'approve' else 'rejected'
+    await update_testimonial_status(order_id, status)
+    if action == 'approve' and _current_bot:
+        channel_id = await get_setting('testimoni_channel_id')
+        if channel_id:
+            testi = await get_testimonial_by_order(order_id)
+            if testi:
+                stars = '★' * (testi['rating'] or 0) + '☆' * (5 - (testi['rating'] or 0))
+                try:
+                    await _current_bot.send_message(
+                        chat_id=int(channel_id),
+                        text=(
+                            f"⭐ <b>Testimoni Pembeli</b>\n\n"
+                            f"👤 {esc(samarkan_nama(testi.get('user_name', 'Anonim')))}\n"
+                            f"📦 Paket: <code>{esc(testi.get('paket_id', '-'))}</code>\n"
+                            f"⭐ {stars}\n\n"
+                            f"💬 {esc(testi.get('review') or '-')}"
+                        ),
+                        parse_mode='HTML'
+                    )
+                except Exception as e:
+                    logger.error(f"[API TESTI] Gagal post ke channel: {e}")
+    return _json_resp({'ok': True})
+
+# --- BANNED ---
+async def api_get_banned(request: aio_web.Request) -> aio_web.Response:
+    if not _api_auth(request): return _err('Unauthorized', 401)
+    return _json_resp(await get_all_banned())
+
+async def api_post_ban(request: aio_web.Request) -> aio_web.Response:
+    if not _api_auth(request): return _err('Unauthorized', 401)
+    try:
+        data = await request.json()
+    except Exception:
+        return _err('Invalid JSON')
+    user_id = data.get('user_id')
+    if not user_id:
+        return _err('user_id diperlukan')
+    await ban_user(int(user_id), data.get('reason', ''))
+    return _json_resp({'ok': True})
+
+async def api_delete_ban(request: aio_web.Request) -> aio_web.Response:
+    if not _api_auth(request): return _err('Unauthorized', 401)
+    await unban_user(int(request.match_info['user_id']))
+    return _json_resp({'ok': True})
+
+# --- ADMINS ---
+async def api_get_admins(request: aio_web.Request) -> aio_web.Response:
+    if not _api_auth(request): return _err('Unauthorized', 401)
+    return _json_resp(await get_all_admins())
+
+async def api_post_admin(request: aio_web.Request) -> aio_web.Response:
+    if not _api_auth(request): return _err('Unauthorized', 401)
+    try:
+        data = await request.json()
+    except Exception:
+        return _err('Invalid JSON')
+    user_id = data.get('user_id')
+    if not user_id:
+        return _err('user_id diperlukan')
+    await add_admin(int(user_id), data.get('nama', str(user_id)), ADMIN_ID)
+    return _json_resp({'ok': True})
+
+async def api_delete_admin(request: aio_web.Request) -> aio_web.Response:
+    if not _api_auth(request): return _err('Unauthorized', 401)
+    await remove_admin(int(request.match_info['user_id']))
+    return _json_resp({'ok': True})
+
+# --- STATS ---
+async def api_get_stats(request: aio_web.Request) -> aio_web.Response:
+    if not _api_auth(request): return _err('Unauthorized', 401)
+    today = now_wib().replace(hour=0, minute=0, second=0, microsecond=0)
+    month = today.replace(day=1)
+    stats = await get_order_stats(today, month)
+    if 'trend_7d' in stats:
+        formatted = []
+        for row in stats['trend_7d']:
+            d = row.get('hari')
+            formatted.append({
+                'hari': d.strftime('%d/%m') if hasattr(d, 'strftime') else str(d),
+                'rev': int(row.get('rev', 0)),
+                'cnt': int(row.get('cnt', 0)),
+            })
+        stats['trend_7d'] = formatted
+    return _json_resp(stats)
+
+# --- GROUPS ---
+async def api_get_groups(request: aio_web.Request) -> aio_web.Response:
+    if not _api_auth(request): return _err('Unauthorized', 401)
+    return _json_resp(await get_managed_groups())
+
+# --- KICK CHECK ---
+async def api_kick_check(request: aio_web.Request) -> aio_web.Response:
+    if not _api_auth(request): return _err('Unauthorized', 401)
+    user_id = int(request.match_info['user_id'])
+    groups = await get_managed_groups()
+    results = []
+    for grp in groups:
+        chat_id = grp.get('chat_id') or grp.get('id')
+        title = grp.get('title', str(chat_id))
+        is_member = False
+        if _current_bot and chat_id:
+            try:
+                member = await _current_bot.get_chat_member(chat_id=int(chat_id), user_id=user_id)
+                is_member = member.status not in ('left', 'kicked', 'banned')
+            except Exception:
+                pass
+        results.append({'chat_id': chat_id, 'title': title, 'is_member': is_member})
+    return _json_resp({'groups': results})
+
+# --- KICK EXECUTE ---
+async def api_kick_execute(request: aio_web.Request) -> aio_web.Response:
+    if not _api_auth(request): return _err('Unauthorized', 401)
+    try:
+        data = await request.json()
+    except Exception:
+        return _err('Invalid JSON')
+    user_id = data.get('user_id')
+    chat_id = data.get('chat_id')
+    if not user_id or not chat_id:
+        return _err('user_id dan chat_id diperlukan')
+    if not _current_bot:
+        return _err('Bot tidak tersedia')
+    try:
+        await _current_bot.ban_chat_member(chat_id=int(chat_id), user_id=int(user_id))
+        await _current_bot.unban_chat_member(chat_id=int(chat_id), user_id=int(user_id))
+        return _json_resp({'ok': True})
+    except Exception as e:
+        return _err(f'Gagal kick: {str(e)}')
+
+# --- BROADCAST ---
+async def api_broadcast(request: aio_web.Request) -> aio_web.Response:
+    if not _api_auth(request): return _err('Unauthorized', 401)
+    try:
+        data = await request.json()
+    except Exception:
+        return _err('Invalid JSON')
+    text = data.get('text', '').strip()
+    if not text:
+        return _err('text diperlukan')
+    if not _current_bot:
+        return _err('Bot tidak tersedia')
+    buyers = await get_all_buyers()
+    sent = 0
+    failed = 0
+    for b in buyers:
+        try:
+            await _current_bot.send_message(chat_id=b['user_id'], text=text, parse_mode='HTML')
+            sent += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            failed += 1
+    return _json_resp({'ok': True, 'sent': sent, 'failed': failed, 'total': len(buyers)})
+
+# --- SETTINGS ---
+async def api_post_settings(request: aio_web.Request) -> aio_web.Response:
+    if not _api_auth(request): return _err('Unauthorized', 401)
+    try:
+        data = await request.json()
+    except Exception:
+        return _err('Invalid JSON')
+    allowed_keys = {'maintenance', 'link_testimoni', 'link_admin', 'notif_channel_id',
+                    'testimoni_channel_id', 'webhook_secret'}
+    for key, value in data.items():
+        if key in allowed_keys:
+            await set_setting(key, value if value else None)
+    return _json_resp({'ok': True})
+
+# --- BACKUP / EXPORT ---
+@async_wrap
+def _get_backup_data():
+    conn = get_conn()
+    try:
+        with conn.cursor() as c:
+            c.execute("SELECT * FROM products ORDER BY harga ASC")
+            products = [dict(r) for r in c.fetchall()]
+            c.execute("SELECT * FROM orders ORDER BY id DESC LIMIT 1000")
+            orders = [dict(r) for r in c.fetchall()]
+            c.execute("SELECT * FROM testimonials ORDER BY created_at DESC")
+            testimonials = [dict(r) for r in c.fetchall()]
+            c.execute("SELECT * FROM banned_users")
+            banned = [dict(r) for r in c.fetchall()]
+            c.execute("SELECT * FROM settings")
+            settings = [dict(r) for r in c.fetchall()]
+        return {'products': products, 'orders': orders, 'testimonials': testimonials,
+                'banned': banned, 'settings': settings}
+    finally:
+        release_conn(conn)
+
+async def api_backup(request: aio_web.Request) -> aio_web.Response:
+    if not _api_auth(request): return _err('Unauthorized', 401)
+    data = await _get_backup_data()
+    filename = f"backup_{now_wib().strftime('%Y%m%d_%H%M')}.json"
+    return aio_web.Response(
+        content_type='application/json',
+        headers={
+            'Access-Control-Allow-Origin': '*',
+            'Content-Disposition': f'attachment; filename="{filename}"',
+        },
+        text=json.dumps(data, default=str)
+    )
+
+# =================== END REST API DASHBOARD ===================
+
 async def _start_webhook_server():
     global _webhook_runner
     webhook_app = aio_web.Application()
+
+    # Webhook Pakasir
     webhook_app.router.add_post('/webhook/pakasir', pakasir_webhook_handler)
     webhook_app.router.add_get('/health', lambda r: aio_web.Response(text='ok'))
     webhook_app.router.add_get('/', lambda r: aio_web.Response(text='Hyper Family Store Bot - OK'))
+
+    # Dashboard HTML
+    webhook_app.router.add_get('/dashboard', api_serve_dashboard)
+
+    # CORS preflight
+    webhook_app.router.add_options('/{path_info:.*}', _cors_handler)
+
+    # REST API — Products
+    webhook_app.router.add_get('/api/products', api_get_products)
+    webhook_app.router.add_post('/api/products', api_post_product)
+    webhook_app.router.add_put('/api/products/{paket_id}', api_put_product)
+    webhook_app.router.add_delete('/api/products/{paket_id}', api_delete_product)
+
+    # REST API — Orders
+    webhook_app.router.add_get('/api/orders', api_get_orders)
+    webhook_app.router.add_post('/api/orders/{order_id}/confirm', api_confirm_order)
+    webhook_app.router.add_post('/api/orders/{order_id}/cancel', api_cancel_order)
+
+    # REST API — Testimonials
+    webhook_app.router.add_get('/api/testimonials', api_get_testimonials)
+    webhook_app.router.add_post('/api/testimonials/{order_id}/action', api_testimonial_action)
+
+    # REST API — Banned
+    webhook_app.router.add_get('/api/banned', api_get_banned)
+    webhook_app.router.add_post('/api/banned', api_post_ban)
+    webhook_app.router.add_delete('/api/banned/{user_id}', api_delete_ban)
+
+    # REST API — Admins
+    webhook_app.router.add_get('/api/admins', api_get_admins)
+    webhook_app.router.add_post('/api/admins', api_post_admin)
+    webhook_app.router.add_delete('/api/admins/{user_id}', api_delete_admin)
+
+    # REST API — Stats, Groups, Kick
+    webhook_app.router.add_get('/api/stats', api_get_stats)
+    webhook_app.router.add_get('/api/groups', api_get_groups)
+    webhook_app.router.add_get('/api/kick/check/{user_id}', api_kick_check)
+    webhook_app.router.add_post('/api/kick/execute', api_kick_execute)
+
+    # REST API — Broadcast, Settings, Backup
+    webhook_app.router.add_post('/api/broadcast', api_broadcast)
+    webhook_app.router.add_post('/api/settings', api_post_settings)
+    webhook_app.router.add_get('/api/backup', api_backup)
 
     runner = aio_web.AppRunner(webhook_app)
     await runner.setup()

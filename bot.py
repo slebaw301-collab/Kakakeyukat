@@ -23,7 +23,7 @@ from datetime import datetime, timedelta, timezone
 import telegram.error
 from telegram import (
     Update, BotCommand, BotCommandScopeChat, BotCommandScopeDefault,
-    InlineKeyboardButton, InlineKeyboardMarkup
+    InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 )
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
@@ -1530,6 +1530,7 @@ _webhook_runner = None
 # =================== REST API DASHBOARD ===================
 
 DASHBOARD_API_KEY = os.environ.get('DASHBOARD_API_KEY', 'kikuk_super_secret_12345')
+DASHBOARD_URL = os.environ.get('DASHBOARD_URL', '')  # contoh: https://xxx.up.railway.app/dashboard
 
 def _dashboard_html_path():
     base = os.path.dirname(os.path.abspath(__file__))
@@ -1567,6 +1568,21 @@ async def _cors_handler(request: aio_web.Request) -> aio_web.Response:
         'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
         'Access-Control-Allow-Headers': 'Authorization, Content-Type',
     })
+
+@aio_web.middleware
+async def _api_error_middleware(request: aio_web.Request, handler):
+    try:
+        resp = await handler(request)
+        resp.headers.setdefault('Access-Control-Allow-Origin', '*')
+        return resp
+    except Exception as e:
+        logger.error(f"[API ERROR] {request.method} {request.path}: {e}", exc_info=True)
+        return aio_web.Response(
+            status=500,
+            content_type='application/json',
+            headers={'Access-Control-Allow-Origin': '*'},
+            text=json.dumps({'error': str(e)})
+        )
 
 async def api_serve_dashboard(request: aio_web.Request) -> aio_web.Response:
     path = _dashboard_html_path()
@@ -1926,7 +1942,7 @@ async def api_backup(request: aio_web.Request) -> aio_web.Response:
 
 async def _start_webhook_server():
     global _webhook_runner
-    webhook_app = aio_web.Application()
+    webhook_app = aio_web.Application(middlewares=[_api_error_middleware])
 
     # Webhook Pakasir
     webhook_app.router.add_post('/webhook/pakasir', pakasir_webhook_handler)
@@ -5558,6 +5574,8 @@ def build_admin_panel_keyboard(user_id: int = None):
     ]
     if user_id and is_super_admin(user_id):
         rows.append([InlineKeyboardButton("👥 Kelola Admin", callback_data="admpanel_admins")])
+    if DASHBOARD_URL:
+        rows.append([InlineKeyboardButton("🖥️ Dashboard Web", web_app=WebAppInfo(url=DASHBOARD_URL))])
     return InlineKeyboardMarkup(rows)
 
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):

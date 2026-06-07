@@ -42,6 +42,81 @@ logger = logging.getLogger("HyperFamilyBot")
 
 # =================== HELPERS TEKS ===================
 
+import re as _re
+
+ORDER_ID_PATTERN = _re.compile(r'^HFB-\d+-\d{14}-[A-Z0-9]{4}$')
+
+def is_valid_order_id(order_id: str) -> bool:
+    """Validasi format Order ID untuk mencegah input sembarangan."""
+    return bool(ORDER_ID_PATTERN.match(order_id))
+
+class UserStateManager:
+    """State machine terpusat untuk mengelola state user di context.user_data."""
+    IDLE = "idle"
+    AWAITING_BAN = "awaiting_ban"
+    AWAITING_UNBAN = "awaiting_unban"
+    AWAITING_CHANNEL_ID = "awaiting_channel_id"
+    AWAITING_TESTI_CHANNEL_ID = "awaiting_testi_channel_id"
+    AWAITING_LINK_TESTI = "awaiting_link_testi"
+    AWAITING_LINK_ADMIN = "awaiting_link_admin"
+    AWAITING_CARI = "awaiting_cari"
+    AWAITING_KICK_SEARCH = "awaiting_kick_search"
+    AWAITING_ADD_GROUP = "awaiting_add_group"
+    AWAITING_ADD_ADMIN = "awaiting_add_admin"
+    AWAITING_JSON_IMPORT = "awaiting_json_import"
+    AWAITING_REVIEW_TEXT = "awaiting_review_text"
+    BLAST_TYPING = "blast_typing"
+    BLAST_PREVIEW = "blast_preview"
+    ADDING_PRODUCT = "adding_product"
+    EDITING_PRODUCT = "editing_product"
+
+_state_manager = UserStateManager()
+
+def get_user_state(context) -> str:
+    """Ambil state saat ini dari user."""
+    ud = context.user_data
+    if ud.get('awaiting_review_text'):
+        return UserStateManager.AWAITING_REVIEW_TEXT
+    if ud.get('awaiting_json_import'):
+        return UserStateManager.AWAITING_JSON_IMPORT
+    if ud.get('awaiting_ban'):
+        return UserStateManager.AWAITING_BAN
+    if ud.get('awaiting_unban'):
+        return UserStateManager.AWAITING_UNBAN
+    if ud.get('awaiting_channel_id'):
+        return UserStateManager.AWAITING_CHANNEL_ID
+    if ud.get('awaiting_testi_channel_id'):
+        return UserStateManager.AWAITING_TESTI_CHANNEL_ID
+    if ud.get('awaiting_link_testi'):
+        return UserStateManager.AWAITING_LINK_TESTI
+    if ud.get('awaiting_link_admin'):
+        return UserStateManager.AWAITING_LINK_ADMIN
+    if ud.get('awaiting_cari'):
+        return UserStateManager.AWAITING_CARI
+    if ud.get('awaiting_kick_search'):
+        return UserStateManager.AWAITING_KICK_SEARCH
+    if ud.get('awaiting_add_group'):
+        return UserStateManager.AWAITING_ADD_GROUP
+    if ud.get('awaiting_add_admin'):
+        return UserStateManager.AWAITING_ADD_ADMIN
+    bs = ud.get('blast_state', {})
+    if bs.get('step') == 'typing':
+        return UserStateManager.BLAST_TYPING
+    if bs.get('step') == 'preview':
+        return UserStateManager.BLAST_PREVIEW
+    if ud.get('adding_product'):
+        return UserStateManager.ADDING_PRODUCT
+    if ud.get('editing_product'):
+        return UserStateManager.EDITING_PRODUCT
+    return UserStateManager.IDLE
+
+def clear_user_state(context):
+    """Bersihkan semua state user."""
+    ud = context.user_data
+    for key in list(ud.keys()):
+        if key.startswith('awaiting_') or key in ('blast_state', 'adding_product', 'editing_product', 'temp_rating', 'prereq_ctx'):
+            ud.pop(key, None)
+
 def samarkan_nama(nama: str) -> str:
     if not nama:
         return "Pembeli"
@@ -438,14 +513,18 @@ def add_product(paket_id, nama, emoji, deskripsi, harga, link=None, group_chat_i
 
 @async_wrap
 def update_product_field(paket_id, field, value):
-    allowed = {"nama", "emoji", "deskripsi", "harga", "link", "group_chat_id", "aktif", "requires_paket_ids"}
-    if field not in allowed:
+    _FIELD_MAP = {
+        "nama": "nama", "emoji": "emoji", "deskripsi": "deskripsi",
+        "harga": "harga", "link": "link", "group_chat_id": "group_chat_id",
+        "aktif": "aktif", "requires_paket_ids": "requires_paket_ids"
+    }
+    safe_field = _FIELD_MAP.get(field)
+    if not safe_field:
         logger.warning(f"[SECURITY WARNING] Field SQL tidak diizinkan: {field}")
         return
-    # Sanitasi nama field aman untuk mencegah SQL injection di query dinamis
     with db_session_safe() as conn:
         with conn.cursor() as c:
-            c.execute(f"UPDATE products SET {field}=%s WHERE paket_id=%s", (value, paket_id))
+            c.execute(f"UPDATE products SET {safe_field}=%s WHERE paket_id=%s", (value, paket_id))
     _invalidate_products_cache()
 
 @async_wrap
@@ -951,7 +1030,24 @@ def set_setting(key, value):
 
 # =================== COOLDOWN DB + IN-MEMORY CACHE ===================
 COOLDOWN_MENIT = 5
+COOLDOWN_MENIT_MAX = 60
 _cooldown_memory_cache: dict = {}
+_cancel_count_cache: dict = {}
+
+def _get_dynamic_cooldown_minutes(user_id: int) -> int:
+    """Hitung cooldown dinamis berdasarkan jumlah cancel user."""
+    cancel_count = _cancel_count_cache.get(user_id, 0)
+    if cancel_count >= 5:
+        return COOLDOWN_MENIT_MAX
+    elif cancel_count >= 3:
+        return 30
+    elif cancel_count >= 2:
+        return 15
+    return COOLDOWN_MENIT
+
+def _increment_cancel_count(user_id: int):
+    """Increment cancel counter untuk user."""
+    _cancel_count_cache[user_id] = _cancel_count_cache.get(user_id, 0) + 1
 
 def _get_cooldown_memory(user_id: int) -> datetime:
     expires = _cooldown_memory_cache.get(user_id)
@@ -970,7 +1066,8 @@ def _clear_cooldown_memory(user_id: int):
 
 @async_wrap
 def set_cooldown_db(user_id):
-    expires_at = now_utc() + timedelta(minutes=COOLDOWN_MENIT)
+    cooldown_minutes = _get_dynamic_cooldown_minutes(user_id)
+    expires_at = now_utc() + timedelta(minutes=cooldown_minutes)
     with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute(
@@ -979,6 +1076,7 @@ def set_cooldown_db(user_id):
                 (user_id, expires_at)
             )
     _set_cooldown_memory(user_id, expires_at)
+    _increment_cancel_count(user_id)
 
 @async_wrap
 def get_cooldown_sisa_db(user_id):
@@ -1365,6 +1463,10 @@ async def pakasir_webhook_handler(request: aio_web.Request) -> aio_web.Response:
     if not order_id or amount is None:
         return aio_web.Response(status=400, text='missing fields')
 
+    if not is_valid_order_id(order_id):
+        logger.warning(f"[WEBHOOK] Order ID format tidak valid: {order_id}")
+        return aio_web.Response(status=400, text='invalid order_id format')
+
     order = await get_order_by_id(order_id)
     if not order:
         return aio_web.Response(status=404, text='order not found')
@@ -1372,7 +1474,12 @@ async def pakasir_webhook_handler(request: aio_web.Request) -> aio_web.Response:
     if order['status'] != 'waiting':
         return aio_web.Response(text='already processed')
 
-    verified_detail = await get_transaction_detail(order_id, amount)
+    try:
+        verified_detail = await get_transaction_detail(order_id, amount)
+    except Exception as e:
+        logger.error(f"[WEBHOOK] Error verifikasi transaksi: {e}")
+        return aio_web.Response(status=502, text='verification service error')
+    
     if not verified_detail or verified_detail.get('status') != 'completed':
         logger.warning(f"[SECURITY ALERT] Percobaan webhook palsu diblokir! Order ID: {order_id}")
         return aio_web.Response(status=400, text='verification failed')
@@ -1403,8 +1510,28 @@ _webhook_runner = None
 
 # =================== REST API DASHBOARD ===================
 
-DASHBOARD_API_KEY = os.environ.get('DASHBOARD_API_KEY', 'kikuk_super_secret_12345')
+from collections import defaultdict
+import time as _time_module
+
+DASHBOARD_API_KEY = os.environ.get('DASHBOARD_API_KEY')
+if not DASHBOARD_API_KEY:
+    raise ValueError("DASHBOARD_API_KEY tidak di-set!")
 DASHBOARD_URL = os.environ.get('DASHBOARD_URL', '')
+
+# =================== RATE LIMITER ===================
+
+_rate_limit_store: dict = defaultdict(list)
+RATE_LIMIT_MAX_REQUESTS = 100
+RATE_LIMIT_WINDOW_SECONDS = 60
+
+def _check_rate_limit(client_id: str) -> bool:
+    """Cek apakah client masih dalam batas rate limit. Return True jika diizinkan."""
+    now = _time_module.time()
+    _rate_limit_store[client_id] = [t for t in _rate_limit_store[client_id] if now - t < RATE_LIMIT_WINDOW_SECONDS]
+    if len(_rate_limit_store[client_id]) >= RATE_LIMIT_MAX_REQUESTS:
+        return False
+    _rate_limit_store[client_id].append(now)
+    return True
 
 def _dashboard_html_path():
     base = os.path.dirname(os.path.abspath(__file__))
@@ -1418,7 +1545,11 @@ def _dashboard_html_path():
     return None
 
 def _api_auth(request: aio_web.Request) -> bool:
-    """Verifikasi token otentikasi API Dashboard secara aman."""
+    """Verifikasi token otentikasi API Dashboard secara aman dengan rate limiting."""
+    client_id = request.remote or 'unknown'
+    if not _check_rate_limit(client_id):
+        logger.warning(f"[RATE LIMIT] Client {client_id} melebihi batas request")
+        return False
     auth = request.headers.get('Authorization', '')
     if auth.startswith('Bearer ') and auth[7:] == DASHBOARD_API_KEY:
         return True
@@ -1860,6 +1991,7 @@ async def post_init(application: Application):
     await application.bot.set_my_commands(
         [
             BotCommand("start",   "Buka toko"),
+            BotCommand("help",    "Bantuan penggunaan bot"),
             BotCommand("riwayat", "Lihat riwayat ordermu"),
         ],
         scope=BotCommandScopeDefault()
@@ -1867,6 +1999,7 @@ async def post_init(application: Application):
     await application.bot.set_my_commands(
         [
             BotCommand("start", "Buka toko"),
+            BotCommand("help", "Bantuan"),
             BotCommand("admin", "Panel admin"),
         ],
         scope=BotCommandScopeChat(chat_id=ADMIN_ID)
@@ -2016,6 +2149,41 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     simpan_msg_user(context, user_id, msg.message_id)
     await hapus_msg_user_lama(context, user_id, keep_last=1)
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler untuk /help - menampilkan bantuan penggunaan bot."""
+    text = (
+        "<b>📖 BANTUAN PENGGUNAAN BOT</b>\n"
+        "========================\n\n"
+        "<b>🛒 CARA BELI:</b>\n"
+        "1. Ketik /start untuk membuka toko\n"
+        "2. Pilih paket yang diinginkan\n"
+        "3. Scan QRIS untuk membayar\n"
+        "4. Link produk dikirim otomatis setelah bayar\n\n"
+        "<b>📋 COMMAND TERSEDIA:</b>\n"
+        "/start - Buka toko & mulai belanja\n"
+        "/help - Tampilkan bantuan ini\n"
+        "/riwayat - Lihat riwayat order kamu\n\n"
+        "<b>❓ PERTANYAAN UMUM:</b>\n\n"
+        "<b>Q: Bagaimana cara membayar?</b>\n"
+        "A: Scan QRIS yang muncul dengan e-wallet (GoPay, OVO, Dana, dll).\n\n"
+        "<b>Q: Berapa lama prosesnya?</b>\n"
+        "A: Pembayaran otomatis terverifikasi dalam 1-5 menit.\n\n"
+        "<b>Q: Link tidak masuk?</b>\n"
+        "A: Ketik /start untuk cek status, atau hubungi admin.\n\n"
+        "<b>Q: Bisa ganti paket?</b>\n"
+        "A: Bisa, maksimal 1x ganti paket sebelum bayar.\n\n"
+        "========================\n"
+        "💬 Butuh bantuan? Hubungi admin:"
+    )
+    link_admin = await get_setting('link_admin', 'https://t.me/Kikukkvd')
+    await update.message.reply_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("💬 Hubungi Admin", url=link_admin)]
+        ])
+    )
 
 async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -2557,20 +2725,29 @@ async def ganti_paket_batal(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =================== ASYNCIO MONITORING PAYMENT TASKS ===================
 
 _payment_tasks: dict = {}
+_payment_tasks_lock = asyncio.Lock()
 _current_bot = None
 
-def _stop_payment_task(user_id: int):
-    task = _payment_tasks.pop(user_id, None)
-    if task and not task.done():
-        task.cancel()
+async def _stop_payment_task(user_id: int):
+    async with _payment_tasks_lock:
+        task = _payment_tasks.pop(user_id, None)
+        if task and not task.done():
+            task.cancel()
 
 def _start_payment_task(bot, order_id: str, paket_id: str, user_id: int,
                          user_name: str, amount: int, timeout_seconds: int = 1800):
-    _stop_payment_task(user_id)
+    asyncio.get_event_loop().create_task(
+        _start_payment_task_async(bot, order_id, paket_id, user_id, user_name, amount, timeout_seconds)
+    )
+
+async def _start_payment_task_async(bot, order_id: str, paket_id: str, user_id: int,
+                                     user_name: str, amount: int, timeout_seconds: int = 1800):
+    await _stop_payment_task(user_id)
     task = asyncio.create_task(
         _payment_poll_loop(bot, order_id, paket_id, user_id, user_name, amount, timeout_seconds)
     )
-    _payment_tasks[user_id] = task
+    async with _payment_tasks_lock:
+        _payment_tasks[user_id] = task
 
 def _check_order_status_sync(order_id):
     with db_session_safe() as conn:
@@ -2650,7 +2827,8 @@ async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
     except asyncio.CancelledError:
         pass
     finally:
-        _payment_tasks.pop(user_id, None)
+        async with _payment_tasks_lock:
+            _payment_tasks.pop(user_id, None)
 
 async def _handle_payment_success(bot, order_id: str, paket_id: str, user_id: int,
                                    user_name: str, amount: int, trans: dict):
@@ -3552,19 +3730,11 @@ async def pd_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # =================== ADMIN: ORDER AKTIF ===================
 
-async def cmd_aktif(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.message.from_user.id, context):
-        return
-
+async def _build_active_orders_text_and_keyboard():
+    """Fungsi bersama untuk membangun text dan keyboard order aktif."""
     orders = await get_all_waiting()
     if not orders:
-        await update.message.reply_text(
-            "<b>✅ TIDAK ADA ORDER AKTIF</b>\n"
-            "========================\n\n"
-            "Tidak ada buyer yang sedang menunggu membayar saat ini.",
-            parse_mode="HTML"
-        )
-        return
+        return None, None
 
     text = f"<b>⏳ ORDER MENUNGGU BAYAR ({len(orders)})</b>\n========================\n\n"
     keyboard = []
@@ -3590,6 +3760,23 @@ async def cmd_aktif(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         ])
 
+    return text, keyboard
+
+async def cmd_aktif(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update.message.from_user.id, context):
+        return
+
+    text, keyboard = await _build_active_orders_text_and_keyboard()
+    if not text:
+        await update.message.reply_text(
+            "<b>✅ TIDAK ADA ORDER AKTIF</b>\n"
+            "========================\n\n"
+            "Tidak ada buyer yang sedang menunggu membayar saat ini.",
+            parse_mode="HTML"
+        )
+        return
+
+    keyboard.append([InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_orders")])
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
 def _check_waiting_order_sync(order_id):
@@ -5378,8 +5565,8 @@ async def admpanel_orders_aktif(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     await query.answer()
 
-    orders = await get_all_waiting()
-    if not orders:
+    text, keyboard = await _build_active_orders_text_and_keyboard()
+    if not text:
         await query.edit_message_text(
             "<b>✅ TIDAK ADA ORDER AKTIF</b>\n========================\n\nTidak ada buyer yang sedang menunggu membayar.",
             parse_mode="HTML",
@@ -5387,23 +5574,6 @@ async def admpanel_orders_aktif(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return
 
-    text = f"<b>⏳ ORDER MENUNGGU BAYAR ({len(orders)})</b>\n========================\n\n"
-    keyboard = []
-    for o in orders:
-        paket_nama = o.get('paket_nama') or o['paket_id']
-        paket_emoji = o.get('paket_emoji') or '📦'
-        paket_harga = o.get('paket_harga') or 0
-        durasi = hitung_durasi(o["waktu"])
-        text += (
-            f"- {esc(paket_emoji)} <b>{esc(o['user_name'])}</b>\n"
-            f"  Paket: {esc(paket_nama)} - {format_harga(paket_harga)}\n"
-            f"  Dibuat: {durasi}\n"
-            f"  ID: <code>{esc(o['order_id'])}</code>\n\n"
-        )
-        keyboard.append([
-            InlineKeyboardButton(f"✅ Konfirmasi: {o['user_name']}", callback_data=f"adm_konfirm|{o['user_id']}|{o['order_id']}"),
-            InlineKeyboardButton(f"❌ Cancel: {o['user_name']}", callback_data=f"adm_cancel|{o['user_id']}|{o['order_id']}")
-        ])
     keyboard.append([InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_orders")])
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
@@ -6269,6 +6439,7 @@ def main():
 
     # User Commands
     app.add_handler(CommandHandler("start",   start))
+    app.add_handler(CommandHandler("help",    cmd_help))
     app.add_handler(CommandHandler("riwayat", cmd_riwayat))
 
     # Admin Commands

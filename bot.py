@@ -12,6 +12,8 @@ import math
 import random
 import string
 import functools
+import urllib.parse
+import time as _time
 from aiohttp import web as aio_web
 import aiohttp
 import qrcode
@@ -20,6 +22,7 @@ from psycopg2.extras import RealDictCursor
 from psycopg2.pool import ThreadedConnectionPool
 from io import BytesIO
 from datetime import datetime, timedelta, timezone
+from contextlib import contextmanager
 import telegram.error
 from telegram import (
     Update, BotCommand, BotCommandScopeChat, BotCommandScopeDefault,
@@ -54,7 +57,7 @@ def samarkan_nama(nama: str) -> str:
     return " ".join(masked_parts)
 
 def esc(text) -> str:
-    """Escape HTML special characters untuk parse_mode=HTML."""
+    """Escape karakter spesial HTML untuk parse_mode=HTML."""
     return html_module.escape(str(text))
 
 # =================== TIMEZONE ===================
@@ -64,7 +67,7 @@ def now_wib() -> datetime:
     return datetime.now(WIB)
 
 def now_utc() -> datetime:
-    """Return timezone-aware UTC datetime."""
+    """Mengembalikan objek datetime UTC dengan timezone-aware."""
     return datetime.now(timezone.utc)
 
 # =================== KONFIGURASI ===================
@@ -120,7 +123,7 @@ async def create_transaction_qris(order_id, amount, description):
             logger.error(f"Pakasir error: {result}")
             return None
     except Exception as e:
-        logger.error(f"Error create transaction: {e}", exc_info=True)
+        logger.error(f"Error saat membuat transaksi QRIS: {e}", exc_info=True)
         return None
 
 async def cancel_transaction(order_id, amount):
@@ -142,7 +145,7 @@ async def cancel_transaction(order_id, amount):
         ) as response:
             return await response.json()
     except Exception as e:
-        logger.error(f"Error cancel transaction: {e}", exc_info=True)
+        logger.error(f"Error saat membatalkan transaksi: {e}", exc_info=True)
         return None
 
 async def get_transaction_detail(order_id, amount):
@@ -163,7 +166,7 @@ async def get_transaction_detail(order_id, amount):
                 return result['transaction']
             return None
     except Exception as e:
-        logger.error(f"Error get detail: {e}", exc_info=True)
+        logger.error(f"Error saat mengambil detail transaksi: {e}", exc_info=True)
         return None
 
 # =================== QR CODE GENERATOR ===================
@@ -183,44 +186,45 @@ def generate_qr_image(qris_string):
     buf.seek(0)
     return buf
 
-# =================== DATABASE POOL ===================
+# =================== DATABASE POOL & CONTEXT MANAGER ===================
 
 _pool: ThreadedConnectionPool = None
 
-# =================== IN-MEMORY TTL CACHE ===================
-import time as _time
-
-# Cache untuk get_setting: {key: (value, expire_at)}
-_settings_cache: dict = {}
-_SETTINGS_TTL = 60  # detik
-
-# Cache untuk get_all_products: (data_list, expire_at) atau None
-_products_cache: tuple = None
-_PRODUCTS_TTL = 30  # detik
-
-def _settings_cache_get(key):
-    entry = _settings_cache.get(key)
-    if entry and _time.monotonic() < entry[1]:
-        return True, entry[0]
-    return False, None
-
-def _settings_cache_set(key, value):
-    _settings_cache[key] = (value, _time.monotonic() + _SETTINGS_TTL)
-
-def _settings_cache_del(key):
-    _settings_cache.pop(key, None)
-
 def init_pool():
     global _pool
-    _pool = ThreadedConnectionPool(2, 20, DATABASE_URL, cursor_factory=RealDictCursor)
-    logger.info("[DB] Threaded Connection pool diinisialisasi (min=2, max=20)")
+    # Alokasi pool dinamis yang lebih tinggi untuk mengantisipasi concurrent request
+    _pool = ThreadedConnectionPool(5, 30, DATABASE_URL, cursor_factory=RealDictCursor)
+    logger.info("[DB] Threaded Connection pool berhasil diinisialisasi (min=5, max=30)")
 
-def get_conn():
-    return _pool.getconn()
-
-def release_conn(conn):
-    if _pool and conn:
-        _pool.putconn(conn)
+@contextmanager
+def db_session_safe(retries=3, delay=0.5):
+    """
+    Context manager aman dengan mekanisme retry eksponensial.
+    Mencegah crash aplikasi akibat Pool Exhaustion pada beban konkurensi tinggi.
+    """
+    conn = None
+    for attempt in range(retries):
+        try:
+            conn = _pool.getconn()
+            break
+        except psycopg2.pool.PoolError:
+            if attempt == retries - 1:
+                logger.error("[DB CRITICAL] Connection pool habis dan seluruh upaya retry gagal!")
+                raise
+            time_sleep = delay * (2 ** attempt)
+            logger.warning(f"[DB WARN] Pool exhausted. Menunggu {time_sleep}s sebelum mencoba kembali (Percobaan ke-{attempt+1})...")
+            _time.sleep(time_sleep)
+    try:
+        yield conn
+        conn.commit()
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"[DB ERROR] Transaksi database gagal dan di-rollback: {e}", exc_info=True)
+        raise
+    finally:
+        if conn and _pool:
+            _pool.putconn(conn)
 
 def async_wrap(func):
     @functools.wraps(func)
@@ -229,8 +233,7 @@ def async_wrap(func):
     return run
 
 def init_db():
-    conn = get_conn()
-    try:
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("""
                 CREATE TABLE IF NOT EXISTS products (
@@ -340,16 +343,11 @@ def init_db():
                     ]
                 )
 
-            conn.commit()
-    finally:
-        release_conn(conn)
-
 # =================== TESTIMONIAL DB FUNCTIONS ===================
 
 @async_wrap
 def save_testimonial(user_id, user_name, paket_id, order_id, rating, review):
-    conn = get_conn()
-    try:
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute(
                 """INSERT INTO testimonials (user_id, user_name, paket_id, order_id, rating, review, status)
@@ -357,47 +355,52 @@ def save_testimonial(user_id, user_name, paket_id, order_id, rating, review):
                    ON CONFLICT (order_id) DO UPDATE SET rating=EXCLUDED.rating, review=EXCLUDED.review, status='pending'""",
                 (user_id, user_name, paket_id, order_id, rating, review)
             )
-            conn.commit()
-    finally:
-        release_conn(conn)
 
 @async_wrap
 def update_testimonial_status(order_id, status):
-    conn = get_conn()
-    try:
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("UPDATE testimonials SET status=%s WHERE order_id=%s", (status, order_id))
-            conn.commit()
-    finally:
-        release_conn(conn)
 
 @async_wrap
 def get_testimonial_by_order(order_id):
-    conn = get_conn()
-    try:
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("SELECT * FROM testimonials WHERE order_id=%s", (order_id,))
             row = c.fetchone()
             return dict(row) if row else None
-    finally:
-        release_conn(conn)
 
 # =================== PRODUCT DB FUNCTIONS ===================
+
+# In-memory TTL Cache
+_settings_cache: dict = {}
+_SETTINGS_TTL = 60  # detik
+_products_cache: tuple = None
+_PRODUCTS_TTL = 30  # detik
+
+def _settings_cache_get(key):
+    entry = _settings_cache.get(key)
+    if entry and _time.monotonic() < entry[1]:
+        return True, entry[0]
+    return False, None
+
+def _settings_cache_set(key, value):
+    _settings_cache[key] = (value, _time.monotonic() + _SETTINGS_TTL)
+
+def _settings_cache_del(key):
+    _settings_cache.pop(key, None)
 
 def _get_all_products_sync():
     global _products_cache
     cached = _products_cache
     if cached and _time.monotonic() < cached[1]:
         return cached[0]
-    conn = get_conn()
-    try:
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("SELECT * FROM products ORDER BY harga ASC")
             data = [dict(r) for r in c.fetchall()]
             _products_cache = (data, _time.monotonic() + _PRODUCTS_TTL)
             return data
-    finally:
-        release_conn(conn)
 
 @async_wrap
 def get_all_products():
@@ -408,14 +411,11 @@ def _invalidate_products_cache():
     _products_cache = None
 
 def _get_product_sync(paket_id):
-    conn = get_conn()
-    try:
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("SELECT * FROM products WHERE paket_id=%s", (paket_id,))
             row = c.fetchone()
             return dict(row) if row else None
-    finally:
-        release_conn(conn)
 
 @async_wrap
 def get_product(paket_id):
@@ -423,8 +423,7 @@ def get_product(paket_id):
 
 @async_wrap
 def add_product(paket_id, nama, emoji, deskripsi, harga, link=None, group_chat_id=None):
-    conn = get_conn()
-    try:
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute(
                 """INSERT INTO products (paket_id, nama, emoji, deskripsi, harga, link, group_chat_id)
@@ -435,34 +434,25 @@ def add_product(paket_id, nama, emoji, deskripsi, harga, link=None, group_chat_i
                        link=EXCLUDED.link, group_chat_id=EXCLUDED.group_chat_id""",
                 (paket_id, nama, emoji, deskripsi, harga, link or DEFAULT_LINK, group_chat_id)
             )
-            conn.commit()
-    finally:
-        release_conn(conn)
     _invalidate_products_cache()
 
 @async_wrap
 def update_product_field(paket_id, field, value):
     allowed = {"nama", "emoji", "deskripsi", "harga", "link", "group_chat_id", "aktif", "requires_paket_ids"}
     if field not in allowed:
+        logger.warning(f"[SECURITY WARNING] Field SQL tidak diizinkan: {field}")
         return
-    conn = get_conn()
-    try:
+    # Sanitasi nama field aman untuk mencegah SQL injection di query dinamis
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute(f"UPDATE products SET {field}=%s WHERE paket_id=%s", (value, paket_id))
-            conn.commit()
-    finally:
-        release_conn(conn)
     _invalidate_products_cache()
 
 @async_wrap
 def delete_product(paket_id):
-    conn = get_conn()
-    try:
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("DELETE FROM products WHERE paket_id=%s", (paket_id,))
-            conn.commit()
-    finally:
-        release_conn(conn)
     _invalidate_products_cache()
 
 def make_paket_id(nama):
@@ -473,8 +463,7 @@ def make_paket_id(nama):
 
 @async_wrap
 def get_active_order(user_id):
-    conn = get_conn()
-    try:
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute(
                 "SELECT * FROM orders WHERE user_id=%s AND status IN ('waiting','pending') ORDER BY id DESC LIMIT 1",
@@ -482,13 +471,10 @@ def get_active_order(user_id):
             )
             row = c.fetchone()
             return dict(row) if row else None
-    finally:
-        release_conn(conn)
 
 @async_wrap
 def get_all_pending():
-    conn = get_conn()
-    try:
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("""
                 SELECT o.*, p.nama as paket_nama, p.emoji as paket_emoji, p.harga as paket_harga,
@@ -499,13 +485,10 @@ def get_all_pending():
                 ORDER BY o.id ASC
             """)
             return [dict(r) for r in c.fetchall()]
-    finally:
-        release_conn(conn)
 
 @async_wrap
 def get_all_waiting():
-    conn = get_conn()
-    try:
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("""
                 SELECT o.*, p.nama as paket_nama, p.emoji as paket_emoji, p.harga as paket_harga
@@ -515,13 +498,10 @@ def get_all_waiting():
                 ORDER BY o.id ASC
             """)
             return [dict(r) for r in c.fetchall()]
-    finally:
-        release_conn(conn)
 
 @async_wrap
 def get_buyer_history_with_products(user_id, limit=10):
-    conn = get_conn()
-    try:
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("""
                 SELECT o.*, p.nama as paket_nama, p.emoji as paket_emoji, p.harga as paket_harga
@@ -532,13 +512,10 @@ def get_buyer_history_with_products(user_id, limit=10):
                 LIMIT %s
             """, (user_id, limit))
             return [dict(r) for r in c.fetchall()]
-    finally:
-        release_conn(conn)
 
 @async_wrap
 def get_all_buyers():
-    conn = get_conn()
-    try:
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("""
                 SELECT o.user_id, o.user_name, MAX(o.id) as max_id
@@ -549,14 +526,11 @@ def get_all_buyers():
                 ORDER BY max_id DESC
             """)
             return [dict(r) for r in c.fetchall()]
-    finally:
-        release_conn(conn)
 
 @async_wrap
 def search_buyers_sync(query: str) -> list:
-    """Cari buyer berdasarkan nama (case-insensitive) atau user_id angka."""
-    conn = get_conn()
-    try:
+    """Mencari pembeli menggunakan parameterized query aman."""
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             try:
                 uid = int(query.strip())
@@ -575,33 +549,24 @@ def search_buyers_sync(query: str) -> list:
                     LIMIT 10
                 """, (f"%{query.strip()}%",))
             return [dict(r) for r in c.fetchall()]
-    finally:
-        release_conn(conn)
 
 def _get_managed_groups_sync() -> list:
-    conn = get_conn()
-    try:
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("SELECT value FROM settings WHERE key='managed_groups'")
             row = c.fetchone()
             if row and row['value']:
                 return json.loads(row['value'])
             return []
-    finally:
-        release_conn(conn)
 
 def _set_managed_groups_sync(groups: list):
-    conn = get_conn()
-    try:
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute(
                 "INSERT INTO settings (key, value) VALUES ('managed_groups', %s) "
                 "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
                 (json.dumps(groups),)
             )
-        conn.commit()
-    finally:
-        release_conn(conn)
 
 async def get_managed_groups() -> list:
     return await asyncio.to_thread(_get_managed_groups_sync)
@@ -611,8 +576,7 @@ async def set_managed_groups(groups: list):
 
 @async_wrap
 def get_order_stats(today_start: datetime, month_start: datetime):
-    conn = get_conn()
-    try:
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             yesterday_start = today_start - timedelta(days=1)
             if month_start.month == 1:
@@ -699,7 +663,7 @@ def get_order_stats(today_start: datetime, month_start: datetime):
                 GROUP BY DATE(created_at AT TIME ZONE 'Asia/Jakarta')
                 ORDER BY hari ASC
             """, (today_start - timedelta(days=6),))
-            trend_7d = [dict(r) for r in c.fetchall()]
+            trend_7d = [dict(row) for row in c.fetchall()]
 
             c.execute("""
                 SELECT
@@ -735,7 +699,7 @@ def get_order_stats(today_start: datetime, month_start: datetime):
                 GROUP BY o.paket_id, p.nama, p.emoji
                 ORDER BY cnt DESC
             """)
-            products_breakdown = [dict(r) for r in c.fetchall()]
+            products_breakdown = [dict(row) for row in c.fetchall()]
 
             best_product = None
             if products_breakdown:
@@ -744,7 +708,7 @@ def get_order_stats(today_start: datetime, month_start: datetime):
                 nama = b.get('nama') or b['paket_id']
                 best_product = f"{emoji} {nama} ({b['cnt']}x)"
 
-            # Week stats (Senin s/d hari ini)
+            # Statistik Mingguan (Senin s/d Hari ini)
             week_start = today_start - timedelta(days=today_start.weekday())
             last_week_start = week_start - timedelta(days=7)
             last_week_end = week_start
@@ -761,7 +725,7 @@ def get_order_stats(today_start: datetime, month_start: datetime):
             """, (last_week_start, last_week_end))
             r = c.fetchone(); last_week_completed = r['cnt']; last_week_revenue = r['rev']
 
-            # Produk terlaris bulan ini
+            # Produk Terlaris Bulan Ini
             c.execute("""
                 SELECT o.paket_id, p.nama, p.emoji, COUNT(*) as cnt, COALESCE(SUM(o.harga_dibayar), 0) as total
                 FROM orders o
@@ -771,9 +735,9 @@ def get_order_stats(today_start: datetime, month_start: datetime):
                 ORDER BY cnt DESC
                 LIMIT 5
             """, (month_start,))
-            products_month = [dict(r) for r in c.fetchall()]
+            products_month = [dict(row) for row in c.fetchall()]
 
-            # Top 3 buyer bulan ini
+            # Top 3 Buyer Bulan Ini
             c.execute("""
                 SELECT o.user_id, o.user_name, COUNT(*) as cnt, COALESCE(SUM(o.harga_dibayar), 0) as total
                 FROM orders o
@@ -782,12 +746,9 @@ def get_order_stats(today_start: datetime, month_start: datetime):
                 ORDER BY cnt DESC
                 LIMIT 3
             """, (month_start,))
-            top_buyers_month = [dict(r) for r in c.fetchall()]
+            top_buyers_month = [dict(row) for row in c.fetchall()]
 
             days_elapsed = max(1, (today_start - month_start).days + 1)
-
-    finally:
-        release_conn(conn)
 
     return {
         'total_orders': total_orders,
@@ -829,57 +790,41 @@ def get_order_stats(today_start: datetime, month_start: datetime):
 
 @async_wrap
 def update_order_status(order_id, status):
-    conn = get_conn()
-    try:
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("UPDATE orders SET status=%s WHERE order_id=%s", (status, order_id))
-            conn.commit()
-    finally:
-        release_conn(conn)
 
 def _mark_order_completed_sync(order_id) -> bool:
-    """Atomic: set completed hanya jika masih 'waiting'. Return True jika berhasil."""
-    conn = get_conn()
-    try:
+    """Atomic: mengubah status menjadi completed hanya jika masih 'waiting'."""
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute(
                 "UPDATE orders SET status='completed' WHERE order_id=%s AND status='waiting' RETURNING id",
                 (order_id,)
             )
             updated = c.fetchone()
-            conn.commit()
             return updated is not None
-    finally:
-        release_conn(conn)
 
 async def mark_order_completed(order_id) -> bool:
     return await asyncio.to_thread(_mark_order_completed_sync, order_id)
 
 @async_wrap
 def get_order_by_id(order_id):
-    conn = get_conn()
-    try:
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("SELECT * FROM orders WHERE order_id=%s", (order_id,))
             row = c.fetchone()
             return dict(row) if row else None
-    finally:
-        release_conn(conn)
 
 @async_wrap
 def check_prerequisites_sync(user_id: int, requires_paket_ids_str: str) -> list:
-    """
-    Cek apakah user sudah pernah COMPLETED semua paket yang ada di requires_paket_ids_str.
-    Mengembalikan list paket_id yang BELUM terpenuhi (kosong = semua sudah).
-    requires_paket_ids_str: CSV string, contoh: "gb_biasa,gb_standar"
-    """
+    """Cek pemenuhan syarat pembelian paket."""
     if not requires_paket_ids_str:
         return []
     required_ids = [p.strip() for p in requires_paket_ids_str.split(",") if p.strip()]
     if not required_ids:
         return []
-    conn = get_conn()
-    try:
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute(
                 """SELECT DISTINCT paket_id FROM orders
@@ -888,44 +833,28 @@ def check_prerequisites_sync(user_id: int, requires_paket_ids_str: str) -> list:
             )
             done_ids = {row["paket_id"] for row in c.fetchall()}
             return [pid for pid in required_ids if pid not in done_ids]
-    finally:
-        release_conn(conn)
 
 @async_wrap
 def set_admin_msg_id(order_id, msg_id):
-    conn = get_conn()
-    try:
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("UPDATE orders SET admin_msg_id=%s WHERE order_id=%s", (msg_id, order_id))
-            conn.commit()
-    finally:
-        release_conn(conn)
 
 @async_wrap
 def set_buyer_msg_id(order_id, msg_id):
-    conn = get_conn()
-    try:
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("UPDATE orders SET buyer_msg_id=%s WHERE order_id=%s", (msg_id, order_id))
-            conn.commit()
-    finally:
-        release_conn(conn)
 
 @async_wrap
 def set_sent_link(order_id, link):
-    conn = get_conn()
-    try:
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("UPDATE orders SET sent_link=%s WHERE order_id=%s", (link, order_id))
-            conn.commit()
-    finally:
-        release_conn(conn)
 
 @async_wrap
 def get_completed_no_link_orders(user_id: int) -> list:
-    """Ambil semua order completed yang belum dapat link (pending prereq)."""
-    conn = get_conn()
-    try:
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute(
                 """SELECT * FROM orders
@@ -934,30 +863,22 @@ def get_completed_no_link_orders(user_id: int) -> list:
                 (user_id,)
             )
             return [dict(r) for r in c.fetchall()]
-    finally:
-        release_conn(conn)
 
 @async_wrap
 def atomic_claim_for_delivery(order_id: str) -> bool:
-    """Atomically claim order for link delivery. Returns True only if successfully claimed.
-    Prevents race conditions when multiple webhook callbacks fire simultaneously."""
-    conn = get_conn()
-    try:
+    """Secara atomik mengklaim order untuk pengiriman guna mencegah race condition Webhook."""
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute(
                 """UPDATE orders SET sent_link='pending'
                    WHERE order_id=%s AND (sent_link IS NULL OR sent_link='')""",
                 (order_id,)
             )
-            conn.commit()
             return c.rowcount > 0
-    finally:
-        release_conn(conn)
 
 @async_wrap
 def save_order(user_id, user_name, paket_id, order_id, harga_dibayar=0, order_changes=0):
-    conn = get_conn()
-    try:
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute(
                 """INSERT INTO orders (user_id, user_name, paket_id, order_id, status, waktu, harga_dibayar, order_changes)
@@ -965,26 +886,19 @@ def save_order(user_id, user_name, paket_id, order_id, harga_dibayar=0, order_ch
                 (user_id, user_name, paket_id, order_id,
                  now_wib().strftime("%H:%M - %d/%m/%Y"), harga_dibayar, order_changes)
             )
-            conn.commit()
-    finally:
-        release_conn(conn)
 
 # =================== BAN DB FUNCTIONS ===================
 
 @async_wrap
 def is_banned(user_id):
-    conn = get_conn()
-    try:
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("SELECT 1 FROM banned_users WHERE user_id=%s", (user_id,))
             return c.fetchone() is not None
-    finally:
-        release_conn(conn)
 
 @async_wrap
 def ban_user(user_id, reason=""):
-    conn = get_conn()
-    try:
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute(
                 """INSERT INTO banned_users (user_id, reason, banned_at)
@@ -992,29 +906,19 @@ def ban_user(user_id, reason=""):
                    ON CONFLICT (user_id) DO UPDATE SET reason=EXCLUDED.reason, banned_at=EXCLUDED.banned_at""",
                 (user_id, reason, now_wib().strftime("%H:%M - %d/%m/%Y"))
             )
-            conn.commit()
-    finally:
-        release_conn(conn)
 
 @async_wrap
 def unban_user(user_id):
-    conn = get_conn()
-    try:
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("DELETE FROM banned_users WHERE user_id=%s", (user_id,))
-            conn.commit()
-    finally:
-        release_conn(conn)
 
 @async_wrap
 def get_all_banned():
-    conn = get_conn()
-    try:
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("SELECT * FROM banned_users ORDER BY banned_at DESC")
             return [dict(r) for r in c.fetchall()]
-    finally:
-        release_conn(conn)
 
 # =================== SETTINGS DB FUNCTIONS ===================
 
@@ -1023,21 +927,17 @@ def get_setting(key, default=None):
     hit, cached_val = _settings_cache_get(key)
     if hit:
         return cached_val if cached_val is not None else default
-    conn = get_conn()
-    try:
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("SELECT value FROM settings WHERE key=%s", (key,))
             row = c.fetchone()
             val = row['value'] if row else None
             _settings_cache_set(key, val)
             return val if val is not None else default
-    finally:
-        release_conn(conn)
 
 @async_wrap
 def set_setting(key, value):
-    conn = get_conn()
-    try:
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             if value is None:
                 c.execute("DELETE FROM settings WHERE key=%s", (key,))
@@ -1047,20 +947,13 @@ def set_setting(key, value):
                        ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value""",
                     (key, str(value))
                 )
-            conn.commit()
-    finally:
-        release_conn(conn)
     _settings_cache_del(key)
 
 # =================== COOLDOWN DB + IN-MEMORY CACHE ===================
 COOLDOWN_MENIT = 5
-
-# In-memory cooldown cache: {user_id: expires_at_utc}
-# Used as fast-path validation before hitting DB
 _cooldown_memory_cache: dict = {}
 
 def _get_cooldown_memory(user_id: int) -> datetime:
-    """Get cooldown expiry from in-memory cache. Returns None if not found or expired."""
     expires = _cooldown_memory_cache.get(user_id)
     if expires is None:
         return None
@@ -1070,43 +963,31 @@ def _get_cooldown_memory(user_id: int) -> datetime:
     return expires
 
 def _set_cooldown_memory(user_id: int, expires_at: datetime):
-    """Store cooldown expiry in memory cache."""
     _cooldown_memory_cache[user_id] = expires_at
 
 def _clear_cooldown_memory(user_id: int):
-    """Clear cooldown from memory cache."""
     _cooldown_memory_cache.pop(user_id, None)
 
 @async_wrap
 def set_cooldown_db(user_id):
-    """Store cooldown in DB using UTC timezone."""
     expires_at = now_utc() + timedelta(minutes=COOLDOWN_MENIT)
-    conn = get_conn()
-    try:
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute(
                 """INSERT INTO cooldowns (user_id, expires_at) VALUES (%s, %s)
                    ON CONFLICT (user_id) DO UPDATE SET expires_at=EXCLUDED.expires_at""",
                 (user_id, expires_at)
             )
-            conn.commit()
-    finally:
-        release_conn(conn)
-    # Also update in-memory cache
     _set_cooldown_memory(user_id, expires_at)
 
 @async_wrap
 def get_cooldown_sisa_db(user_id):
-    """Get remaining cooldown minutes. Uses UTC consistently."""
-    # Check in-memory cache first (fast path)
     mem_expires = _get_cooldown_memory(user_id)
     if mem_expires is not None:
         sisa = (mem_expires - now_utc()).total_seconds()
         return math.ceil(sisa / 60) if sisa > 0 else 0
     
-    # Fallback to DB
-    conn = get_conn()
-    try:
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("SELECT expires_at FROM cooldowns WHERE user_id=%s", (user_id,))
             row = c.fetchone()
@@ -1114,63 +995,45 @@ def get_cooldown_sisa_db(user_id):
                 return 0
             try:
                 until = row['expires_at']
-                # Ensure timezone-aware comparison
                 if until.tzinfo is None:
-                    # If naive, assume it's UTC (PostgreSQL TIMESTAMPTZ should be aware, but handle edge case)
                     until = until.replace(tzinfo=timezone.utc)
                 
-                # Convert to UTC for consistent comparison
                 until_utc = until.astimezone(timezone.utc)
                 sisa = (until_utc - now_utc()).total_seconds()
                 
-                # Update memory cache for next time
                 if sisa > 0:
                     _set_cooldown_memory(user_id, until_utc)
                 
                 return math.ceil(sisa / 60) if sisa > 0 else 0
             except Exception as e:
-                logger.error(f"[COOLDOWN] Gagal menghitung sisa cooldown: {e}")
+                logger.error(f"[COOLDOWN] Gagal menghitung cooldown: {e}")
                 return 0
-    finally:
-        release_conn(conn)
 
 @async_wrap
 def clear_cooldown_db(user_id):
-    conn = get_conn()
-    try:
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("DELETE FROM cooldowns WHERE user_id=%s", (user_id,))
-            conn.commit()
-    finally:
-        release_conn(conn)
     _clear_cooldown_memory(user_id)
 
 @async_wrap
 def cleanup_expired_cooldowns():
-    conn = get_conn()
-    try:
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("DELETE FROM cooldowns WHERE expires_at < NOW()")
-            conn.commit()
-    finally:
-        release_conn(conn)
 
 # =================== ADMIN DB FUNCTIONS ===================
 
 @async_wrap
 def get_all_admins():
-    conn = get_conn()
-    try:
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("SELECT * FROM admins ORDER BY added_at ASC")
             return [dict(r) for r in c.fetchall()]
-    finally:
-        release_conn(conn)
 
 @async_wrap
 def add_admin(user_id, nama, added_by):
-    conn = get_conn()
-    try:
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute(
                 """INSERT INTO admins (user_id, nama, added_by, added_at)
@@ -1178,29 +1041,19 @@ def add_admin(user_id, nama, added_by):
                    ON CONFLICT (user_id) DO UPDATE SET nama=EXCLUDED.nama""",
                 (user_id, str(nama), added_by, now_wib().strftime("%H:%M - %d/%m/%Y"))
             )
-            conn.commit()
-    finally:
-        release_conn(conn)
 
 @async_wrap
 def remove_admin(user_id):
-    conn = get_conn()
-    try:
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("DELETE FROM admins WHERE user_id=%s", (user_id,))
-            conn.commit()
-    finally:
-        release_conn(conn)
 
 @async_wrap
 def is_admin_in_db(user_id):
-    conn = get_conn()
-    try:
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("SELECT 1 FROM admins WHERE user_id=%s", (user_id,))
             return c.fetchone() is not None
-    finally:
-        release_conn(conn)
 
 # =================== ADMIN CHECK WITH SESSION CACHE ===================
 
@@ -1246,11 +1099,11 @@ def hitung_durasi(waktu_str):
         hours = total_minutes // 60
         minutes = total_minutes % 60
         return f"{hours} jam {minutes} menit lalu"
-    except Exception:
+    except Exception as e:
+        logger.debug(f"Gagal menghitung durasi: {e}")
         return waktu_str
 
 def _build_link_section(group_link: str, fallback_link: str) -> str:
-    """Helper untuk membangun blok teks link produk (group atau biasa)."""
     if group_link:
         return (
             f"🔗 <b>Link Bergabung (Khusus Kamu)</b>\n"
@@ -1328,8 +1181,8 @@ async def kirim_notif(bot, text: str, reply_markup=None):
             try:
                 msg = await bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="HTML", reply_markup=reply_markup)
                 return msg.message_id
-            except Exception:
-                pass
+            except Exception as ex:
+                logger.error(f"[NOTIF] Gagal kirim ke admin utama: {ex}")
     return None
 
 async def hapus_notif_lama(bot, order_id):
@@ -1343,20 +1196,21 @@ async def hapus_notif_lama(bot, order_id):
     target = int(channel_id) if channel_id else ADMIN_ID
     try:
         await bot.delete_message(chat_id=target, message_id=int(msg_id))
-    except Exception:
+    except Exception as e:
+        logger.debug(f"[NOTIF] Gagal hapus notif lama di {target}: {e}")
         if target != ADMIN_ID:
             try:
                 await bot.delete_message(chat_id=ADMIN_ID, message_id=int(msg_id))
-            except Exception:
-                pass
+            except Exception as ex:
+                logger.debug(f"[NOTIF] Gagal hapus notif di admin utama: {ex}")
 
 async def hapus_qris_buyer_lama(bot, order_id, user_id):
     order = await get_order_by_id(order_id)
     if order and order.get('buyer_msg_id'):
         try:
             await bot.delete_message(chat_id=int(user_id), message_id=int(order['buyer_msg_id']))
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Gagal hapus pesan QRIS buyer lama: {e}")
 
 # =================== MAIN MENU ===================
 
@@ -1401,8 +1255,8 @@ async def hapus_admin_msg(context, user_id):
     for msg_id in msg_ids:
         try:
             await context.bot.delete_message(chat_id=user_id, message_id=msg_id)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Gagal hapus pesan admin: {e}")
 
 def simpan_msg_user(context, user_id, message_id):
     context.bot_data.setdefault('user_messages', {})
@@ -1417,8 +1271,8 @@ async def hapus_msg_user_lama(context, user_id, keep_last=1):
         for msg_id in to_delete:
             try:
                 await context.bot.delete_message(chat_id=user_id, message_id=msg_id)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Gagal hapus pesan user lama: {e}")
 
 async def kirim_link_ke_buyer(context, user_id, paket, order_id, amount):
     group_link = await generate_group_link(context.bot, paket, order_id)
@@ -1452,10 +1306,29 @@ async def kirim_link_ke_buyer(context, user_id, paket, order_id, amount):
     await hapus_msg_user_lama(context, user_id, keep_last=2)
     return link
 
+# =================== SECURITY: KRIPTOGRAFIS SIGNATURE VERIFIER ===================
+
+def verify_telegram_webapp_signature(init_data: str, bot_token: str) -> bool:
+    """Memverifikasi keaslian initData dari Telegram WebApp (Mini App)."""
+    try:
+        parsed_data = dict(urllib.parse.parse_qsl(init_data))
+        if 'hash' not in parsed_data:
+            return False
+        
+        received_hash = parsed_data.pop('hash')
+        data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(parsed_data.items()))
+        
+        secret_key = hmac.new(b"WebAppData", bot_token.encode(), hashlib.sha256).digest()
+        computed_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
+        
+        return hmac.compare_digest(computed_hash, received_hash)
+    except Exception as e:
+        logger.error(f"[SECURITY] Gagal memverifikasi signature Telegram WebApp: {e}")
+        return False
+
 # =================== WEBHOOK SERVER (PAKASIR) ===================
 
 async def pakasir_webhook_handler(request: aio_web.Request) -> aio_web.Response:
-    # Optional signature verification
     if PAKASIR_WEBHOOK_SECRET:
         try:
             body = await request.read()
@@ -1515,6 +1388,7 @@ async def pakasir_webhook_handler(request: aio_web.Request) -> aio_web.Response:
     _stop_payment_task(user_id)
 
     if _current_bot:
+        # Menangani pemrosesan lunas di background task asinkron yang aman
         asyncio.create_task(
             _handle_payment_success(
                 _current_bot, order_id, paket_id, user_id, user_name,
@@ -1522,7 +1396,7 @@ async def pakasir_webhook_handler(request: aio_web.Request) -> aio_web.Response:
             )
         )
 
-    logger.info(f"[WEBHOOK] ✅ Webhook sukses diverifikasi & diproses: {order_id}")
+    logger.info(f"[WEBHOOK] ✅ Webhook berhasil diverifikasi & diproses: {order_id}")
     return aio_web.Response(text='ok')
 
 _webhook_runner = None
@@ -1530,7 +1404,7 @@ _webhook_runner = None
 # =================== REST API DASHBOARD ===================
 
 DASHBOARD_API_KEY = os.environ.get('DASHBOARD_API_KEY', 'kikuk_super_secret_12345')
-DASHBOARD_URL = os.environ.get('DASHBOARD_URL', '')  # contoh: https://xxx.up.railway.app/dashboard
+DASHBOARD_URL = os.environ.get('DASHBOARD_URL', '')
 
 def _dashboard_html_path():
     base = os.path.dirname(os.path.abspath(__file__))
@@ -1544,11 +1418,13 @@ def _dashboard_html_path():
     return None
 
 def _api_auth(request: aio_web.Request) -> bool:
+    """Verifikasi token otentikasi API Dashboard secara aman."""
     auth = request.headers.get('Authorization', '')
     if auth.startswith('Bearer ') and auth[7:] == DASHBOARD_API_KEY:
         return True
     if auth.startswith('tma '):
-        return True
+        init_data_raw = auth[4:]
+        return verify_telegram_webapp_signature(init_data_raw, TOKEN)
     return False
 
 def _json_resp(data, status=200):
@@ -1587,12 +1463,11 @@ async def _api_error_middleware(request: aio_web.Request, handler):
 async def api_serve_dashboard(request: aio_web.Request) -> aio_web.Response:
     path = _dashboard_html_path()
     if not path:
-        return aio_web.Response(status=404, text='dashboard.html tidak ditemukan. Taruh file HTML di folder yang sama dengan bot.py')
+        return aio_web.Response(status=404, text='dashboard.html tidak ditemukan.')
     with open(path, 'r', encoding='utf-8') as f:
         content = f.read()
     return aio_web.Response(content_type='text/html', text=content)
 
-# --- PRODUCTS ---
 async def api_get_products(request: aio_web.Request) -> aio_web.Response:
     if not _api_auth(request): return _err('Unauthorized', 401)
     return _json_resp(await get_all_products())
@@ -1633,11 +1508,9 @@ async def api_delete_product(request: aio_web.Request) -> aio_web.Response:
     await delete_product(request.match_info['paket_id'])
     return _json_resp({'ok': True})
 
-# --- ORDERS ---
 @async_wrap
 def _get_all_orders_api():
-    conn = get_conn()
-    try:
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("""
                 SELECT o.*, p.nama as paket_nama, p.emoji as paket_emoji
@@ -1646,8 +1519,6 @@ def _get_all_orders_api():
                 ORDER BY o.id DESC LIMIT 500
             """)
             return [dict(r) for r in c.fetchall()]
-    finally:
-        release_conn(conn)
 
 async def api_get_orders(request: aio_web.Request) -> aio_web.Response:
     if not _api_auth(request): return _err('Unauthorized', 401)
@@ -1707,20 +1578,16 @@ async def api_cancel_order(request: aio_web.Request) -> aio_web.Response:
                 ),
                 parse_mode='HTML'
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Gagal kirim pembatalan via API ke buyer: {e}")
     return _json_resp({'ok': True})
 
-# --- TESTIMONIALS ---
 @async_wrap
 def _get_all_testimonials_api():
-    conn = get_conn()
-    try:
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("SELECT * FROM testimonials ORDER BY created_at DESC")
             return [dict(r) for r in c.fetchall()]
-    finally:
-        release_conn(conn)
 
 async def api_get_testimonials(request: aio_web.Request) -> aio_web.Response:
     if not _api_auth(request): return _err('Unauthorized', 401)
@@ -1760,7 +1627,6 @@ async def api_testimonial_action(request: aio_web.Request) -> aio_web.Response:
                     logger.error(f"[API TESTI] Gagal post ke channel: {e}")
     return _json_resp({'ok': True})
 
-# --- BANNED ---
 async def api_get_banned(request: aio_web.Request) -> aio_web.Response:
     if not _api_auth(request): return _err('Unauthorized', 401)
     return _json_resp(await get_all_banned())
@@ -1782,7 +1648,6 @@ async def api_delete_ban(request: aio_web.Request) -> aio_web.Response:
     await unban_user(int(request.match_info['user_id']))
     return _json_resp({'ok': True})
 
-# --- ADMINS ---
 async def api_get_admins(request: aio_web.Request) -> aio_web.Response:
     if not _api_auth(request): return _err('Unauthorized', 401)
     return _json_resp(await get_all_admins())
@@ -1804,7 +1669,6 @@ async def api_delete_admin(request: aio_web.Request) -> aio_web.Response:
     await remove_admin(int(request.match_info['user_id']))
     return _json_resp({'ok': True})
 
-# --- STATS ---
 async def api_get_stats(request: aio_web.Request) -> aio_web.Response:
     if not _api_auth(request): return _err('Unauthorized', 401)
     today = now_wib().replace(hour=0, minute=0, second=0, microsecond=0)
@@ -1822,12 +1686,10 @@ async def api_get_stats(request: aio_web.Request) -> aio_web.Response:
         stats['trend_7d'] = formatted
     return _json_resp(stats)
 
-# --- GROUPS ---
 async def api_get_groups(request: aio_web.Request) -> aio_web.Response:
     if not _api_auth(request): return _err('Unauthorized', 401)
     return _json_resp(await get_managed_groups())
 
-# --- KICK CHECK ---
 async def api_kick_check(request: aio_web.Request) -> aio_web.Response:
     if not _api_auth(request): return _err('Unauthorized', 401)
     user_id = int(request.match_info['user_id'])
@@ -1841,12 +1703,11 @@ async def api_kick_check(request: aio_web.Request) -> aio_web.Response:
             try:
                 member = await _current_bot.get_chat_member(chat_id=int(chat_id), user_id=user_id)
                 is_member = member.status not in ('left', 'kicked', 'banned')
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Gagal verifikasi keanggotaan grup {chat_id}: {e}")
         results.append({'chat_id': chat_id, 'title': title, 'is_member': is_member})
     return _json_resp({'groups': results})
 
-# --- KICK EXECUTE ---
 async def api_kick_execute(request: aio_web.Request) -> aio_web.Response:
     if not _api_auth(request): return _err('Unauthorized', 401)
     try:
@@ -1866,7 +1727,6 @@ async def api_kick_execute(request: aio_web.Request) -> aio_web.Response:
     except Exception as e:
         return _err(f'Gagal kick: {str(e)}')
 
-# --- BROADCAST ---
 async def api_broadcast(request: aio_web.Request) -> aio_web.Response:
     if not _api_auth(request): return _err('Unauthorized', 401)
     try:
@@ -1886,11 +1746,11 @@ async def api_broadcast(request: aio_web.Request) -> aio_web.Response:
             await _current_bot.send_message(chat_id=b['user_id'], text=text, parse_mode='HTML')
             sent += 1
             await asyncio.sleep(0.05)
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Broadcast gagal terkirim ke buyer {b['user_id']}: {e}")
             failed += 1
     return _json_resp({'ok': True, 'sent': sent, 'failed': failed, 'total': len(buyers)})
 
-# --- SETTINGS ---
 async def api_post_settings(request: aio_web.Request) -> aio_web.Response:
     if not _api_auth(request): return _err('Unauthorized', 401)
     try:
@@ -1904,11 +1764,9 @@ async def api_post_settings(request: aio_web.Request) -> aio_web.Response:
             await set_setting(key, value if value else None)
     return _json_resp({'ok': True})
 
-# --- BACKUP / EXPORT ---
 @async_wrap
 def _get_backup_data():
-    conn = get_conn()
-    try:
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("SELECT * FROM products ORDER BY harga ASC")
             products = [dict(r) for r in c.fetchall()]
@@ -1922,14 +1780,13 @@ def _get_backup_data():
             settings = [dict(r) for r in c.fetchall()]
         return {'products': products, 'orders': orders, 'testimonials': testimonials,
                 'banned': banned, 'settings': settings}
-    finally:
-        release_conn(conn)
 
 async def api_backup(request: aio_web.Request) -> aio_web.Response:
     if not _api_auth(request): return _err('Unauthorized', 401)
     data = await _get_backup_data()
     filename = f"backup_{now_wib().strftime('%Y%m%d_%H%M')}.json"
     return aio_web.Response(
+        status=200,
         content_type='application/json',
         headers={
             'Access-Control-Allow-Origin': '*',
@@ -1938,55 +1795,49 @@ async def api_backup(request: aio_web.Request) -> aio_web.Response:
         text=json.dumps(data, default=str)
     )
 
-# =================== END REST API DASHBOARD ===================
+# =================== WEB SERVER MANAGEMENT ===================
 
 async def _start_webhook_server():
     global _webhook_runner
     webhook_app = aio_web.Application(middlewares=[_api_error_middleware])
 
-    # Webhook Pakasir
+    # Endpoints Webhook & Status
     webhook_app.router.add_post('/webhook/pakasir', pakasir_webhook_handler)
     webhook_app.router.add_get('/health', lambda r: aio_web.Response(text='ok'))
     webhook_app.router.add_get('/', lambda r: aio_web.Response(text='Hyper Family Store Bot - OK'))
 
-    # Dashboard HTML
+    # Dashboard Panel
     webhook_app.router.add_get('/dashboard', api_serve_dashboard)
 
-    # CORS preflight
+    # CORS Preflight
     webhook_app.router.add_options('/{path_info:.*}', _cors_handler)
 
-    # REST API — Products
+    # REST APIs
     webhook_app.router.add_get('/api/products', api_get_products)
     webhook_app.router.add_post('/api/products', api_post_product)
     webhook_app.router.add_put('/api/products/{paket_id}', api_put_product)
     webhook_app.router.add_delete('/api/products/{paket_id}', api_delete_product)
 
-    # REST API — Orders
     webhook_app.router.add_get('/api/orders', api_get_orders)
     webhook_app.router.add_post('/api/orders/{order_id}/confirm', api_confirm_order)
     webhook_app.router.add_post('/api/orders/{order_id}/cancel', api_cancel_order)
 
-    # REST API — Testimonials
     webhook_app.router.add_get('/api/testimonials', api_get_testimonials)
     webhook_app.router.add_post('/api/testimonials/{order_id}/action', api_testimonial_action)
 
-    # REST API — Banned
     webhook_app.router.add_get('/api/banned', api_get_banned)
     webhook_app.router.add_post('/api/banned', api_post_ban)
     webhook_app.router.add_delete('/api/banned/{user_id}', api_delete_ban)
 
-    # REST API — Admins
     webhook_app.router.add_get('/api/admins', api_get_admins)
     webhook_app.router.add_post('/api/admins', api_post_admin)
     webhook_app.router.add_delete('/api/admins/{user_id}', api_delete_admin)
 
-    # REST API — Stats, Groups, Kick
     webhook_app.router.add_get('/api/stats', api_get_stats)
     webhook_app.router.add_get('/api/groups', api_get_groups)
     webhook_app.router.add_get('/api/kick/check/{user_id}', api_kick_check)
     webhook_app.router.add_post('/api/kick/execute', api_kick_execute)
 
-    # REST API — Broadcast, Settings, Backup
     webhook_app.router.add_post('/api/broadcast', api_broadcast)
     webhook_app.router.add_post('/api/settings', api_post_settings)
     webhook_app.router.add_get('/api/backup', api_backup)
@@ -1997,14 +1848,13 @@ async def _start_webhook_server():
     port = int(os.environ.get('PORT', 8080))
     site = aio_web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
-    logger.info(f"[WEBHOOK] Server berjalan di port {port}")
+    logger.info(f"[WEBHOOK] Server API berhasil berjalan di port {port}")
 
 # =================== POST INIT ===================
 
 async def post_init(application: Application):
     global _current_bot, _http_session
     _current_bot = application.bot
-
     _http_session = aiohttp.ClientSession()
 
     await application.bot.set_my_commands(
@@ -2024,7 +1874,7 @@ async def post_init(application: Application):
 
     waiting_orders = await get_all_waiting()
     if waiting_orders:
-        logger.info(f"[POST_INIT] Ditemukan {len(waiting_orders)} order aktif, membuat ulang payment tasks...")
+        logger.info(f"[POST_INIT] Menemukan {len(waiting_orders)} order aktif, memulihkan background task pembayaran...")
         for order in waiting_orders:
             paket = await get_product(order['paket_id'])
             if not paket:
@@ -2034,7 +1884,8 @@ async def post_init(application: Application):
                 try:
                     elapsed = int((now_wib() - order['created_at']).total_seconds())
                     recovery_timeout = max(300, 1800 - elapsed)
-                except Exception:
+                except Exception as e:
+                    logger.debug(f"Gagal menghitung selisih durasi order untuk recovery: {e}")
                     recovery_timeout = 300
             else:
                 recovery_timeout = 300
@@ -2047,29 +1898,29 @@ async def post_init(application: Application):
                 amount=recovery_amount,
                 timeout_seconds=recovery_timeout
             )
-            logger.info(f"[POST_INIT] Task dimulai ulang untuk order {order['order_id']}")
+            logger.info(f"[POST_INIT] Task monitoring diaktifkan kembali untuk Order ID: {order['order_id']}")
 
     asyncio.create_task(_auto_backup_loop())
     asyncio.create_task(_buyer_reminder_loop(_current_bot))
     asyncio.create_task(_cleanup_cooldowns_loop())
     asyncio.create_task(_start_webhook_server())
-    logger.info("[POST_INIT] Semua task background dijadwalkan.")
+    logger.info("[POST_INIT] Seluruh background task berkala berhasil dijadwalkan.")
 
 # =================== GRACEFUL SHUTDOWN ===================
 
 async def post_shutdown(application: Application):
     global _http_session, _pool, _webhook_runner
-    logger.info("[SHUTDOWN] Memulai proses graceful shutdown...")
+    logger.info("[SHUTDOWN] Memulai siklus anggun mematikan sistem (Graceful Shutdown)...")
     if _http_session and not _http_session.closed:
         await _http_session.close()
-        logger.info("[SHUTDOWN] Sesi HTTP aiohttp berhasil ditutup.")
+        logger.info("[SHUTDOWN] Sesi client HTTP asinkron ditutup.")
     if _webhook_runner:
         await _webhook_runner.cleanup()
-        logger.info("[SHUTDOWN] Webhook server runner berhasil dibersihkan.")
+        logger.info("[SHUTDOWN] Web Server API berhasil dibersihkan.")
     if _pool:
         _pool.closeall()
-        logger.info("[SHUTDOWN] Database connection pool berhasil ditutup.")
-    logger.info("[SHUTDOWN] Graceful shutdown selesai.")
+        logger.info("[SHUTDOWN] Seluruh koneksi ke DB PostgreSQL ditutup dengan aman.")
+    logger.info("[SHUTDOWN] Shutdown selesai.")
 
 # =================== USER HANDLERS ===================
 
@@ -2097,7 +1948,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # === COOLDOWN CHECK DI ENTRY POINT /start ===
     sisa = await get_cooldown_sisa_db(user_id)
     if sisa > 0:
         await update.message.reply_text(
@@ -2128,6 +1978,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await hapus_notif_lama(context.bot, active['order_id'])
                 msg_id = await kirim_notif(
                     context.bot,
+                    f"... [DIAPRESIASI BUYER] ...\n"
                     f"✅ <b>ORDER BERHASIL</b>\n"
                     f"========================\n\n"
                     f"👤 Pembeli: {esc(active.get('user_name', 'User'))} (<code>{user_id}</code>)\n"
@@ -2196,7 +2047,6 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton(f"{p['emoji']} {p['nama']} - {format_harga(p['harga'])}", callback_data=f"pilih_{p['paket_id']}")]
         for p in aktif
     ]
-    # === PISAHKAN CALLBACK: back_to_menu untuk navigasi, bukan back_start ===
     keyboard.append([InlineKeyboardButton("⬅️ Kembali", callback_data="back_to_menu")])
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
@@ -2248,7 +2098,6 @@ async def pilih_paket(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _buat_order_baru(update, context, query, user_id, user_name, paket, order_changes=0)
 
 async def prereq_buy_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler ketika buyer klik 🛒 Beli [produk] dari pesan syarat prereq."""
     query = update.callback_query
     user_id = query.from_user.id
     user_name = query.from_user.full_name
@@ -2257,7 +2106,6 @@ async def prereq_buy_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.answer("🚫 Akun kamu diblokir. Hubungi admin.", show_alert=True)
         return
 
-    # Format: prereq_buy_{pid}|{parent_order_id}
     parts = query.data.split("|")
     prereq_pid = parts[0].replace("prereq_buy_", "")
     parent_order_id = parts[1] if len(parts) > 1 else None
@@ -2280,7 +2128,6 @@ async def prereq_buy_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return
 
-    # Simpan konteks prereq agar back_start bisa tampilkan ulang pesan syarat
     if parent_order_id:
         parent_order = await get_order_by_id(parent_order_id)
         if parent_order:
@@ -2293,7 +2140,6 @@ async def prereq_buy_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await _buat_order_baru(update, context, query, user_id, user_name, paket, order_changes=0)
 
 async def _buat_order_baru(update, context, query, user_id, user_name, paket, order_changes=0):
-    """Helper: buat QRIS + simpan order + kirim ke buyer & admin."""
     loading_msg = await context.bot.send_message(
         chat_id=update.effective_chat.id,
         text="⏳ Membuat invoice...",
@@ -2301,9 +2147,6 @@ async def _buat_order_baru(update, context, query, user_id, user_name, paket, or
 
     rand_suffix = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
     order_id = f"HFB-{user_id}-{now_wib().strftime('%Y%m%d%H%M%S')}-{rand_suffix}"
-
-    # =================== LANJUTAN DARI _buat_order_baru ===================
-# [DESKRIPSI: Lanjutan fungsi _buat_order_baru - tidak ada perubahan di sini]
 
     trans_data = await create_transaction_qris(
         order_id=order_id,
@@ -2313,8 +2156,8 @@ async def _buat_order_baru(update, context, query, user_id, user_name, paket, or
 
     try:
         await loading_msg.delete()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"Gagal menghapus pesan loading: {e}")
 
     if not trans_data:
         msg = await context.bot.send_message(
@@ -2349,7 +2192,6 @@ async def _buat_order_baru(update, context, query, user_id, user_name, paket, or
 
     sisa_ganti = 1 - order_changes
 
-    # Tambah catatan konteks prereq jika buyer datang dari flow syarat
     prereq_ctx = context.user_data.get('prereq_ctx') if context else None
     prereq_note = ""
     if prereq_ctx:
@@ -2391,8 +2233,8 @@ async def _buat_order_baru(update, context, query, user_id, user_name, paket, or
     if query:
         try:
             await query.message.delete()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Gagal menghapus pesan sebelumnya: {e}")
 
     msg = await context.bot.send_photo(
         chat_id=update.effective_chat.id,
@@ -2425,15 +2267,9 @@ async def _buat_order_baru(update, context, query, user_id, user_name, paket, or
         total_payment, timeout_seconds=timeout_secs
     )
 
-# =================== CANCEL ORDER (PISAH DARI back_start) ===================
-# [DESKRIPSI: Handler baru khusus untuk tombol "Batalkan Pesanan"
-#  - Sebelumnya pakai callback_data="back_start" yang dobel fungsi
-#  - Sekarang callback_data="cancel_order" khusus untuk batal, selalu set cooldown
-#  - back_start dihapus dari tombol batal, diganti cancel_order]
+# =================== CANCEL ORDER ===================
 
 async def cancel_order_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler khusus untuk tombol '❌ Batalkan Pesanan'. 
-    Selalu set cooldown ke DB + memory cache."""
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
@@ -2462,19 +2298,16 @@ async def cancel_order_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         if msg_id:
             await set_admin_msg_id(cancelled_order_id, msg_id)
 
-    # === SET COOLDOWN: Selalu aktif saat batal, pakai UTC + memory cache ===
     await set_cooldown_db(user_id)
 
-    # Ambil prereq_ctx SEBELUM clear agar tidak hilang
     prereq_ctx = context.user_data.pop('prereq_ctx', None)
     context.user_data.clear()
 
     try:
         await query.message.delete()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"Gagal menghapus pesan order yang dibatalkan: {e}")
 
-    # Jika buyer batal dari flow prereq, tampilkan ulang pesan syarat
     if prereq_ctx:
         parent_order_id = prereq_ctx.get('parent_order_id')
         parent_paket_id = prereq_ctx.get('parent_paket_id')
@@ -2531,22 +2364,17 @@ async def cancel_order_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     simpan_msg_user(context, user_id, msg.message_id)
     await hapus_msg_user_lama(context, user_id, keep_last=1)
 
-# =================== BACK TO MENU (NAVIGASI BIASA, TIDAK SET COOLDOWN) ===================
-# [DESKRIPSI: Handler baru khusus untuk tombol "⬅️ Kembali" di menu daftar paket
-#  - callback_data="back_to_menu" untuk navigasi biasa
-#  - TIDAK set cooldown, cuma balik ke menu utama
-#  - Pisah dari cancel_order yang set cooldown]
+# =================== BACK TO MENU ===================
 
 async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler untuk tombol kembali ke menu utama (navigasi biasa, tanpa set cooldown)."""
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
 
     try:
         await query.message.delete()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"Gagal menghapus pesan kembali ke menu: {e}")
 
     msg = await context.bot.send_message(
         chat_id=update.effective_chat.id,
@@ -2558,7 +2386,6 @@ async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await hapus_msg_user_lama(context, user_id, keep_last=1)
 
 # =================== GANTI PAKET ===================
-# [DESKRIPSI: Tidak ada perubahan signifikan di sini]
 
 async def ganti_paket_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -2683,13 +2510,10 @@ async def ganti_paket_exec(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         await query.message.delete()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"Gagal menghapus pesan QRIS lama saat ganti paket: {e}")
 
-    # === SET COOLDOWN JUGA SAAT GANTI PAKET (karena ini membatalkan order lama) ===
-    # [DESKRIPSI: Tambahan - ganti paket juga set cooldown karena membatalkan order lama]
     await set_cooldown_db(user_id)
-
     await _buat_order_baru(update, context, None, user_id, user_name,
                            new_paket, order_changes=changes_used + 1)
 
@@ -2727,11 +2551,10 @@ async def ganti_paket_batal(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         await query.message.edit_caption(caption_back, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"Gagal update tampilan pembatalan ganti paket: {e}")
 
-# =================== ASYNCIO PAYMENT TASKS ===================
-# [DESKRIPSI: Timeout QRIS juga set cooldown karena order expired = batal]
+# =================== ASYNCIO MONITORING PAYMENT TASKS ===================
 
 _payment_tasks: dict = {}
 _current_bot = None
@@ -2750,14 +2573,11 @@ def _start_payment_task(bot, order_id: str, paket_id: str, user_id: int,
     _payment_tasks[user_id] = task
 
 def _check_order_status_sync(order_id):
-    conn = get_conn()
-    try:
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("SELECT status FROM orders WHERE order_id=%s", (order_id,))
             row = c.fetchone()
             return dict(row) if row else None
-    finally:
-        release_conn(conn)
 
 async def _check_order_status(order_id):
     return await asyncio.to_thread(_check_order_status_sync, order_id)
@@ -2782,7 +2602,6 @@ async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
                 await _handle_payment_success(bot, order_id, paket_id, user_id, user_name, amount, trans)
                 return
 
-        # TIMEOUT - cek sekali lagi sebelum expired
         row = await _check_order_status(order_id)
         if not row or row['status'] != 'waiting':
             return
@@ -2796,10 +2615,6 @@ async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
             await cancel_transaction(order_id, amount)
         await update_order_status(order_id, 'expired')
         await hapus_qris_buyer_lama(bot, order_id, user_id)
-
-        # === SET COOLDOWN SAAT TIMEOUT/EXPIRED ===
-        # [DESKRIPSI: Buyer yang tidak bayar sampai waktu habis juga kena cooldown
-        #  supaya tidak bisa langsung spam order baru]
         await set_cooldown_db(user_id)
 
         try:
@@ -2815,8 +2630,8 @@ async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
                 ),
                 parse_mode="HTML"
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Gagal kirim notif expired ke buyer: {e}")
 
         await hapus_notif_lama(bot, order_id)
 
@@ -2839,10 +2654,10 @@ async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
 
 async def _handle_payment_success(bot, order_id: str, paket_id: str, user_id: int,
                                    user_name: str, amount: int, trans: dict):
-    # Atomic: hanya proses jika masih 'waiting' → mencegah double processing
+    # Proteksi atomik ganda guna mengunci state transaksi selesai
     success = await mark_order_completed(order_id)
     if not success:
-        logger.info(f"[PAYMENT] Order {order_id} sudah diproses sebelumnya, skip.")
+        logger.info(f"[PAYMENT] Order ID {order_id} sudah diproses sebelumnya, membatalkan duplikasi.")
         return
 
     await hapus_qris_buyer_lama(bot, order_id, user_id)
@@ -2850,12 +2665,10 @@ async def _handle_payment_success(bot, order_id: str, paket_id: str, user_id: in
     paket = await get_product(paket_id) or {"emoji": "📦", "nama": "Produk", "harga": amount, "link": DEFAULT_LINK}
     paid_amount = trans.get('amount', amount)
 
-    # ── CEK PREREQUISITE ──────────────────────────────────────────────────────
     requires_str = paket.get("requires_paket_ids") or ""
     missing_prereqs = await check_prerequisites_sync(user_id, requires_str)
 
     if missing_prereqs:
-        # Bangun status per item (✅/❌) untuk semua syarat
         all_req_ids = [p.strip() for p in requires_str.split(",") if p.strip()]
         missing_set = set(missing_prereqs)
         fulfilled_count = len(all_req_ids) - len(missing_set)
@@ -2877,7 +2690,6 @@ async def _handle_payment_success(bot, order_id: str, paket_id: str, user_id: in
 
         prereq_status = "\n".join(prereq_lines)
 
-        # Beritahu buyer — pembayaran diterima tapi link ditahan
         try:
             await bot.send_message(
                 chat_id=user_id,
@@ -2921,7 +2733,6 @@ async def _handle_payment_success(bot, order_id: str, paket_id: str, user_id: in
         if msg_id:
             await set_admin_msg_id(order_id, msg_id)
         return
-    # ── END CEK PREREQUISITE ──────────────────────────────────────────────────
 
     group_link = await generate_group_link(bot, paket, order_id)
     link = group_link or (paket.get("link") or DEFAULT_LINK)
@@ -2979,16 +2790,14 @@ async def _handle_payment_success(bot, order_id: str, paket_id: str, user_id: in
                 ),
                 parse_mode="HTML"
             )
-        except Exception:
-            pass
+        except Exception as ex:
+            logger.error(f"Gagal kirim emergency alert ke admin: {ex}")
 
-    # Cek apakah payment ini memenuhi prereq untuk order lain yang pending
     await _auto_deliver_pending_prereq_orders(bot, user_id, user_name)
 
 # =================== AUTO-DELIVER PENDING PREREQ ORDERS ===================
 
 async def _auto_deliver_pending_prereq_orders(bot, user_id: int, user_name: str):
-    """Setelah payment sukses, cek apakah order lain yang prereq-nya sekarang terpenuhi."""
     pending = await get_completed_no_link_orders(user_id)
     if not pending:
         return
@@ -3003,12 +2812,11 @@ async def _auto_deliver_pending_prereq_orders(bot, user_id: int, user_name: str)
             continue
         missing = await check_prerequisites_sync(user_id, req_str)
         if missing:
-            continue  # masih ada yang belum terpenuhi
+            continue
 
-        # Semua prereq sudah terpenuhi! Klaim dulu secara atomik sebelum kirim.
         claimed = await atomic_claim_for_delivery(oid)
         if not claimed:
-            continue  # proses lain sudah mengklaim, skip
+            continue
 
         group_link = await generate_group_link(bot, paket, oid)
         link = group_link or (paket.get("link") or DEFAULT_LINK)
@@ -3052,7 +2860,6 @@ async def _auto_deliver_pending_prereq_orders(bot, user_id: int, user_name: str)
 # =================== ADMIN: KIRIM LINK PREREQ MANUAL ===================
 
 async def admin_kirim_link_prereq(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin konfirmasi kirim link VIP setelah buyer memenuhi syarat prerequisite."""
     query = update.callback_query
     await query.answer()
 
@@ -3110,8 +2917,7 @@ async def admin_kirim_link_prereq(update: Update, context: ContextTypes.DEFAULT_
 # =================== AUTO-APPROVE & REVOKE JOIN REQUEST ===================
 
 def _check_join_request_sync(user_id, chat_id):
-    conn = get_conn()
-    try:
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("""
                 SELECT o.id FROM orders o
@@ -3121,8 +2927,6 @@ def _check_join_request_sync(user_id, chat_id):
                 ORDER BY o.id DESC LIMIT 1
             """, (user_id, chat_id))
             return c.fetchone()
-    finally:
-        release_conn(conn)
 
 async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     join_req = update.chat_join_request
@@ -3145,7 +2949,7 @@ async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE
                         invite_link=join_req.invite_link.invite_link
                     )
                 except Exception as rev_err:
-                    logger.error(f"[JOIN] Gagal revoke link: {rev_err}")
+                    logger.debug(f"[JOIN] Gagal revoke link: {rev_err}")
         except Exception as e:
             logger.error(f"[JOIN] Gagal approve {user_id} ke {chat_id}: {e}")
     else:
@@ -3264,7 +3068,6 @@ async def handle_rate_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text("🙏 Terima kasih! Anda selalu dapat memberikan ulasan nanti di riwayat order.")
 
 async def handle_rate_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Kembali ke pesan sukses dengan link produk dari mana saja di flow review."""
     query = update.callback_query
     await query.answer()
 
@@ -3289,7 +3092,7 @@ async def handle_rate_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📋 <b>Cara gabung:</b>\n"
             f"1. Klik link di atas\n"
             f"2. Pencet <b>\"Minta Bergabung\"</b>\n"
-            f"3. Bot langsung <b>approve otomatis</b> ✅\n\n"
+            f"3. Bot langsung approve otomatis ✅\n\n"
             f"⚠️ <i>Link ini sekali pakai, jangan dishare!</i>"
         )
     else:
@@ -3315,7 +3118,6 @@ async def handle_rate_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def handle_rate_back_stars(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Kembali ke layar pilih bintang dari layar input teks ulasan."""
     query = update.callback_query
     await query.answer()
 
@@ -3534,17 +3336,14 @@ async def produk_toggle_aktif(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     status_str = "diaktifkan" if new_aktif else "dinonaktifkan"
     await query.answer(f"✅ Produk berhasil {status_str}.", show_alert=True)
-    # Refresh detail
     p['aktif'] = new_aktif
     await produk_detail(update, context)
 
 async def _show_prereq_selector(query, context, paket_id: str, p: dict):
-    """Tampilkan selector prerequisite paket dengan tombol toggle."""
     all_products = await get_all_products()
     current_str = p.get('requires_paket_ids') or ""
     current_ids = [x.strip() for x in current_str.split(",") if x.strip()]
 
-    # Simpan state sementara di user_data
     if 'editing_prereq' not in context.user_data or context.user_data['editing_prereq'].get('paket_id') != paket_id:
         context.user_data['editing_prereq'] = {'paket_id': paket_id, 'selected': list(current_ids)}
 
@@ -3553,7 +3352,7 @@ async def _show_prereq_selector(query, context, paket_id: str, p: dict):
     buttons = []
     for prod in all_products:
         if prod['paket_id'] == paket_id:
-            continue  # skip diri sendiri
+            continue
         is_selected = prod['paket_id'] in selected
         mark = "✅ " if is_selected else "⬜ "
         label = f"{mark}{prod.get('emoji', '')} {prod['nama']}"
@@ -3654,7 +3453,6 @@ async def produk_edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Produk tidak ditemukan.", show_alert=True)
         return
 
-    # requires_paket_ids: gunakan UI selector tombol, bukan text input
     if field == 'requires_paket_ids':
         await _show_prereq_selector(query, context, paket_id, p)
         return
@@ -3795,13 +3593,10 @@ async def cmd_aktif(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
 def _check_waiting_order_sync(order_id):
-    conn = get_conn()
-    try:
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("SELECT * FROM orders WHERE order_id=%s AND status='waiting'", (order_id,))
             return c.fetchone()
-    finally:
-        release_conn(conn)
 
 async def admin_cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -3836,8 +3631,6 @@ async def admin_cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await hapus_qris_buyer_lama(context.bot, order_id, target_user_id)
     await hapus_notif_lama(context.bot, order_id)
 
-    # === SET COOLDOWN JUGA SAAT ADMIN CANCEL ===
-    # [DESKRIPSI: Admin cancel juga set cooldown ke buyer, konsisten dengan batal buyer]
     await set_cooldown_db(target_user_id)
 
     msg_id = await kirim_notif(
@@ -3863,8 +3656,8 @@ async def admin_cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
             ),
             parse_mode="HTML"
         )
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"Gagal kirim notif pembatalan admin ke buyer: {e}")
 
     await query.edit_message_text(
         f"✅ <b>Order Dibatalkan</b>\n\n"
@@ -4032,7 +3825,6 @@ def _build_stats_text(s: dict, now: datetime) -> str:
     else:
         prod_lines = "- <i>Belum ada transaksi produk.</i>\n"
 
-    # Produk terlaris bulan ini
     prod_month_lines = ""
     if s.get('products_month'):
         for pm in s['products_month']:
@@ -4042,7 +3834,6 @@ def _build_stats_text(s: dict, now: datetime) -> str:
     else:
         prod_month_lines = "  <i>Belum ada penjualan bulan ini.</i>\n"
 
-    # Top 3 buyer bulan ini
     top_buyer_lines = ""
     for i, b in enumerate(s.get('top_buyers_month', []), 1):
         name = esc(b.get('user_name') or str(b['user_id']))
@@ -4050,14 +3841,12 @@ def _build_stats_text(s: dict, now: datetime) -> str:
     if not top_buyer_lines:
         top_buyer_lines = "  <i>Belum ada data.</i>\n"
 
-    # Estimasi omzet akhir bulan
     days_elapsed = s.get('days_elapsed', 1)
     est_str = ""
     if days_elapsed > 0 and s['month_revenue'] > 0:
         estimated = round(s['month_revenue'] / days_elapsed * 30)
         est_str = f"- Estimasi Akhir Bulan  :  <b>~{_format_short(estimated)}</b>  <i>(pace {days_elapsed}hr)</i>"
 
-    # Repeat buyers %
     repeat_pct = round(s['repeat_buyers'] / s['total_buyers'] * 100) if s['total_buyers'] > 0 else 0
 
     pend = s.get('pending_testi', 0)
@@ -4176,9 +3965,7 @@ async def cmd_riwayat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =================== BACKUP & EXPORT ===================
 
 def _generate_full_export_sync():
-    """Eksport semua tabel penting ke dict. Satu fungsi untuk backup & export."""
-    conn = get_conn()
-    try:
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("SELECT * FROM products ORDER BY harga ASC")
             products = [dict(r) for r in c.fetchall()]
@@ -4192,8 +3979,6 @@ def _generate_full_export_sync():
             settings = [dict(r) for r in c.fetchall()]
             c.execute("SELECT * FROM admins ORDER BY added_at ASC")
             admins = [dict(r) for r in c.fetchall()]
-    finally:
-        release_conn(conn)
     return products, orders, banned, testimonials, settings, admins
 
 async def _generate_json_export():
@@ -4281,8 +4066,8 @@ async def _kirim_backup(bot):
         logger.error(f"Error backup: {e}", exc_info=True)
         try:
             await bot.send_message(chat_id=ADMIN_ID, text=f"❌ Gagal backup database: {esc(str(e))}", parse_mode="HTML")
-        except Exception:
-            pass
+        except Exception as ex:
+            logger.error(f"Gagal kirim pesan kegagalan backup ke admin: {ex}")
 
 async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update.message.from_user.id, context):
@@ -4340,10 +4125,8 @@ def _import_json_data_sync(data: dict):
     ok_p = ok_o = ok_b = ok_t = ok_s = ok_a = 0
     fail_p = fail_o = fail_b = fail_t = fail_s = fail_a = 0
 
-    conn = get_conn()
-    try:
+    with db_session_safe() as conn:
         with conn.cursor() as c:
-            # Products
             if products:
                 try:
                     c.executemany(
@@ -4370,7 +4153,6 @@ def _import_json_data_sync(data: dict):
                     logger.error(f"[IMPORT] products batch gagal: {e}")
                     fail_p = len(products)
 
-            # Orders
             for o in orders:
                 try:
                     c.execute(
@@ -4396,7 +4178,6 @@ def _import_json_data_sync(data: dict):
                     logger.error(f"[IMPORT] order gagal: {e}")
                     fail_o += 1
 
-            # Banned
             if banned:
                 try:
                     c.executemany(
@@ -4414,7 +4195,6 @@ def _import_json_data_sync(data: dict):
                     logger.error(f"[IMPORT] banned batch gagal: {e}")
                     fail_b = len(banned)
 
-            # Testimonials
             for t in testimonials:
                 try:
                     c.execute(
@@ -4436,7 +4216,6 @@ def _import_json_data_sync(data: dict):
                     logger.error(f"[IMPORT] testimonial gagal: {e}")
                     fail_t += 1
 
-            # Settings (hanya yang bukan managed_groups, dengan konfirmasi overwrite)
             for s in settings:
                 if s.get('key') in ('managed_groups',):
                     continue
@@ -4450,7 +4229,6 @@ def _import_json_data_sync(data: dict):
                     logger.error(f"[IMPORT] setting gagal: {e}")
                     fail_s += 1
 
-            # Admins
             for a in admins:
                 try:
                     c.execute(
@@ -4469,9 +4247,6 @@ def _import_json_data_sync(data: dict):
                     logger.error(f"[IMPORT] admin gagal: {e}")
                     fail_a += 1
 
-            conn.commit()
-    finally:
-        release_conn(conn)
     return ok_p, fail_p, ok_o, fail_o, ok_b, fail_b, ok_t, fail_t, ok_s, fail_s, ok_a, fail_a
 
 async def handle_json_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4519,16 +4294,13 @@ async def handle_json_document(update: Update, context: ContextTypes.DEFAULT_TYP
 # =================== KIRIM ULANG LINK ===================
 
 def _get_completed_order_sync(order_id, user_id):
-    conn = get_conn()
-    try:
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute(
                 "SELECT * FROM orders WHERE order_id=%s AND user_id=%s AND status='completed'",
                 (order_id, user_id)
             )
             return c.fetchone()
-    finally:
-        release_conn(conn)
 
 async def resend_group_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -4574,22 +4346,19 @@ async def resend_group_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML"
         )
 
-# =================== BUYER REMINDER ===================
+# =================== BACKGROUND LOOPS ===================
 REMINDER_HARI = 3
 
 def _get_buyers_for_reminder_sync(hari: int):
     target_day_start = (now_wib() - timedelta(days=hari)).replace(hour=0, minute=0, second=0, microsecond=0)
     target_day_end = target_day_start + timedelta(days=1)
-    conn = get_conn()
-    try:
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute(
                 "SELECT DISTINCT user_id, user_name FROM orders WHERE status='completed' AND created_at >= %s AND created_at < %s",
                 (target_day_start, target_day_end)
             )
             return [dict(r) for r in c.fetchall()]
-    finally:
-        release_conn(conn)
 
 async def _send_buyer_reminders(bot):
     buyers = await asyncio.to_thread(_get_buyers_for_reminder_sync, REMINDER_HARI)
@@ -4626,7 +4395,7 @@ async def _buyer_reminder_loop(bot):
         except asyncio.CancelledError:
             break
         except Exception as e:
-            logger.error(f"[REMINDER] Error loop: {e}")
+            logger.error(f"[REMINDER] Error di reminder loop: {e}")
             await asyncio.sleep(3600)
 
 async def _auto_backup_loop():
@@ -4636,12 +4405,12 @@ async def _auto_backup_loop():
             next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
             wait_secs = (next_midnight - now).total_seconds()
             await asyncio.sleep(wait_secs)
-            logger.info("[AUTO_BACKUP] Menjalankan backup harian...")
+            logger.info("[AUTO_BACKUP] Menjalankan backup harian otomatis...")
             await _kirim_backup(_current_bot)
         except asyncio.CancelledError:
             break
         except Exception as e:
-            logger.error(f"[AUTO_BACKUP] Error: {e}")
+            logger.error(f"[AUTO_BACKUP] Error di backup loop: {e}")
             try:
                 if _current_bot:
                     await _current_bot.send_message(
@@ -4655,12 +4424,11 @@ async def _auto_backup_loop():
                         ),
                         parse_mode="HTML"
                     )
-            except Exception:
-                pass
+            except Exception as ex:
+                logger.error(f"Gagal mengirim status error backup otomatis ke admin: {ex}")
             await asyncio.sleep(3600)
 
 async def _cleanup_cooldowns_loop():
-    """Bersihkan cooldown yang sudah expired setiap 1 jam."""
     while True:
         try:
             await asyncio.sleep(3600)
@@ -4669,7 +4437,7 @@ async def _cleanup_cooldowns_loop():
         except asyncio.CancelledError:
             break
         except Exception as e:
-            logger.error(f"[CLEANUP] Error: {e}")
+            logger.error(f"[CLEANUP] Error di cleanup cooldown loop: {e}")
 
 # =================== ADMIN: BROADCAST ===================
 
@@ -4690,7 +4458,6 @@ async def _run_broadcast(bot, admin_id: int, buyers: list, text_blast: str):
 
     try:
         for index, b in enumerate(buyers):
-            # Cek apakah task di-cancel
             if asyncio.current_task().cancelled():
                 break
 
@@ -4703,11 +4470,10 @@ async def _run_broadcast(bot, admin_id: int, buyers: list, text_blast: str):
                 )
                 sent += 1
             except telegram.error.Forbidden:
-                # User blokir bot: lewati saja, JANGAN ban
                 skipped += 1
                 logger.info(f"[BLAST] User {target_id} memblokir bot, dilewati.")
             except telegram.error.RetryAfter as e:
-                logger.warning(f"[BLAST] Terkena rate limit, tidur {e.retry_after} detik.")
+                logger.warning(f"[BLAST] Terkena rate limit Telegram, tidur {e.retry_after} detik.")
                 await asyncio.sleep(e.retry_after)
                 try:
                     await bot.send_message(chat_id=target_id, text=text_blast, parse_mode="HTML")
@@ -4739,8 +4505,8 @@ async def _run_broadcast(bot, admin_id: int, buyers: list, text_blast: str):
                         parse_mode="HTML",
                         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⛔ Hentikan Sekarang", callback_data="blast_stop")]])
                     )
-                except Exception:
-                    pass
+                except Exception as ex:
+                    logger.debug(f"Gagal memperbarui progres broadcast admin: {ex}")
 
     except asyncio.CancelledError:
         logger.info(f"[BLAST] Broadcast dibatalkan oleh admin {admin_id}.")
@@ -4762,8 +4528,8 @@ async def _run_broadcast(bot, admin_id: int, buyers: list, text_blast: str):
                 ),
                 parse_mode="HTML"
             )
-        except Exception:
-            pass
+        except Exception as ex:
+            logger.debug(f"Gagal mengirim laporan final broadcast: {ex}")
 
 async def cmd_blast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update.message.from_user.id, context):
@@ -4800,7 +4566,6 @@ async def blast_batal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def blast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin konfirmasi blast setelah preview."""
     query = update.callback_query
     await query.answer("⏳ Memulai broadcast di background...")
 
@@ -4824,7 +4589,6 @@ async def blast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _blast_tasks[admin_id] = task
 
 async def blast_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin stop broadcast yang sedang berjalan."""
     query = update.callback_query
     await query.answer("⛔ Menghentikan broadcast...")
 
@@ -4849,7 +4613,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     text = update.message.text.strip() if update.message.text else ""
 
-    # --- STATE: BUYER MENGETIK TESTIMONI ---
     if context.user_data.get('awaiting_review_text'):
         context.user_data.pop('awaiting_review_text', None)
         temp = context.user_data.pop('temp_rating', None)
@@ -4894,10 +4657,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🙏 Terima kasih banyak! Ulasan Anda telah berhasil dikirim dan saat ini sedang ditinjau oleh admin.")
         return
 
-    # --- ADMIN STATES ---
     if await is_admin(user_id, context):
 
-        # --- State: blast - mengetik pesan ---
         blast_state = context.user_data.get('blast_state')
         if blast_state and blast_state.get('step') == 'typing':
             if not text:
@@ -4905,7 +4666,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             buyers = blast_state.get('buyers', [])
-            # Simpan teks & ganti step ke preview
             context.user_data['blast_state'] = {
                 'step': 'preview',
                 'text': text,
@@ -4930,7 +4690,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # --- State: awaiting cari order ---
         if context.user_data.get('awaiting_cari'):
             context.user_data.pop('awaiting_cari', None)
             order_id = text.strip()
@@ -4966,7 +4725,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # --- State: awaiting ban user ---
         if context.user_data.get('awaiting_ban'):
             context.user_data.pop('awaiting_ban', None)
             parts = text.split(None, 1)
@@ -4989,7 +4747,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # --- State: awaiting unban user ---
         if context.user_data.get('awaiting_unban'):
             context.user_data.pop('awaiting_unban', None)
             try:
@@ -5008,7 +4765,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # --- State: awaiting kick search (name or user_id) ---
         if context.user_data.get('awaiting_kick_search'):
             context.user_data.pop('awaiting_kick_search', None)
             query_str = text.strip()
@@ -5040,7 +4796,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # --- State: awaiting tambah grup ---
         if context.user_data.get('awaiting_add_group'):
             context.user_data.pop('awaiting_add_group', None)
             gid_str = text.strip()
@@ -5061,7 +4816,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # --- State: awaiting channel ID ---
         if context.user_data.get('awaiting_channel_id'):
             context.user_data.pop('awaiting_channel_id', None)
             val = text.strip()
@@ -5104,7 +4858,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
             return
 
-        # --- State: awaiting testi channel ID ---
         if context.user_data.get('awaiting_testi_channel_id'):
             context.user_data.pop('awaiting_testi_channel_id', None)
             val = text.strip()
@@ -5138,7 +4891,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
             return
 
-        # --- State: tambah admin via forward ---
         if context.user_data.get('awaiting_add_admin'):
             context.user_data.pop('awaiting_add_admin', None)
             if not is_super_admin(user_id):
@@ -5169,7 +4921,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # --- State: ubah link testimoni ---
         if context.user_data.get('awaiting_link_testi'):
             context.user_data.pop('awaiting_link_testi', None)
             val = text.strip()
@@ -5181,7 +4932,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # --- State: ubah link admin/CS ---
         if context.user_data.get('awaiting_link_admin'):
             context.user_data.pop('awaiting_link_admin', None)
             val = text.strip()
@@ -5193,7 +4943,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # --- State: tambah produk ---
         adding = context.user_data.get('adding_product')
         if adding:
             step = adding.get('step')
@@ -5278,7 +5027,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await _send_produk_menu(context, chat_id=user_id)
                 return
 
-        # --- State: edit field produk ---
         editing = context.user_data.get('editing_product')
         if editing:
             paket_id = editing['paket_id']
@@ -5325,6 +5073,7 @@ async def cmd_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="HTML")
 
 # =================== ADMIN: PENDING ORDERS ===================
+
 
 async def admin_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update.message.from_user.id, context):
@@ -5550,8 +5299,8 @@ async def admin_konfirmasi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         simpan_msg_user(context, user_id, msg.message_id)
         await hapus_msg_user_lama(context, user_id, keep_last=2)
         await hapus_admin_msg(context, user_id)
-
-# =================== ADMIN: PANEL UTAMA ===================
+        
+        # =================== ADMIN: PANEL UTAMA ===================
 
 def build_admin_panel_keyboard(user_id: int = None):
     rows = [
@@ -5706,7 +5455,8 @@ async def admpanel_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await query.edit_message_text(text, parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_back")]]))
-    except Exception:
+    except Exception as e:
+        logger.debug(f"Gagal mengedit stats di panel: {e}")
         await context.bot.send_message(chat_id=query.from_user.id, text=text, parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_back")]]))
 
@@ -5736,7 +5486,6 @@ async def admpanel_blast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def blast_retype(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ubah pesan blast setelah preview."""
     query = update.callback_query
     await query.answer()
 
@@ -5928,7 +5677,8 @@ async def admpanel_kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 chat = await context.bot.get_chat(int(gid))
                 nama_grup = esc(chat.title or str(gid))
-            except Exception:
+            except Exception as e:
+                logger.debug(f"Gagal mengambil judul chat {gid}: {e}")
                 nama_grup = "⚠️ Tidak dapat diakses"
             group_lines += f"  {i}. <b>{nama_grup}</b>\n     <code>{gid}</code>\n"
     else:
@@ -5968,12 +5718,11 @@ async def kick_cek_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def kick_select_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Tampilkan status user di tiap grup + tombol kick per grup dan kick semua."""
     query = update.callback_query
     try:
         await query.answer()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"Gagal answer callback query kick_select: {e}")
     if not await is_admin(query.from_user.id, context):
         return
     target_id = int(query.data.split("|", 1)[1])
@@ -5988,7 +5737,8 @@ async def kick_select_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             chat = await context.bot.get_chat(int(gid))
             group_names[str(gid)] = chat.title or str(gid)
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Gagal mengambil metadata chat {gid}: {e}")
             group_names[str(gid)] = str(gid)
 
     buttons = []
@@ -6003,6 +5753,7 @@ async def kick_select_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 icon = "❌"
                 status_label = status
         except Exception as e:
+            logger.debug(f"Gagal mengambil data keanggotaan {target_id} di chat {gid}: {e}")
             icon = "⚠️"
             status_label = "error"
         nama_grup = esc(group_names.get(str(gid), str(gid)))
@@ -6024,7 +5775,6 @@ async def kick_select_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(result_text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
 
 async def kick_one(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Kick user hanya dari 1 grup tertentu."""
     query = update.callback_query
     if not await is_admin(query.from_user.id, context):
         await query.answer("⛔ Akses ditolak.", show_alert=True)
@@ -6038,12 +5788,12 @@ async def kick_one(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             chat = await context.bot.get_chat(gid)
             nama_grup = chat.title or str(gid)
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Gagal mengambil detail chat {gid}: {e}")
             nama_grup = str(gid)
         await query.answer(f"✅ Berhasil kick dari {nama_grup}", show_alert=True)
     except Exception as e:
         await query.answer(f"❌ Gagal: {str(e)[:80]}", show_alert=True)
-    # Refresh view — set data ke kick_select|{target_id} agar kick_select_user bisa baca target_id
     query.data = f"kick_select|{target_id}"
     await kick_select_user(update, context)
 
@@ -6072,7 +5822,8 @@ async def kick_del_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             chat = await context.bot.get_chat(int(gid))
             label = f"🗑️ {chat.title or gid}  ({gid})"
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Gagal mengambil info chat {gid}: {e}")
             label = f"🗑️ {gid}"
         buttons.append([InlineKeyboardButton(label, callback_data=f"kick_del_confirm|{gid}")])
     buttons.append([InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_kick")])
@@ -6108,7 +5859,8 @@ async def kick_do_kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             chat = await context.bot.get_chat(int(gid))
             nama_grup = chat.title or str(gid)
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Gagal memuat judul chat {gid}: {e}")
             nama_grup = str(gid)
         try:
             await context.bot.ban_chat_member(chat_id=int(gid), user_id=target_id)
@@ -6117,10 +5869,8 @@ async def kick_do_kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             failed.append(f"{esc(nama_grup)}: {esc(str(e)[:60])}")
 
-    # Auto-ban di DB
     await ban_user(target_id, "Dikick dari grup oleh admin")
 
-    # Kirim notif ke user bahwa akses dinonaktifkan
     try:
         await context.bot.send_message(
             chat_id=target_id,
@@ -6131,8 +5881,8 @@ async def kick_do_kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ),
             parse_mode="HTML"
         )
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"Gagal mengirim notif pencabutan akses ke user {target_id}: {e}")
 
     result_text = (
         f"✅ <b>User <code>{target_id}</code> berhasil dikick + di-ban</b>\n"
@@ -6313,7 +6063,7 @@ async def admpanel_setting_link_admin(update: Update, context: ContextTypes.DEFA
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Batal", callback_data="admpanel_setting")]])
     )
 
-# =================== ADMIN: BAN / UNBAN (command) ===================
+# =================== ADMIN: BAN / UNBAN COMMANDS ===================
 
 async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update.message.from_user.id, context):
@@ -6503,13 +6253,7 @@ async def admpanel_admin_del(update: Update, context: ContextTypes.DEFAULT_TYPE)
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_admins")]])
     )
 
-# =================== MAIN ===================
-# [DESKRIPSI: PERUBAHAN PENTING DI SINI - Handler registration diperbarui
-#  1. back_start DIHAPUS (diganti cancel_order + back_to_menu)
-#  2. cancel_order_handler BARU untuk callback_data="cancel_order"
-#  3. back_to_menu BARU untuk callback_data="back_to_menu"
-#  4. Semua tombol "Batalkan Pesanan" sekarang pakai callback_data="cancel_order"
-#  5. Semua tombol "Kembali" di menu daftar paket pakai callback_data="back_to_menu"]
+# =================== MAIN ENTRYPOINT ===================
 
 def main():
     init_pool()
@@ -6523,11 +6267,11 @@ def main():
         .build()
     )
 
-    # User commands
+    # User Commands
     app.add_handler(CommandHandler("start",   start))
     app.add_handler(CommandHandler("riwayat", cmd_riwayat))
 
-    # Admin commands
+    # Admin Commands
     app.add_handler(CommandHandler("admin",       cmd_admin))
     app.add_handler(CommandHandler("produk",      cmd_produk))
     app.add_handler(CommandHandler("pending",     admin_pending))
@@ -6543,15 +6287,11 @@ def main():
     app.add_handler(CommandHandler("daftar_ban",  cmd_daftar_ban))
     app.add_handler(CommandHandler("cari",        cmd_cari))
 
-    # User callbacks
+    # User Callback Query Handlers
     app.add_handler(CallbackQueryHandler(buy_callback,         pattern="^buy$"))
     app.add_handler(CallbackQueryHandler(pilih_paket,          pattern="^pilih_"))
     app.add_handler(CallbackQueryHandler(prereq_buy_handler,   pattern="^prereq_buy_"))
-    
-    # === CALLBACK BARU: Pisah antara batal dan navigasi kembali ===
-    # [DESKRIPSI: cancel_order_handler untuk tombol "Batalkan Pesanan" - set cooldown]
     app.add_handler(CallbackQueryHandler(cancel_order_handler, pattern="^cancel_order$"))
-    # [DESKRIPSI: back_to_menu untuk tombol "Kembali" di menu daftar paket - tanpa set cooldown]
     app.add_handler(CallbackQueryHandler(back_to_menu,         pattern="^back_to_menu$"))
     
     app.add_handler(CallbackQueryHandler(ganti_paket_list,     pattern="^ganti_paket_list$"))
@@ -6559,10 +6299,10 @@ def main():
     app.add_handler(CallbackQueryHandler(ganti_paket_exec,     pattern="^ganti_paket_exec\\|"))
     app.add_handler(CallbackQueryHandler(ganti_paket_batal,    pattern="^ganti_paket_batal$"))
 
-    # Kirim ulang link
+    # Buyer Actions Handlers
     app.add_handler(CallbackQueryHandler(resend_group_link, pattern="^resendlink\\|"))
 
-    # Testimoni user callbacks
+    # Testimonial Flow Handlers
     app.add_handler(CallbackQueryHandler(handle_rate_start,      pattern="^rate_start\\|"))
     app.add_handler(CallbackQueryHandler(handle_rate_val,        pattern="^rate_val\\|"))
     app.add_handler(CallbackQueryHandler(handle_rate_text_skip,  pattern="^rate_text_skip\\|"))
@@ -6570,14 +6310,14 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_rate_back,       pattern="^rate_back\\|"))
     app.add_handler(CallbackQueryHandler(handle_rate_back_stars, pattern="^rate_back_stars\\|"))
 
-    # Admin kirim link setelah prerequisite terpenuhi
+    # Admin Prerequisite Manual Handler
     app.add_handler(CallbackQueryHandler(admin_kirim_link_prereq, pattern="^admin_kirim_link_prereq\\|"))
 
-    # Admin ulasan moderasi
+    # Admin Testimonial Verification
     app.add_handler(CallbackQueryHandler(admin_testi_approve, pattern="^adm_testi_approve\\|"))
     app.add_handler(CallbackQueryHandler(admin_testi_reject,  pattern="^adm_testi_reject\\|"))
 
-    # Produk management
+    # Admin Product Management Flow
     app.add_handler(CallbackQueryHandler(produk_detail,        pattern="^pd_detail_"))
     app.add_handler(CallbackQueryHandler(produk_edit_field,    pattern="^pd_edit_"))
     app.add_handler(CallbackQueryHandler(produk_toggle_aktif,  pattern="^pd_toggle_"))
@@ -6587,14 +6327,14 @@ def main():
     app.add_handler(CallbackQueryHandler(produk_tambah_batal,  pattern="^pd_tambah_batal$"))
     app.add_handler(CallbackQueryHandler(pd_back,              pattern="^pd_back$"))
 
-    # Admin order callbacks
+    # Admin Order Management Flow
     app.add_handler(CallbackQueryHandler(admin_proses_order,   pattern="^proses_"))
     app.add_handler(CallbackQueryHandler(admin_konfirmasi,     pattern="^(confirm|reject)_"))
     app.add_handler(CallbackQueryHandler(back_orders,          pattern="^back_orders$"))
     app.add_handler(CallbackQueryHandler(admin_cancel_order,   pattern="^adm_cancel\\|"))
     app.add_handler(CallbackQueryHandler(admin_manual_confirm, pattern="^adm_konfirm\\|"))
 
-    # Admin panel callbacks
+    # Admin Main Panel Navigation Flow
     app.add_handler(CallbackQueryHandler(admpanel_back,            pattern="^admpanel_back$"))
     app.add_handler(CallbackQueryHandler(admpanel_produk,          pattern="^admpanel_produk$"))
     app.add_handler(CallbackQueryHandler(admpanel_orders,          pattern="^admpanel_orders$"))
@@ -6613,7 +6353,7 @@ def main():
     app.add_handler(CallbackQueryHandler(admpanel_user_unban,      pattern="^admpanel_user_unban$"))
     app.add_handler(CallbackQueryHandler(admpanel_user_daftar,     pattern="^admpanel_user_daftar$"))
 
-    # Kick feature callbacks
+    # Admin Group Kick Feature Flow
     app.add_handler(CallbackQueryHandler(admpanel_kick,    pattern="^admpanel_kick$"))
     app.add_handler(CallbackQueryHandler(kick_cek_user,    pattern="^kick_cek_user$"))
     app.add_handler(CallbackQueryHandler(kick_select_user, pattern="^kick_select\\|"))
@@ -6626,7 +6366,7 @@ def main():
     app.add_handler(CallbackQueryHandler(kick_del_confirm, pattern="^kick_del_confirm\\|"))
     app.add_handler(CallbackQueryHandler(kick_do_kick,     pattern="^kick_do_kick\\|"))
 
-    # Pengaturan callbacks
+    # Admin Settings Configuration Flow
     app.add_handler(CallbackQueryHandler(admpanel_setting,              pattern="^admpanel_setting$"))
     app.add_handler(CallbackQueryHandler(admpanel_setting_channel_set,  pattern="^admpanel_setting_channel_set$"))
     app.add_handler(CallbackQueryHandler(admpanel_setting_channel_off,  pattern="^admpanel_setting_channel_off$"))
@@ -6637,34 +6377,34 @@ def main():
     app.add_handler(CallbackQueryHandler(admpanel_setting_link_testi,   pattern="^admpanel_setting_link_testi$"))
     app.add_handler(CallbackQueryHandler(admpanel_setting_link_admin,   pattern="^admpanel_setting_link_admin$"))
 
-    # Admin management (super admin only)
+    # Super Admin Management Flow
     app.add_handler(CallbackQueryHandler(admpanel_admins,       pattern="^admpanel_admins$"))
     app.add_handler(CallbackQueryHandler(admpanel_admin_add,    pattern="^admpanel_admin_add$"))
     app.add_handler(CallbackQueryHandler(admpanel_admin_remove, pattern="^admpanel_admin_remove$"))
     app.add_handler(CallbackQueryHandler(admpanel_admin_del,    pattern="^admpanel_admin_del_"))
 
-    # Blast callbacks
+    # Blast Message Confirmation Flow
     app.add_handler(CallbackQueryHandler(blast_batal,   pattern="^blast_batal$"))
     app.add_handler(CallbackQueryHandler(blast_confirm, pattern="^blast_confirm$"))
     app.add_handler(CallbackQueryHandler(blast_stop,    pattern="^blast_stop$"))
     app.add_handler(CallbackQueryHandler(blast_retype,  pattern="^blast_retype$"))
 
-    # Auto-approve join request
+    # Auto-Approve Join Request Handler
     app.add_handler(ChatJoinRequestHandler(handle_join_request))
 
-    # Admin: terima file .json untuk import
+    # Backup & Import Document Handlers
     app.add_handler(MessageHandler(
         filters.Document.ALL & filters.ChatType.PRIVATE,
         handle_json_document
     ))
 
-    # General Message Handler
+    # General Fallback Message Handler
     app.add_handler(MessageHandler(
         (filters.TEXT | filters.FORWARDED) & ~filters.COMMAND & filters.ChatType.PRIVATE,
         message_handler
     ))
 
-    logger.info("Bot berjalan...")
+    logger.info("Bot Hyper Family Store berhasil berjalan...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":

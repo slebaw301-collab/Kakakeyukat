@@ -1813,7 +1813,8 @@ async def api_get_stats(request: aio_web.Request) -> aio_web.Response:
         for row in stats['trend_7d']:
             d = row.get('hari')
             formatted.append({
-                'hari': d.strftime('%d/%m') if hasattr(d, 'strftime') else str(d),
+                'date': d.strftime('%d/%m') if hasattr(d, 'strftime') else str(d),
+                'day': d.strftime('%d/%m') if hasattr(d, 'strftime') else str(d),
                 'rev': int(row.get('rev', 0)),
                 'cnt': int(row.get('cnt', 0)),
             })
@@ -2607,7 +2608,6 @@ async def ganti_paket_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def ganti_paket_konfirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     user_id = query.from_user.id
 
     new_paket_id = query.data.split("|", 1)[1]
@@ -2690,7 +2690,6 @@ async def ganti_paket_exec(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def ganti_paket_batal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     user_id = query.from_user.id
 
     active = await get_active_order(user_id)
@@ -2703,6 +2702,7 @@ async def ganti_paket_batal(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("❌ Produk tidak ditemukan.", show_alert=True)
         return
 
+    await query.answer()
     changes_used = active.get('order_changes', 0)
     sisa_ganti = 1 - changes_used
 
@@ -2739,7 +2739,11 @@ async def _stop_payment_task(user_id: int):
 
 def _start_payment_task(bot, order_id: str, paket_id: str, user_id: int,
                          user_name: str, amount: int, timeout_seconds: int = 1800):
-    asyncio.get_event_loop().create_task(
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.get_event_loop()
+    loop.create_task(
         _start_payment_task_async(bot, order_id, paket_id, user_id, user_name, amount, timeout_seconds)
     )
 
@@ -3042,12 +3046,12 @@ async def _auto_deliver_pending_prereq_orders(bot, user_id: int, user_name: str)
 
 async def admin_kirim_link_prereq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
 
     if not await is_admin(query.from_user.id, context):
         await query.answer("⛔ Akses ditolak.", show_alert=True)
         return
 
+    await query.answer()
     order_id = query.data.split("|")[1]
     order = await get_order_by_id(order_id)
     if not order:
@@ -3334,6 +3338,10 @@ async def admin_testi_approve(update: Update, context: ContextTypes.DEFAULT_TYPE
     query = update.callback_query
     await query.answer()
 
+    if not await is_admin(query.from_user.id, context):
+        await query.answer("⛔ Akses ditolak.", show_alert=True)
+        return
+
     order_id = query.data.split("|")[1]
     testi = await get_testimonial_by_order(order_id)
     if not testi:
@@ -3392,6 +3400,10 @@ async def admin_testi_approve(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def admin_testi_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+
+    if not await is_admin(query.from_user.id, context):
+        await query.answer("⛔ Akses ditolak.", show_alert=True)
+        return
 
     order_id = query.data.split("|")[1]
     await update_testimonial_status(order_id, 'rejected')
@@ -3790,7 +3802,6 @@ def _check_waiting_order_sync(order_id):
 
 async def admin_cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
 
     if not await is_admin(query.from_user.id, context):
         await query.answer("⛔ Akses ditolak.", show_alert=True)
@@ -3801,6 +3812,7 @@ async def admin_cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.answer("Format tidak valid.", show_alert=True)
         return
 
+    await query.answer()
     target_user_id = int(parts[1])
     order_id = parts[2]
 
@@ -4632,6 +4644,7 @@ async def _cleanup_cooldowns_loop():
 # =================== ADMIN: BROADCAST ===================
 
 _blast_tasks: dict = {}
+_blast_tasks_lock = asyncio.Lock()
 
 async def _run_broadcast(bot, admin_id: int, buyers: list, text_blast: str):
     total = len(buyers)
@@ -4702,7 +4715,8 @@ async def _run_broadcast(bot, admin_id: int, buyers: list, text_blast: str):
         logger.info(f"[BLAST] Broadcast dibatalkan oleh admin {admin_id}.")
 
     finally:
-        _blast_tasks.pop(admin_id, None)
+        async with _blast_tasks_lock:
+            _blast_tasks.pop(admin_id, None)
         is_cancelled = sent + failed + skipped < total
         try:
             await bot.send_message(
@@ -4776,14 +4790,16 @@ async def blast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     task = asyncio.create_task(_run_broadcast(context.bot, admin_id, buyers, text_blast))
-    _blast_tasks[admin_id] = task
+    async with _blast_tasks_lock:
+        _blast_tasks[admin_id] = task
 
 async def blast_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer("⛔ Menghentikan broadcast...")
 
     admin_id = query.from_user.id
-    task = _blast_tasks.pop(admin_id, None)
+    async with _blast_tasks_lock:
+        task = _blast_tasks.pop(admin_id, None)
     if task and not task.done():
         task.cancel()
         await query.edit_message_text(
@@ -5289,13 +5305,10 @@ async def admin_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
 def _get_pending_order_sync(user_id):
-    conn = get_conn()
-    try:
+    with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("SELECT * FROM orders WHERE user_id=%s AND status='pending' ORDER BY id DESC LIMIT 1", (user_id,))
             return c.fetchone()
-    finally:
-        release_conn(conn)
 
 async def admin_proses_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query

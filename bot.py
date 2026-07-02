@@ -359,6 +359,15 @@ def init_db():
             c.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS order_changes INTEGER DEFAULT 0")
             c.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP")
 
+            # Indexes untuk query yang sering dijalankan
+            c.execute("CREATE INDEX IF NOT EXISTS idx_orders_user_id ON orders(user_id)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_orders_created_at ON orders(created_at)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_orders_user_status ON orders(user_id, status)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_orders_status_created ON orders(status, created_at)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_testimonials_status ON testimonials(status)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_cooldowns_user_id ON cooldowns(user_id)")
+
             c.execute("""
                 CREATE TABLE IF NOT EXISTS testimonials (
                     id SERIAL PRIMARY KEY,
@@ -664,50 +673,48 @@ def get_order_stats(today_start: datetime, month_start: datetime):
                 last_month_start = month_start.replace(month=month_start.month - 1, day=1)
             last_month_end = month_start
 
+            # Query 1: semua agregat per-periode dalam satu scan tabel
             c.execute("""
-                SELECT COUNT(*) as cnt, COALESCE(SUM(harga_dibayar), 0) as rev
-                FROM orders WHERE status='completed' AND created_at >= %s
-            """, (today_start,))
-            r = c.fetchone(); today_completed = r['cnt']; today_revenue = r['rev']
-
-            c.execute("""
-                SELECT COUNT(*) as cnt, COALESCE(SUM(harga_dibayar), 0) as rev
-                FROM orders WHERE status='completed' AND created_at >= %s AND created_at < %s
-            """, (yesterday_start, today_start))
-            r = c.fetchone(); yesterday_completed = r['cnt']; yesterday_revenue = r['rev']
-
-            c.execute("""
-                SELECT COUNT(*) as cnt, COALESCE(SUM(harga_dibayar), 0) as rev
-                FROM orders WHERE status='completed' AND created_at >= %s
-            """, (month_start,))
-            r = c.fetchone(); month_completed = r['cnt']; month_revenue = r['rev']
-
-            c.execute("""
-                SELECT COUNT(*) as cnt, COALESCE(SUM(harga_dibayar), 0) as rev
-                FROM orders WHERE status='completed' AND created_at >= %s AND created_at < %s
-            """, (last_month_start, last_month_end))
-            r = c.fetchone(); last_month_completed = r['cnt']; last_month_revenue = r['rev']
-
-            c.execute("SELECT COUNT(*) as cnt FROM orders WHERE status='completed'")
-            total_orders = c.fetchone()['cnt']
-
-            c.execute("SELECT COUNT(*) as cnt FROM orders")
-            total_generated = c.fetchone()['cnt'] or 1
-
-            c.execute("SELECT COUNT(*) as cnt FROM orders WHERE status IN ('waiting','pending')")
-            active_count = c.fetchone()['cnt']
-
-            c.execute("SELECT COUNT(*) as cnt FROM orders WHERE status='cancelled'")
-            cancelled_count = c.fetchone()['cnt']
-
-            c.execute("SELECT COUNT(*) as cnt FROM orders WHERE status='expired'")
-            expired_count = c.fetchone()['cnt']
-
-            c.execute("SELECT COUNT(*) as cnt FROM orders WHERE status='rejected'")
-            rejected_count = c.fetchone()['cnt']
-
-            c.execute("SELECT COALESCE(SUM(harga_dibayar), 0) as total FROM orders WHERE status='completed'")
-            total_revenue = c.fetchone()['total']
+                SELECT
+                    COUNT(*) FILTER (WHERE status='completed' AND created_at >= %(today)s)          AS today_completed,
+                    COALESCE(SUM(harga_dibayar) FILTER (WHERE status='completed' AND created_at >= %(today)s), 0) AS today_revenue,
+                    COUNT(*) FILTER (WHERE status='completed' AND created_at >= %(yest)s AND created_at < %(today)s) AS yesterday_completed,
+                    COALESCE(SUM(harga_dibayar) FILTER (WHERE status='completed' AND created_at >= %(yest)s AND created_at < %(today)s), 0) AS yesterday_revenue,
+                    COUNT(*) FILTER (WHERE status='completed' AND created_at >= %(month)s)          AS month_completed,
+                    COALESCE(SUM(harga_dibayar) FILTER (WHERE status='completed' AND created_at >= %(month)s), 0) AS month_revenue,
+                    COUNT(*) FILTER (WHERE status='completed' AND created_at >= %(lm_start)s AND created_at < %(lm_end)s) AS last_month_completed,
+                    COALESCE(SUM(harga_dibayar) FILTER (WHERE status='completed' AND created_at >= %(lm_start)s AND created_at < %(lm_end)s), 0) AS last_month_revenue,
+                    COUNT(*) FILTER (WHERE status='completed')                                      AS total_orders,
+                    COUNT(*)                                                                        AS total_generated_raw,
+                    COUNT(*) FILTER (WHERE status IN ('waiting','pending'))                         AS active_count,
+                    COUNT(*) FILTER (WHERE status='cancelled')                                      AS cancelled_count,
+                    COUNT(*) FILTER (WHERE status='expired')                                        AS expired_count,
+                    COUNT(*) FILTER (WHERE status='rejected')                                       AS rejected_count,
+                    COALESCE(SUM(harga_dibayar) FILTER (WHERE status='completed'), 0)              AS total_revenue
+                FROM orders
+            """, {
+                'today':    today_start,
+                'yest':     yesterday_start,
+                'month':    month_start,
+                'lm_start': last_month_start,
+                'lm_end':   last_month_end,
+            })
+            r = c.fetchone()
+            today_completed     = r['today_completed']
+            today_revenue       = r['today_revenue']
+            yesterday_completed = r['yesterday_completed']
+            yesterday_revenue   = r['yesterday_revenue']
+            month_completed     = r['month_completed']
+            month_revenue       = r['month_revenue']
+            last_month_completed = r['last_month_completed']
+            last_month_revenue  = r['last_month_revenue']
+            total_orders        = r['total_orders']
+            total_generated     = r['total_generated_raw'] or 1
+            active_count        = r['active_count']
+            cancelled_count     = r['cancelled_count']
+            expired_count       = r['expired_count']
+            rejected_count      = r['rejected_count']
+            total_revenue       = r['total_revenue']
 
             aov = round(total_revenue / total_orders) if total_orders > 0 else 0
 
@@ -762,13 +769,18 @@ def get_order_stats(today_start: datetime, month_start: datetime):
             rev_30d = c.fetchone()['rev']
             avg_daily_revenue = round(rev_30d / 30) if rev_30d else 0
 
-            c.execute("SELECT COALESCE(AVG(rating), 0) as avg, COUNT(*) as cnt FROM testimonials WHERE status='approved'")
+            # Query: gabungkan statistik testimoni dalam satu scan
+            c.execute("""
+                SELECT
+                    COALESCE(AVG(rating) FILTER (WHERE status='approved'), 0) AS avg_rating,
+                    COUNT(*) FILTER (WHERE status='approved')                  AS total_testi,
+                    COUNT(*) FILTER (WHERE status='pending')                   AS pending_testi
+                FROM testimonials
+            """)
             testi_row = c.fetchone()
-            avg_rating = round(float(testi_row['avg']), 1)
-            total_testi = testi_row['cnt']
-
-            c.execute("SELECT COUNT(*) as cnt FROM testimonials WHERE status='pending'")
-            pending_testi = c.fetchone()['cnt']
+            avg_rating    = round(float(testi_row['avg_rating']), 1)
+            total_testi   = testi_row['total_testi']
+            pending_testi = testi_row['pending_testi']
 
             c.execute("""
                 SELECT o.paket_id, p.nama, p.emoji, COUNT(*) as cnt, COALESCE(SUM(o.harga_dibayar), 0) as total
@@ -1492,7 +1504,7 @@ async def pakasir_webhook_handler(request: aio_web.Request) -> aio_web.Response:
     if not paket:
         return aio_web.Response(status=404, text='product not found')
 
-    _stop_payment_task(user_id)
+    await _stop_payment_task(user_id)
 
     if _current_bot:
         # Menangani pemrosesan lunas di background task asinkron yang aman
@@ -1513,7 +1525,7 @@ _webhook_runner = None
 from collections import defaultdict
 import time as _time_module
 
-DASHBOARD_API_KEY = os.environ.get('DASHBOARD_API_KEY', 'kikuk_super_secret_12345')
+DASHBOARD_API_KEY = os.environ.get('DASHBOARD_API_KEY')
 DASHBOARD_URL = os.environ.get('DASHBOARD_URL', '')
 
 # =================== RATE LIMITER ===================
@@ -2064,7 +2076,16 @@ async def post_shutdown(application: Application):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
-    if not await is_admin(user_id, context) and await is_maintenance():
+    # Jalankan semua pengecekan awal secara paralel untuk respons lebih cepat
+    is_admin_flag, maint, banned, sisa, active = await asyncio.gather(
+        is_admin(user_id, context),
+        is_maintenance(),
+        is_banned(user_id),
+        get_cooldown_sisa_db(user_id),
+        get_active_order(user_id),
+    )
+
+    if not is_admin_flag and maint:
         await update.message.reply_text(
             "⚙️ <b>BOT SEDANG MAINTENANCE</b>\n"
             "========================\n\n"
@@ -2075,7 +2096,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if await is_banned(user_id):
+    if banned:
         await update.message.reply_text(
             "🚫 <b>Akun kamu diblokir</b>\n"
             "========================\n\n"
@@ -2085,7 +2106,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    sisa = await get_cooldown_sisa_db(user_id)
     if sisa > 0:
         await update.message.reply_text(
             f"⏳ <b>Cooldown Aktif</b>\n"
@@ -2095,8 +2115,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML"
         )
         return
-
-    active = await get_active_order(user_id)
     if active:
         paket = await get_product(active["paket_id"])
         if not paket:
@@ -2107,7 +2125,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if trans and trans.get("status") == "completed":
             success = await mark_order_completed(active["order_id"])
             if success:
-                _stop_payment_task(user_id)
+                await _stop_payment_task(user_id)
                 await hapus_qris_buyer_lama(context.bot, active["order_id"], user_id)
                 paid_amount = trans.get("amount", paket["harga"])
                 link = await kirim_link_ke_buyer(context, user_id, paket, active["order_id"], paid_amount)
@@ -2193,11 +2211,18 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
 
-    if not await is_admin(user_id, context) and await is_maintenance():
+    # Jalankan semua pengecekan awal secara paralel
+    is_admin_flag, maint, banned = await asyncio.gather(
+        is_admin(user_id, context),
+        is_maintenance(),
+        is_banned(user_id),
+    )
+
+    if not is_admin_flag and maint:
         await query.answer("⚙️ Bot sedang maintenance. Coba lagi nanti.", show_alert=True)
         return
 
-    if await is_banned(user_id):
+    if banned:
         await query.answer("🚫 Akun kamu diblokir. Hubungi admin.", show_alert=True)
         return
 
@@ -2312,6 +2337,12 @@ async def prereq_buy_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await _buat_order_baru(update, context, query, user_id, user_name, paket, order_changes=0)
 
 async def _buat_order_baru(update, context, query, user_id, user_name, paket, order_changes=0):
+    # Kirim typing indicator agar user tahu bot sedang memproses
+    try:
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_photo")
+    except Exception:
+        pass
+
     loading_msg = await context.bot.send_message(
         chat_id=update.effective_chat.id,
         text="⏳ Membuat invoice...",
@@ -2453,7 +2484,7 @@ async def cancel_order_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         if amount:
             await cancel_transaction(active["order_id"], amount)
         await update_order_status(active["order_id"], "cancelled")
-        _stop_payment_task(user_id)
+        await _stop_payment_task(user_id)
         await hapus_qris_buyer_lama(context.bot, active["order_id"], user_id)
 
         cancelled_order_id = active["order_id"]
@@ -2675,7 +2706,7 @@ async def ganti_paket_exec(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if amount_old:
         await cancel_transaction(old_order_id, amount_old)
     await update_order_status(old_order_id, "cancelled")
-    _stop_payment_task(user_id)
+    await _stop_payment_task(user_id)
     await hapus_qris_buyer_lama(context.bot, old_order_id, user_id)
     await hapus_notif_lama(context.bot, old_order_id)
 
@@ -3336,11 +3367,12 @@ async def handle_rate_back_stars(update: Update, context: ContextTypes.DEFAULT_T
 
 async def admin_testi_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
 
     if not await is_admin(query.from_user.id, context):
         await query.answer("⛔ Akses ditolak.", show_alert=True)
         return
+
+    await query.answer()
 
     order_id = query.data.split("|")[1]
     testi = await get_testimonial_by_order(order_id)
@@ -3399,11 +3431,12 @@ async def admin_testi_approve(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def admin_testi_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
 
     if not await is_admin(query.from_user.id, context):
         await query.answer("⛔ Akses ditolak.", show_alert=True)
         return
+
+    await query.answer()
 
     order_id = query.data.split("|")[1]
     await update_testimonial_status(order_id, 'rejected')
@@ -3829,7 +3862,7 @@ async def admin_cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await cancel_transaction(order_id, cancel_amount)
 
     await update_order_status(order_id, 'cancelled')
-    _stop_payment_task(target_user_id)
+    await _stop_payment_task(target_user_id)
     await hapus_qris_buyer_lama(context.bot, order_id, target_user_id)
     await hapus_notif_lama(context.bot, order_id)
 
@@ -3893,7 +3926,7 @@ async def admin_manual_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
     order = dict(order)
     paket = await get_product(order['paket_id']) or {"emoji": "📦", "nama": order['paket_id'], "harga": 0, "link": DEFAULT_LINK}
 
-    _stop_payment_task(target_user_id)
+    await _stop_payment_task(target_user_id)
     ok = await mark_order_completed(order_id)
     if not ok:
         await query.edit_message_text("⚠️ Order sudah diproses sebelumnya (mungkin oleh webhook).")

@@ -2230,18 +2230,17 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     products = await get_all_products()
     aktif = [p for p in products if p.get('aktif', True)]
-    text = "<b>📦 PILIH PAKET</b>\n========================\n\n"
-    for p in aktif:
-        text += (
-            f"{esc(p['emoji'])} <b>{esc(p['nama']).upper()}</b>\n"
-            f"- {esc(p['deskripsi'])}\n"
-            f"- Harga: {format_harga(p['harga'])}\n"
-            f"- Status: Tersedia ✅\n\n"
-        )
-    text += "========================"
+
+    text = (
+        "🛍️ <b>PILIH PAKET</b>\n\n"
+        "Ketuk paket di bawah untuk melihat detail lengkap."
+    )
 
     keyboard = [
-        [InlineKeyboardButton(f"{p['emoji']} {p['nama']} - {format_harga(p['harga'])}", callback_data=f"pilih_{p['paket_id']}")]
+        [InlineKeyboardButton(
+            f"{p['emoji']}  {p['nama'].upper()}  ·  {format_harga(p['harga'])}",
+            callback_data=f"pilih_{p['paket_id']}"
+        )]
         for p in aktif
     ]
     keyboard.append([InlineKeyboardButton("⬅️ Kembali", callback_data="back_to_menu")])
@@ -2273,7 +2272,77 @@ async def pilih_paket(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total = (trans.get("amount", paket_active["harga"]) + trans.get("fee", 0)) if trans else (active.get("harga_dibayar") or paket_active["harga"])
         caption = (
             f"<b>⏳ ORDER AKTIF</b>\n"
-            f"========================\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📦 Paket: {esc(paket_active['emoji'])} {esc(paket_active['nama'])}\n"
+            f"💰 Total: {format_harga(total)}\n"
+            f"📝 Order ID: <code>{esc(active['order_id'])}</code>\n\n"
+            f"⚠️ Selesaikan pembayaran atau batalkan dulu."
+        )
+        keyboard = [[InlineKeyboardButton("❌ Batalkan Order", callback_data="cancel_order")]]
+        await query.edit_message_text(caption, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    sisa = await get_cooldown_sisa_db(user_id)
+    if sisa > 0:
+        await query.answer(
+            f"⏳ Kamu baru saja membatalkan order. Coba lagi dalam {sisa} menit.",
+            show_alert=True
+        )
+        return
+
+    await query.answer()
+
+    # Tampilkan kartu detail produk — beli hanya setelah konfirmasi
+    req_ids = paket.get("requires_paket_ids") or []
+    prereq_note = ""
+    if req_ids:
+        prereq_note = "\n\n⚠️ <i>Paket ini memerlukan paket prasyarat terlebih dahulu.</i>"
+
+    detail_text = (
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{esc(paket['emoji'])}  <b>{esc(paket['nama']).upper()}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📋 {esc(paket['deskripsi'])}\n\n"
+        f"💰 Harga: <b>{format_harga(paket['harga'])}</b>\n"
+        f"✅ Status: Tersedia"
+        f"{prereq_note}"
+    )
+    keyboard = [
+        [InlineKeyboardButton(
+            f"🛒 Beli Sekarang  —  {format_harga(paket['harga'])}",
+            callback_data=f"konfirm_beli_{paket['paket_id']}"
+        )],
+        [InlineKeyboardButton("⬅️ Kembali ke Pilihan Paket", callback_data="buy")],
+    ]
+    await query.edit_message_text(detail_text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def konfirm_beli(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    user_name = query.from_user.full_name
+
+    if await is_banned(user_id):
+        await query.answer("🚫 Akun kamu diblokir. Hubungi admin.", show_alert=True)
+        return
+
+    paket_id = query.data.replace("konfirm_beli_", "")
+    paket = await get_product(paket_id)
+    if not paket:
+        await query.answer("❌ Produk tidak ditemukan.", show_alert=True)
+        return
+
+    active = await get_active_order(user_id)
+    if active:
+        paket_active = await get_product(active["paket_id"]) or {"emoji": "📦", "nama": "Produk", "harga": 0}
+        trans = await get_transaction_detail(active["order_id"], active.get("harga_dibayar") or paket_active["harga"])
+        if trans and trans.get("status") == "completed":
+            await query.answer("✅ Pembayaran sudah diterima!", show_alert=True)
+            return
+        await query.answer("⏳ Kamu sudah punya invoice aktif!", show_alert=True)
+        total = (trans.get("amount", paket_active["harga"]) + trans.get("fee", 0)) if trans else (active.get("harga_dibayar") or paket_active["harga"])
+        caption = (
+            f"<b>⏳ ORDER AKTIF</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"📦 Paket: {esc(paket_active['emoji'])} {esc(paket_active['nama'])}\n"
             f"💰 Total: {format_harga(total)}\n"
             f"📝 Order ID: <code>{esc(active['order_id'])}</code>\n\n"
@@ -6510,6 +6579,7 @@ def main():
     # User Callback Query Handlers
     app.add_handler(CallbackQueryHandler(buy_callback,         pattern="^buy$"))
     app.add_handler(CallbackQueryHandler(pilih_paket,          pattern="^pilih_"))
+    app.add_handler(CallbackQueryHandler(konfirm_beli,         pattern="^konfirm_beli_"))
     app.add_handler(CallbackQueryHandler(prereq_buy_handler,   pattern="^prereq_buy_"))
     app.add_handler(CallbackQueryHandler(cancel_order_handler, pattern="^cancel_order$"))
     app.add_handler(CallbackQueryHandler(back_to_menu,         pattern="^back_to_menu$"))

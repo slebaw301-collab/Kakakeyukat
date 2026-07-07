@@ -1735,26 +1735,15 @@ async def pakasir_webhook_handler(request: aio_web.Request) -> aio_web.Response:
     if not paket:
         return aio_web.Response(status=404, text='product not found')
 
-    incoming_amount = _safe_int(amount, -1)
-    expected_amount = _safe_int(order.get('harga_dibayar'), 0) or _safe_int(paket.get('harga'), 0)
-    if incoming_amount != expected_amount:
-        logger.warning(
-            f"[SECURITY ALERT] Amount webhook mismatch order={order_id} incoming={incoming_amount} expected={expected_amount}"
-        )
-        return aio_web.Response(status=400, text='amount mismatch')
-
+    # Balik ke behavior lama: jangan blokir payment karena beda nominal base/fee.
+    # Selama order_id valid dan Pakasir mengonfirmasi status completed, order diproses.
     try:
-        verified_detail = await get_transaction_detail(order_id, incoming_amount)
+        verified_detail = await get_transaction_detail(order_id, amount)
     except Exception as e:
         logger.error(f"[WEBHOOK] Error verifikasi transaksi: {e}")
         return aio_web.Response(status=502, text='verification service error')
-
-    verified_amount = _safe_int((verified_detail or {}).get('amount'), incoming_amount)
-    if (
-        not verified_detail
-        or verified_detail.get('status') != 'completed'
-        or verified_amount != expected_amount
-    ):
+    
+    if not verified_detail or verified_detail.get('status') != 'completed':
         logger.warning(f"[SECURITY ALERT] Percobaan webhook palsu diblokir! Order ID: {order_id}")
         return aio_web.Response(status=400, text='verification failed')
 
@@ -1765,7 +1754,7 @@ async def pakasir_webhook_handler(request: aio_web.Request) -> aio_web.Response:
     await _stop_payment_task(user_id)
     await _handle_payment_success(
         _current_bot, order_id, paket_id, user_id, user_name,
-        expected_amount, {'amount': expected_amount, 'status': 'completed'}
+        paket.get('harga', 0), {'amount': amount, 'status': 'completed'}
     )
 
     logger.info(f"[WEBHOOK] ✅ Webhook berhasil diverifikasi & diproses: {order_id}")

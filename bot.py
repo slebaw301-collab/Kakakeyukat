@@ -135,6 +135,36 @@ def esc(text) -> str:
     """Escape karakter spesial HTML untuk parse_mode=HTML."""
     return html_module.escape(str(text))
 
+
+def tg_user_link(user_id, name: str = None) -> str:
+    """Membuat nama buyer clickable ke profil Telegram."""
+    display_name = esc(name or "Buyer")
+    try:
+        uid = int(user_id)
+    except (TypeError, ValueError):
+        return display_name
+    return f'<a href="tg://user?id={uid}">{display_name}</a>'
+
+def _infer_order_status_label(judul: str) -> str:
+    title = (judul or "").upper()
+    if "EXPIRED" in title:
+        return "⏰ Expired"
+    if "BATAL" in title or "CANCEL" in title:
+        return "❌ Cancelled"
+    if "REJECT" in title or "TOLAK" in title:
+        return "❌ Rejected"
+    if "BARU" in title or "WAIT" in title or "MENUNGGU" in title:
+        return "⏳ Waiting"
+    if "BERHASIL" in title or "KONFIRM" in title or "LINK" in title or "COMPLETED" in title:
+        return "✅ Completed"
+    return "📌 Updated"
+
+def _safe_int(value, default=0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
 # =================== TIMEZONE ===================
 WIB = timezone(timedelta(hours=7))
 
@@ -151,6 +181,7 @@ _ADMIN_ID_RAW = os.environ.get("ADMIN_ID", "")
 PAKASIR_API_KEY = os.environ.get("PAKASIR_API_KEY")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 PAKASIR_WEBHOOK_SECRET = os.environ.get("PAKASIR_WEBHOOK_SECRET", "")
+APP_ENV = os.environ.get("APP_ENV") or os.environ.get("ENV") or "development"
 
 PAKASIR_SLUG = "atkikukkvd"
 PAKASIR_BASE_URL = "https://app.pakasir.com"
@@ -165,6 +196,8 @@ if not PAKASIR_API_KEY:
     raise ValueError("PAKASIR_API_KEY tidak di-set!")
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL tidak di-set!")
+if APP_ENV.lower() == "production" and not PAKASIR_WEBHOOK_SECRET:
+    raise ValueError("PAKASIR_WEBHOOK_SECRET wajib di-set saat APP_ENV/ENV=production!")
 
 # =================== SINGLETON HTTP SESSION ===================
 _http_session: aiohttp.ClientSession = None
@@ -355,18 +388,12 @@ def init_db():
             c.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS admin_msg_id BIGINT DEFAULT NULL")
             c.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS buyer_msg_id BIGINT DEFAULT NULL")
             c.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS sent_link TEXT DEFAULT NULL")
+            c.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_status TEXT DEFAULT 'not_sent'")
+            c.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_error TEXT DEFAULT NULL")
             c.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS harga_dibayar INTEGER DEFAULT 0")
             c.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS order_changes INTEGER DEFAULT 0")
             c.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP")
 
-            # Indexes untuk query yang sering dijalankan
-            c.execute("CREATE INDEX IF NOT EXISTS idx_orders_user_id ON orders(user_id)")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_orders_created_at ON orders(created_at)")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_orders_user_status ON orders(user_id, status)")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_orders_status_created ON orders(status, created_at)")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_testimonials_status ON testimonials(status)")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_cooldowns_user_id ON cooldowns(user_id)")
 
             c.execute("""
                 CREATE TABLE IF NOT EXISTS testimonials (
@@ -404,6 +431,16 @@ def init_db():
                     added_at TEXT NOT NULL
                 )
             """)
+
+            # Indexes dibuat setelah semua tabel ada agar fresh deploy tidak gagal.
+            c.execute("CREATE INDEX IF NOT EXISTS idx_orders_user_id ON orders(user_id)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_orders_created_at ON orders(created_at)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_orders_user_status ON orders(user_id, status)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_orders_status_created ON orders(status, created_at)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_orders_delivery_status ON orders(delivery_status)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_testimonials_status ON testimonials(status)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_cooldowns_user_id ON cooldowns(user_id)")
 
             for key, val in [
                 ('link_testimoni', 'https://t.me/+7zsdSrwYIG8wOTg1'),
@@ -495,6 +532,13 @@ def _invalidate_products_cache():
     _products_cache = None
 
 def _get_product_sync(paket_id):
+    # Pakai cache all-products jika masih valid agar callback/payment flow lebih smooth.
+    global _products_cache
+    cached = _products_cache
+    if cached and _time.monotonic() < cached[1]:
+        for item in cached[0]:
+            if item.get('paket_id') == paket_id:
+                return dict(item)
     with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("SELECT * FROM products WHERE paket_id=%s", (paket_id,))
@@ -908,6 +952,18 @@ def get_order_by_id(order_id):
             return dict(row) if row else None
 
 @async_wrap
+def get_completed_order_for_user(order_id: str, user_id: int):
+    with db_session_safe() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                """SELECT * FROM orders
+                   WHERE order_id=%s AND user_id=%s AND status='completed'""",
+                (order_id, user_id)
+            )
+            row = c.fetchone()
+            return dict(row) if row else None
+
+@async_wrap
 def check_prerequisites_sync(user_id: int, requires_paket_ids_str: str) -> list:
     """Cek pemenuhan syarat pembelian paket."""
     if not requires_paket_ids_str:
@@ -939,9 +995,52 @@ def set_buyer_msg_id(order_id, msg_id):
 
 @async_wrap
 def set_sent_link(order_id, link):
+    """Tandai link benar-benar sudah terkirim ke buyer."""
     with db_session_safe() as conn:
         with conn.cursor() as c:
-            c.execute("UPDATE orders SET sent_link=%s WHERE order_id=%s", (link, order_id))
+            c.execute(
+                """UPDATE orders
+                   SET sent_link=%s, delivery_status='sent', delivery_error=NULL
+                   WHERE order_id=%s""",
+                (link, order_id)
+            )
+
+@async_wrap
+def set_delivery_status(order_id: str, status: str, error: str = None):
+    allowed = {'not_sent', 'pending', 'sent', 'failed', 'held'}
+    if status not in allowed:
+        status = 'failed'
+    with db_session_safe() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                """UPDATE orders
+                   SET delivery_status=%s, delivery_error=%s
+                   WHERE order_id=%s""",
+                (status, error, order_id)
+            )
+
+@async_wrap
+def mark_delivery_held(order_id: str, reason: str = 'Syarat belum terpenuhi'):
+    with db_session_safe() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                """UPDATE orders
+                   SET delivery_status='held', delivery_error=%s
+                   WHERE order_id=%s""",
+                (reason, order_id)
+            )
+
+@async_wrap
+def reset_delivery_claim(order_id: str, error: str = None):
+    """Reset klaim pengiriman yang gagal agar bisa dicoba ulang."""
+    with db_session_safe() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                """UPDATE orders
+                   SET sent_link=NULL, delivery_status='failed', delivery_error=%s
+                   WHERE order_id=%s""",
+                (error, order_id)
+            )
 
 @async_wrap
 def get_completed_no_link_orders(user_id: int) -> list:
@@ -950,19 +1049,32 @@ def get_completed_no_link_orders(user_id: int) -> list:
             c.execute(
                 """SELECT * FROM orders
                    WHERE user_id=%s AND status='completed'
-                   AND (sent_link IS NULL OR sent_link='')""",
+                   AND (
+                        delivery_status IS NULL
+                        OR delivery_status IN ('not_sent', 'failed', 'held')
+                        OR sent_link IS NULL
+                        OR sent_link=''
+                   )
+                   ORDER BY id ASC""",
                 (user_id,)
             )
             return [dict(r) for r in c.fetchall()]
 
 @async_wrap
 def atomic_claim_for_delivery(order_id: str) -> bool:
-    """Secara atomik mengklaim order untuk pengiriman guna mencegah race condition Webhook."""
+    """Secara atomik mengklaim order untuk pengiriman guna mencegah race condition."""
     with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute(
-                """UPDATE orders SET sent_link='pending'
-                   WHERE order_id=%s AND (sent_link IS NULL OR sent_link='')""",
+                """UPDATE orders
+                   SET sent_link='pending', delivery_status='pending', delivery_error=NULL
+                   WHERE order_id=%s
+                   AND (
+                        delivery_status IS NULL
+                        OR delivery_status IN ('not_sent', 'failed', 'held')
+                        OR sent_link IS NULL
+                        OR sent_link=''
+                   )""",
                 (order_id,)
             )
             return c.rowcount > 0
@@ -1265,19 +1377,96 @@ async def is_maintenance() -> bool:
 def _format_order_notif(judul: str, user_name: str, user_id: int,
                          paket: dict, order_id: str,
                          amount: int = None, extra: str = None) -> str:
+    """Format order status admin yang lebih terstruktur dan buyer clickable."""
+    status_label = _infer_order_status_label(judul)
     lines = [
         judul,
-        "========================",
-        f"👤 Pembeli  : {esc(user_name)} (<code>{user_id}</code>)",
-        f"📦 Paket    : {esc(paket.get('emoji','📦'))} {esc(paket.get('nama','?'))}",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+        "👤 <b>Buyer</b>",
+        f"Nama : {tg_user_link(user_id, user_name)}",
+        f"ID   : <code>{esc(user_id)}</code>",
+        "",
+        "📦 <b>Produk</b>",
+        f"Paket : {esc(paket.get('emoji','📦'))} {esc(paket.get('nama','?'))}",
     ]
     if amount is not None:
-        lines.append(f"💰 Total    : {format_harga(amount)}")
-    lines.append(f"📝 Order ID : <code>{esc(order_id)}</code>")
-    lines.append(f"🕒 Waktu    : {now_wib().strftime('%H:%M, %d/%m/%Y')}")
+        lines.append(f"Total : {format_harga(amount)}")
+    lines.extend([
+        "",
+        "📌 <b>Status Order</b>",
+        f"Status : {status_label}",
+    ])
     if extra:
-        lines.append(f"\nℹ️ {extra}")
+        lines.extend(["", str(extra)])
+    lines.extend([
+        "",
+        "🕒 <b>Waktu</b>",
+        now_wib().strftime('%H:%M, %d/%m/%Y'),
+        "",
+        "🔖 <b>Order ID</b>",
+        f"<code>{esc(order_id)}</code>",
+    ])
     return "\n".join(lines)
+
+async def build_order_detail_text(order: dict, paket: dict) -> str:
+    STATUS_LABEL = {
+        'completed': '✅ Completed', 'waiting': '⏳ Waiting',
+        'pending': '🔄 Pending Manual', 'cancelled': '❌ Cancelled',
+        'expired': '⏰ Expired', 'rejected': '🚫 Rejected',
+    }
+    DELIVERY_LABEL = {
+        'sent': '✅ Sudah dikirim',
+        'held': '⏸️ Link ditahan',
+        'failed': '⚠️ Gagal dikirim',
+        'pending': '⏳ Sedang diproses',
+        'not_sent': '—',
+        None: '—',
+    }
+    amount = order.get('harga_dibayar') or paket.get('harga', 0)
+    text = (
+        f"<b>🧾 ORDER STATUS</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"👤 <b>Buyer</b>\n"
+        f"Nama : {tg_user_link(order.get('user_id'), order.get('user_name', '-'))}\n"
+        f"ID   : <code>{esc(order.get('user_id', '-'))}</code>\n\n"
+        f"📦 <b>Produk</b>\n"
+        f"Paket : {esc(paket.get('emoji','📦'))} {esc(paket.get('nama','Produk'))}\n"
+        f"Total : {format_harga(amount)}\n\n"
+        f"📌 <b>Status Order</b>\n"
+        f"Status : {STATUS_LABEL.get(order.get('status'), order.get('status', '-'))}\n"
+        f"Link   : {DELIVERY_LABEL.get(order.get('delivery_status'), order.get('delivery_status') or '—')}\n"
+    )
+
+    requires_str = paket.get('requires_paket_ids') or ''
+    if requires_str:
+        progress = await _build_prereq_progress(order.get('user_id'), requires_str, parent_order_id=order.get('order_id'))
+        if progress['missing']:
+            akses_status = '⏸️ Link ditahan'
+            alasan = 'Syarat belum terpenuhi'
+        else:
+            akses_status = '✅ Syarat terpenuhi'
+            alasan = 'Semua syarat akses sudah lengkap'
+        text += (
+            f"\n🔐 <b>Akses Produk</b>\n"
+            f"Status : {akses_status}\n"
+            f"Alasan : {alasan}\n\n"
+            f"📋 <b>Progress Syarat</b>\n"
+            f"Progress : {progress['fulfilled_count']}/{progress['total_count']} terpenuhi\n\n"
+            f"{progress['text']}\n"
+        )
+
+    sent_link = order.get('sent_link')
+    if sent_link and sent_link != 'pending':
+        text += f"\n🔗 <b>Link Terkirim</b>\n{esc(sent_link)}\n"
+
+    text += (
+        f"\n🕒 <b>Waktu</b>\n"
+        f"{esc(order.get('waktu', '-'))}\n\n"
+        f"🔖 <b>Order ID</b>\n"
+        f"<code>{esc(order.get('order_id', '-'))}</code>"
+    )
+    return text
 
 async def kirim_notif(bot, text: str, reply_markup=None):
     channel_id = await get_setting('notif_channel_id')
@@ -1486,16 +1675,6 @@ async def pakasir_webhook_handler(request: aio_web.Request) -> aio_web.Response:
     if order['status'] != 'waiting':
         return aio_web.Response(text='already processed')
 
-    try:
-        verified_detail = await get_transaction_detail(order_id, amount)
-    except Exception as e:
-        logger.error(f"[WEBHOOK] Error verifikasi transaksi: {e}")
-        return aio_web.Response(status=502, text='verification service error')
-    
-    if not verified_detail or verified_detail.get('status') != 'completed':
-        logger.warning(f"[SECURITY ALERT] Percobaan webhook palsu diblokir! Order ID: {order_id}")
-        return aio_web.Response(status=400, text='verification failed')
-
     paket_id = order['paket_id']
     user_id = order['user_id']
     user_name = order.get('user_name', 'User')
@@ -1504,16 +1683,38 @@ async def pakasir_webhook_handler(request: aio_web.Request) -> aio_web.Response:
     if not paket:
         return aio_web.Response(status=404, text='product not found')
 
-    await _stop_payment_task(user_id)
-
-    if _current_bot:
-        # Menangani pemrosesan lunas di background task asinkron yang aman
-        asyncio.create_task(
-            _handle_payment_success(
-                _current_bot, order_id, paket_id, user_id, user_name,
-                paket['harga'], {'amount': amount, 'status': 'completed'}
-            )
+    incoming_amount = _safe_int(amount, -1)
+    expected_amount = _safe_int(order.get('harga_dibayar'), 0) or _safe_int(paket.get('harga'), 0)
+    if incoming_amount != expected_amount:
+        logger.warning(
+            f"[SECURITY ALERT] Amount webhook mismatch order={order_id} incoming={incoming_amount} expected={expected_amount}"
         )
+        return aio_web.Response(status=400, text='amount mismatch')
+
+    try:
+        verified_detail = await get_transaction_detail(order_id, incoming_amount)
+    except Exception as e:
+        logger.error(f"[WEBHOOK] Error verifikasi transaksi: {e}")
+        return aio_web.Response(status=502, text='verification service error')
+
+    verified_amount = _safe_int((verified_detail or {}).get('amount'), incoming_amount)
+    if (
+        not verified_detail
+        or verified_detail.get('status') != 'completed'
+        or verified_amount != expected_amount
+    ):
+        logger.warning(f"[SECURITY ALERT] Percobaan webhook palsu diblokir! Order ID: {order_id}")
+        return aio_web.Response(status=400, text='verification failed')
+
+    if not _current_bot:
+        logger.error(f"[WEBHOOK] Bot belum siap saat webhook masuk: {order_id}")
+        return aio_web.Response(status=503, text='bot not ready')
+
+    await _stop_payment_task(user_id)
+    await _handle_payment_success(
+        _current_bot, order_id, paket_id, user_id, user_name,
+        expected_amount, {'amount': expected_amount, 'status': 'completed'}
+    )
 
     logger.info(f"[WEBHOOK] ✅ Webhook berhasil diverifikasi & diproses: {order_id}")
     return aio_web.Response(text='ok')
@@ -1554,56 +1755,80 @@ def _dashboard_html_path():
             return os.path.join(base, fname)
     return None
 
-def _api_auth(request: aio_web.Request) -> bool:
-    """Verifikasi token otentikasi API Dashboard secara aman dengan rate limiting."""
+def _allowed_cors_origin(request: aio_web.Request = None) -> str:
+    """Batasi CORS ke DASHBOARD_URL jika diset; fallback '*' untuk dev lokal."""
+    if not DASHBOARD_URL:
+        return '*'
+    allowed = {DASHBOARD_URL.rstrip('/')}
+    origin = request.headers.get('Origin') if request else None
+    if origin and origin.rstrip('/') in allowed:
+        return origin
+    return DASHBOARD_URL.rstrip('/')
+
+def _cors_headers(request: aio_web.Request = None) -> dict:
+    return {
+        'Access-Control-Allow-Origin': _allowed_cors_origin(request),
+        'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+        'Access-Control-Allow-Headers': 'Authorization, Content-Type',
+        'Vary': 'Origin',
+    }
+
+async def _api_auth(request: aio_web.Request) -> bool:
+    """Verifikasi API dashboard + pastikan Telegram WebApp user adalah admin."""
     client_id = request.remote or 'unknown'
     if not _check_rate_limit(client_id):
         logger.warning(f"[RATE LIMIT] Client {client_id} melebihi batas request")
         return False
-    
-    # Jika DASHBOARD_API_KEY tidak diset, tolak semua akses API
+
     if not DASHBOARD_API_KEY:
         return False
-    
+
     auth = request.headers.get('Authorization', '')
-    if auth.startswith('Bearer ') and auth[7:] == DASHBOARD_API_KEY:
-        return True
+    if auth.startswith('Bearer '):
+        return hmac.compare_digest(auth[7:], DASHBOARD_API_KEY)
+
     if auth.startswith('tma '):
         init_data_raw = auth[4:]
-        return verify_telegram_webapp_signature(init_data_raw, TOKEN)
+        if not verify_telegram_webapp_signature(init_data_raw, TOKEN):
+            return False
+        try:
+            parsed = dict(urllib.parse.parse_qsl(init_data_raw))
+            user_payload = json.loads(parsed.get('user', '{}'))
+            user_id = int(user_payload.get('id', 0))
+        except Exception as e:
+            logger.warning(f"[API AUTH] initData valid tapi user payload tidak valid: {e}")
+            return False
+        return await is_admin(user_id)
+
     return False
 
-def _json_resp(data, status=200):
+def _json_resp(data, status=200, request: aio_web.Request = None):
     return aio_web.Response(
         status=status,
         content_type='application/json',
-        headers={'Access-Control-Allow-Origin': '*'},
+        headers=_cors_headers(request),
         text=json.dumps(data, default=str)
     )
 
-def _err(msg, status=400):
-    return _json_resp({'error': msg}, status)
+def _err(msg, status=400, request: aio_web.Request = None):
+    return _json_resp({'error': msg}, status, request=request)
 
 async def _cors_handler(request: aio_web.Request) -> aio_web.Response:
-    return aio_web.Response(headers={
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-        'Access-Control-Allow-Headers': 'Authorization, Content-Type',
-    })
+    return aio_web.Response(headers=_cors_headers(request))
 
 @aio_web.middleware
 async def _api_error_middleware(request: aio_web.Request, handler):
     try:
         resp = await handler(request)
-        resp.headers.setdefault('Access-Control-Allow-Origin', '*')
+        resp.headers.update(_cors_headers(request))
         return resp
     except Exception as e:
         logger.error(f"[API ERROR] {request.method} {request.path}: {e}", exc_info=True)
         return aio_web.Response(
             status=500,
             content_type='application/json',
-            headers={'Access-Control-Allow-Origin': '*'},
-            text=json.dumps({'error': str(e)})
+            headers=_cors_headers(request),
+            text=json.dumps({'error': 'Internal server error'})
         )
 
 async def api_serve_dashboard(request: aio_web.Request) -> aio_web.Response:
@@ -1614,16 +1839,50 @@ async def api_serve_dashboard(request: aio_web.Request) -> aio_web.Response:
         content = f.read()
     return aio_web.Response(content_type='text/html', text=content)
 
+
+def _validate_product_payload(data: dict, partial: bool = False):
+    errors = []
+    nama = str(data.get('nama', '')).strip()
+    if not partial and not nama:
+        errors.append('nama wajib diisi')
+
+    if 'harga' in data or not partial:
+        try:
+            harga = int(data.get('harga', 0))
+            if harga <= 0:
+                errors.append('harga harus lebih dari 0')
+        except (TypeError, ValueError):
+            errors.append('harga harus angka')
+
+    paket_id = str(data.get('paket_id') or make_paket_id(nama)).strip()
+    if not partial and not re.match(r'^[a-z0-9_]{1,40}$', paket_id):
+        errors.append('paket_id hanya boleh huruf kecil, angka, underscore, maksimal 40 karakter')
+
+    for key in ('link',):
+        val = data.get(key)
+        if val and not (str(val).startswith('http://') or str(val).startswith('https://') or str(val).startswith('tg://')):
+            errors.append(f'{key} harus berupa URL valid')
+
+    if data.get('requires_paket_ids'):
+        ids = _split_required_ids(data.get('requires_paket_ids'))
+        if any(not re.match(r'^[a-z0-9_]{1,40}$', pid) for pid in ids):
+            errors.append('requires_paket_ids berisi paket_id tidak valid')
+
+    return errors
+
 async def api_get_products(request: aio_web.Request) -> aio_web.Response:
-    if not _api_auth(request): return _err('Unauthorized', 401)
+    if not await _api_auth(request): return _err('Unauthorized', 401)
     return _json_resp(await get_all_products())
 
 async def api_post_product(request: aio_web.Request) -> aio_web.Response:
-    if not _api_auth(request): return _err('Unauthorized', 401)
+    if not await _api_auth(request): return _err('Unauthorized', 401)
     try:
         data = await request.json()
     except Exception:
         return _err('Invalid JSON')
+    errors = _validate_product_payload(data, partial=False)
+    if errors:
+        return _err('; '.join(errors))
     paket_id = data.get('paket_id') or make_paket_id(data.get('nama', ''))
     await add_product(
         paket_id=paket_id, nama=data.get('nama', ''), emoji=data.get('emoji', '📦'),
@@ -1635,12 +1894,15 @@ async def api_post_product(request: aio_web.Request) -> aio_web.Response:
     return _json_resp({'ok': True, 'paket_id': paket_id})
 
 async def api_put_product(request: aio_web.Request) -> aio_web.Response:
-    if not _api_auth(request): return _err('Unauthorized', 401)
+    if not await _api_auth(request): return _err('Unauthorized', 401)
     paket_id = request.match_info['paket_id']
     try:
         data = await request.json()
     except Exception:
         return _err('Invalid JSON')
+    errors = _validate_product_payload(data, partial=True)
+    if errors:
+        return _err('; '.join(errors))
     allowed = {'nama', 'emoji', 'deskripsi', 'harga', 'link', 'group_chat_id', 'aktif', 'requires_paket_ids'}
     for field, value in data.items():
         if field in allowed:
@@ -1650,7 +1912,7 @@ async def api_put_product(request: aio_web.Request) -> aio_web.Response:
     return _json_resp({'ok': True})
 
 async def api_delete_product(request: aio_web.Request) -> aio_web.Response:
-    if not _api_auth(request): return _err('Unauthorized', 401)
+    if not await _api_auth(request): return _err('Unauthorized', 401)
     await delete_product(request.match_info['paket_id'])
     return _json_resp({'ok': True})
 
@@ -1667,43 +1929,37 @@ def _get_all_orders_api():
             return [dict(r) for r in c.fetchall()]
 
 async def api_get_orders(request: aio_web.Request) -> aio_web.Response:
-    if not _api_auth(request): return _err('Unauthorized', 401)
+    if not await _api_auth(request): return _err('Unauthorized', 401)
     return _json_resp(await _get_all_orders_api())
 
 async def api_confirm_order(request: aio_web.Request) -> aio_web.Response:
-    if not _api_auth(request): return _err('Unauthorized', 401)
+    if not await _api_auth(request): return _err('Unauthorized', 401)
     order_id = request.match_info['order_id']
     order = await get_order_by_id(order_id)
     if not order:
         return _err('Order tidak ditemukan', 404)
     if order['status'] != 'waiting':
         return _err(f"Status order: {order['status']}, bukan waiting")
+    if not _current_bot:
+        return _err('Bot tidak tersedia', 503)
+
     ok = await mark_order_completed(order_id)
     if not ok:
         return _err('Gagal konfirmasi, mungkin sudah diproses')
-    paket = await get_product(order['paket_id']) or {'emoji': '📦', 'nama': order['paket_id'], 'harga': 0, 'link': DEFAULT_LINK}
-    link = paket.get('link') or DEFAULT_LINK
-    await set_sent_link(order_id, link)
-    if _current_bot:
-        try:
-            await _current_bot.send_message(
-                chat_id=order['user_id'],
-                text=(
-                    f"<b>✅ PEMBAYARAN DIKONFIRMASI ADMIN</b>\n"
-                    f"========================\n\n"
-                    f"📦 Paket: {esc(paket['emoji'])} {esc(paket['nama'])}\n"
-                    f"📝 Order ID: <code>{esc(order_id)}</code>\n\n"
-                    f"🔗 <b>Link Akses:</b>\n{link}\n\n"
-                    f"Terima kasih telah berbelanja! 🙏"
-                ),
-                parse_mode='HTML'
-            )
-        except Exception as e:
-            logger.error(f"[API CONFIRM] Gagal kirim notif ke buyer: {e}")
-    return _json_resp({'ok': True})
+
+    await _process_completed_order_delivery(
+        _current_bot,
+        order_id=order_id,
+        paket_id=order['paket_id'],
+        user_id=order['user_id'],
+        user_name=order.get('user_name', 'User'),
+        paid_amount=order.get('harga_dibayar') or 0,
+        source_title="✅ <b>DIKONFIRMASI ADMIN DASHBOARD</b>"
+    )
+    return _json_resp({'ok': True, 'delivery_status': 'processed'})
 
 async def api_cancel_order(request: aio_web.Request) -> aio_web.Response:
-    if not _api_auth(request): return _err('Unauthorized', 401)
+    if not await _api_auth(request): return _err('Unauthorized', 401)
     order_id = request.match_info['order_id']
     order = await get_order_by_id(order_id)
     if not order:
@@ -1736,11 +1992,11 @@ def _get_all_testimonials_api():
             return [dict(r) for r in c.fetchall()]
 
 async def api_get_testimonials(request: aio_web.Request) -> aio_web.Response:
-    if not _api_auth(request): return _err('Unauthorized', 401)
+    if not await _api_auth(request): return _err('Unauthorized', 401)
     return _json_resp(await _get_all_testimonials_api())
 
 async def api_testimonial_action(request: aio_web.Request) -> aio_web.Response:
-    if not _api_auth(request): return _err('Unauthorized', 401)
+    if not await _api_auth(request): return _err('Unauthorized', 401)
     order_id = request.match_info['order_id']
     try:
         data = await request.json()
@@ -1774,11 +2030,11 @@ async def api_testimonial_action(request: aio_web.Request) -> aio_web.Response:
     return _json_resp({'ok': True})
 
 async def api_get_banned(request: aio_web.Request) -> aio_web.Response:
-    if not _api_auth(request): return _err('Unauthorized', 401)
+    if not await _api_auth(request): return _err('Unauthorized', 401)
     return _json_resp(await get_all_banned())
 
 async def api_post_ban(request: aio_web.Request) -> aio_web.Response:
-    if not _api_auth(request): return _err('Unauthorized', 401)
+    if not await _api_auth(request): return _err('Unauthorized', 401)
     try:
         data = await request.json()
     except Exception:
@@ -1790,16 +2046,16 @@ async def api_post_ban(request: aio_web.Request) -> aio_web.Response:
     return _json_resp({'ok': True})
 
 async def api_delete_ban(request: aio_web.Request) -> aio_web.Response:
-    if not _api_auth(request): return _err('Unauthorized', 401)
+    if not await _api_auth(request): return _err('Unauthorized', 401)
     await unban_user(int(request.match_info['user_id']))
     return _json_resp({'ok': True})
 
 async def api_get_admins(request: aio_web.Request) -> aio_web.Response:
-    if not _api_auth(request): return _err('Unauthorized', 401)
+    if not await _api_auth(request): return _err('Unauthorized', 401)
     return _json_resp(await get_all_admins())
 
 async def api_post_admin(request: aio_web.Request) -> aio_web.Response:
-    if not _api_auth(request): return _err('Unauthorized', 401)
+    if not await _api_auth(request): return _err('Unauthorized', 401)
     try:
         data = await request.json()
     except Exception:
@@ -1811,12 +2067,12 @@ async def api_post_admin(request: aio_web.Request) -> aio_web.Response:
     return _json_resp({'ok': True})
 
 async def api_delete_admin(request: aio_web.Request) -> aio_web.Response:
-    if not _api_auth(request): return _err('Unauthorized', 401)
+    if not await _api_auth(request): return _err('Unauthorized', 401)
     await remove_admin(int(request.match_info['user_id']))
     return _json_resp({'ok': True})
 
 async def api_get_stats(request: aio_web.Request) -> aio_web.Response:
-    if not _api_auth(request): return _err('Unauthorized', 401)
+    if not await _api_auth(request): return _err('Unauthorized', 401)
     today = now_wib().replace(hour=0, minute=0, second=0, microsecond=0)
     month = today.replace(day=1)
     stats = await get_order_stats(today, month)
@@ -1834,11 +2090,11 @@ async def api_get_stats(request: aio_web.Request) -> aio_web.Response:
     return _json_resp(stats)
 
 async def api_get_groups(request: aio_web.Request) -> aio_web.Response:
-    if not _api_auth(request): return _err('Unauthorized', 401)
+    if not await _api_auth(request): return _err('Unauthorized', 401)
     return _json_resp(await get_managed_groups())
 
 async def api_kick_check(request: aio_web.Request) -> aio_web.Response:
-    if not _api_auth(request): return _err('Unauthorized', 401)
+    if not await _api_auth(request): return _err('Unauthorized', 401)
     user_id = int(request.match_info['user_id'])
     groups = await get_managed_groups()
     results = []
@@ -1856,7 +2112,7 @@ async def api_kick_check(request: aio_web.Request) -> aio_web.Response:
     return _json_resp({'groups': results})
 
 async def api_kick_execute(request: aio_web.Request) -> aio_web.Response:
-    if not _api_auth(request): return _err('Unauthorized', 401)
+    if not await _api_auth(request): return _err('Unauthorized', 401)
     try:
         data = await request.json()
     except Exception:
@@ -1875,7 +2131,7 @@ async def api_kick_execute(request: aio_web.Request) -> aio_web.Response:
         return _err(f'Gagal kick: {str(e)}')
 
 async def api_broadcast(request: aio_web.Request) -> aio_web.Response:
-    if not _api_auth(request): return _err('Unauthorized', 401)
+    if not await _api_auth(request): return _err('Unauthorized', 401)
     try:
         data = await request.json()
     except Exception:
@@ -1899,7 +2155,7 @@ async def api_broadcast(request: aio_web.Request) -> aio_web.Response:
     return _json_resp({'ok': True, 'sent': sent, 'failed': failed, 'total': len(buyers)})
 
 async def api_post_settings(request: aio_web.Request) -> aio_web.Response:
-    if not _api_auth(request): return _err('Unauthorized', 401)
+    if not await _api_auth(request): return _err('Unauthorized', 401)
     try:
         data = await request.json()
     except Exception:
@@ -1929,14 +2185,15 @@ def _get_backup_data():
                 'banned': banned, 'settings': settings}
 
 async def api_backup(request: aio_web.Request) -> aio_web.Response:
-    if not _api_auth(request): return _err('Unauthorized', 401)
+    if not await _api_auth(request): return _err('Unauthorized', 401)
     data = await _get_backup_data()
     filename = f"backup_{now_wib().strftime('%Y%m%d_%H%M')}.json"
     return aio_web.Response(
         status=200,
         content_type='application/json',
         headers={
-            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Origin': _allowed_cors_origin(request),
+            'Vary': 'Origin',
             'Content-Disposition': f'attachment; filename="{filename}"',
         },
         text=json.dumps(data, default=str)
@@ -2126,25 +2383,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             success = await mark_order_completed(active["order_id"])
             if success:
                 await _stop_payment_task(user_id)
-                await hapus_qris_buyer_lama(context.bot, active["order_id"], user_id)
                 paid_amount = trans.get("amount", paket["harga"])
-                link = await kirim_link_ke_buyer(context, user_id, paket, active["order_id"], paid_amount)
-                await set_sent_link(active['order_id'], link)
-                await hapus_notif_lama(context.bot, active['order_id'])
-                msg_id = await kirim_notif(
+                await _process_completed_order_delivery(
                     context.bot,
-                    f"... [DIAPRESIASI BUYER] ...\n"
-                    f"✅ <b>ORDER BERHASIL</b>\n"
-                    f"========================\n\n"
-                    f"👤 Pembeli: {esc(active.get('user_name', 'User'))} (<code>{user_id}</code>)\n"
-                    f"📦 Paket: {esc(paket['emoji'])} {esc(paket['nama'])}\n"
-                    f"📝 Order ID: <code>{esc(active['order_id'])}</code>\n"
-                    f"💰 Total: {format_harga(paid_amount)}\n"
-                    f"🕒 Lunas: {now_wib().strftime('%H:%M, %d %b %Y')}\n\n"
-                    f"✅ Link terkirim ke buyer"
+                    order_id=active["order_id"],
+                    paket_id=active["paket_id"],
+                    user_id=user_id,
+                    user_name=active.get('user_name', update.effective_user.full_name),
+                    paid_amount=paid_amount,
+                    source_title="✅ <b>ORDER BERHASIL</b>"
                 )
-                if msg_id:
-                    await set_admin_msg_id(active['order_id'], msg_id)
             return
 
         total = (trans.get("amount", paket["harga"]) + trans.get("fee", 0)) if trans else (active.get("harga_dibayar") or paket["harga"])
@@ -2230,17 +2478,18 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     products = await get_all_products()
     aktif = [p for p in products if p.get('aktif', True)]
-
-    text = (
-        "🛍️ <b>PILIH PAKET</b>\n\n"
-        "Ketuk paket di bawah untuk melihat detail lengkap."
-    )
+    text = "<b>📦 PILIH PAKET</b>\n========================\n\n"
+    for p in aktif:
+        text += (
+            f"{esc(p['emoji'])} <b>{esc(p['nama']).upper()}</b>\n"
+            f"- {esc(p['deskripsi'])}\n"
+            f"- Harga: {format_harga(p['harga'])}\n"
+            f"- Status: Tersedia ✅\n\n"
+        )
+    text += "========================"
 
     keyboard = [
-        [InlineKeyboardButton(
-            f"{p['emoji']}  {p['nama'].upper()}  ·  {format_harga(p['harga'])}",
-            callback_data=f"pilih_{p['paket_id']}"
-        )]
+        [InlineKeyboardButton(f"{p['emoji']} {p['nama']} - {format_harga(p['harga'])}", callback_data=f"pilih_{p['paket_id']}")]
         for p in aktif
     ]
     keyboard.append([InlineKeyboardButton("⬅️ Kembali", callback_data="back_to_menu")])
@@ -2272,77 +2521,7 @@ async def pilih_paket(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total = (trans.get("amount", paket_active["harga"]) + trans.get("fee", 0)) if trans else (active.get("harga_dibayar") or paket_active["harga"])
         caption = (
             f"<b>⏳ ORDER AKTIF</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📦 Paket: {esc(paket_active['emoji'])} {esc(paket_active['nama'])}\n"
-            f"💰 Total: {format_harga(total)}\n"
-            f"📝 Order ID: <code>{esc(active['order_id'])}</code>\n\n"
-            f"⚠️ Selesaikan pembayaran atau batalkan dulu."
-        )
-        keyboard = [[InlineKeyboardButton("❌ Batalkan Order", callback_data="cancel_order")]]
-        await query.edit_message_text(caption, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
-        return
-
-    sisa = await get_cooldown_sisa_db(user_id)
-    if sisa > 0:
-        await query.answer(
-            f"⏳ Kamu baru saja membatalkan order. Coba lagi dalam {sisa} menit.",
-            show_alert=True
-        )
-        return
-
-    await query.answer()
-
-    # Tampilkan kartu detail produk — beli hanya setelah konfirmasi
-    req_ids = paket.get("requires_paket_ids") or []
-    prereq_note = ""
-    if req_ids:
-        prereq_note = "\n\n⚠️ <i>Paket ini memerlukan paket prasyarat terlebih dahulu.</i>"
-
-    detail_text = (
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{esc(paket['emoji'])}  <b>{esc(paket['nama']).upper()}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📋 {esc(paket['deskripsi'])}\n\n"
-        f"💰 Harga: <b>{format_harga(paket['harga'])}</b>\n"
-        f"✅ Status: Tersedia"
-        f"{prereq_note}"
-    )
-    keyboard = [
-        [InlineKeyboardButton(
-            f"🛒 Beli Sekarang  —  {format_harga(paket['harga'])}",
-            callback_data=f"konfirm_beli_{paket['paket_id']}"
-        )],
-        [InlineKeyboardButton("⬅️ Kembali ke Pilihan Paket", callback_data="buy")],
-    ]
-    await query.edit_message_text(detail_text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
-
-async def konfirm_beli(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user_id = query.from_user.id
-    user_name = query.from_user.full_name
-
-    if await is_banned(user_id):
-        await query.answer("🚫 Akun kamu diblokir. Hubungi admin.", show_alert=True)
-        return
-
-    paket_id = query.data.replace("konfirm_beli_", "")
-    paket = await get_product(paket_id)
-    if not paket:
-        await query.answer("❌ Produk tidak ditemukan.", show_alert=True)
-        return
-
-    active = await get_active_order(user_id)
-    if active:
-        paket_active = await get_product(active["paket_id"]) or {"emoji": "📦", "nama": "Produk", "harga": 0}
-        trans = await get_transaction_detail(active["order_id"], active.get("harga_dibayar") or paket_active["harga"])
-        if trans and trans.get("status") == "completed":
-            await query.answer("✅ Pembayaran sudah diterima!", show_alert=True)
-            return
-        await query.answer("⏳ Kamu sudah punya invoice aktif!", show_alert=True)
-        total = (trans.get("amount", paket_active["harga"]) + trans.get("fee", 0)) if trans else (active.get("harga_dibayar") or paket_active["harga"])
-        caption = (
-            f"<b>⏳ ORDER AKTIF</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"========================\n\n"
             f"📦 Paket: {esc(paket_active['emoji'])} {esc(paket_active['nama'])}\n"
             f"💰 Total: {format_harga(total)}\n"
             f"📝 Order ID: <code>{esc(active['order_id'])}</code>\n\n"
@@ -2900,6 +3079,7 @@ async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
         await update_order_status(order_id, 'expired')
         await hapus_qris_buyer_lama(bot, order_id, user_id)
         await set_cooldown_db(user_id)
+        cooldown_sisa = await get_cooldown_sisa_db(user_id)
 
         try:
             await bot.send_message(
@@ -2909,7 +3089,7 @@ async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
                     "========================\n\n"
                     "Pesanan telah dibatalkan otomatis.\n\n"
                     f"Alasan: Pembayaran tidak diterima dalam waktu yang ditentukan.\n\n"
-                    f"⏳ Kamu bisa membuat pesanan baru dalam <b>{COOLDOWN_MENIT} menit</b>.\n\n"
+                    f"⏳ Kamu bisa membuat pesanan baru dalam <b>{cooldown_sisa} menit</b>.\n\n"
                     "Ketik /start untuk membuat pesanan baru."
                 ),
                 parse_mode="HTML"
@@ -2934,8 +3114,267 @@ async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
     except asyncio.CancelledError:
         pass
     finally:
+        current_task = asyncio.current_task()
         async with _payment_tasks_lock:
-            _payment_tasks.pop(user_id, None)
+            if _payment_tasks.get(user_id) is current_task:
+                _payment_tasks.pop(user_id, None)
+
+def _split_required_ids(requires_str: str) -> list:
+    return [pid.strip() for pid in (requires_str or '').split(',') if pid.strip()]
+
+async def _build_prereq_progress(user_id: int, requires_str: str, parent_order_id: str = None) -> dict:
+    all_req_ids = _split_required_ids(requires_str)
+    missing = await check_prerequisites_sync(user_id, requires_str)
+    missing_set = set(missing)
+
+    lines = []
+    buttons = []
+    for pid in all_req_ids:
+        p_obj = await get_product(pid)
+        label = f"{p_obj['emoji']} {p_obj['nama']}" if p_obj else pid
+        if pid in missing_set:
+            lines.append(f"❌ {esc(label)}")
+            if parent_order_id:
+                buttons.append([InlineKeyboardButton(
+                    f"🛒 Beli {p_obj['nama'] if p_obj else pid}",
+                    callback_data=f"prereq_buy_{pid}|{parent_order_id}"
+                )])
+        else:
+            lines.append(f"✅ {esc(label)}")
+
+    return {
+        'all_ids': all_req_ids,
+        'missing': missing,
+        'missing_set': missing_set,
+        'fulfilled_count': len(all_req_ids) - len(missing_set),
+        'total_count': len(all_req_ids),
+        'lines': lines,
+        'text': "\n".join(lines),
+        'buttons': buttons,
+    }
+
+async def _send_delivery_failed_alert(bot, order_id: str, user_id: int, user_name: str, paket: dict, error: Exception):
+    await reset_delivery_claim(order_id, str(error)[:500])
+    try:
+        await bot.send_message(
+            chat_id=ADMIN_ID,
+            text=(
+                "🚨 <b>ALERT: GAGAL KIRIM LINK</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"👤 Buyer : {tg_user_link(user_id, user_name)}\n"
+                f"ID      : <code>{esc(user_id)}</code>\n"
+                f"📦 Paket : {esc(paket.get('emoji','📦'))} {esc(paket.get('nama','Produk'))}\n"
+                f"🔖 Order : <code>{esc(order_id)}</code>\n\n"
+                "Order sudah lunas, tapi bot gagal mengirim link. Kirim manual secepatnya."
+            ),
+            parse_mode="HTML"
+        )
+    except Exception as ex:
+        logger.error(f"Gagal kirim emergency alert ke admin: {ex}")
+
+async def _send_buyer_product_link(bot, user_id: int, order_id: str, paket: dict, paid_amount: int, title: str) -> tuple:
+    group_link = await generate_group_link(bot, paket, order_id)
+    link = group_link or (paket.get("link") or DEFAULT_LINK)
+    link_section = _build_link_section(group_link, link)
+
+    await bot.send_message(
+        chat_id=user_id,
+        text=(
+            f"{title}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📦 <b>Produk</b>\n"
+            f"Paket : {esc(paket.get('emoji','📦'))} {esc(paket.get('nama','Produk'))}\n"
+            f"Total : {format_harga(paid_amount)}\n\n"
+            f"🔖 <b>Order ID</b>\n"
+            f"<code>{esc(order_id)}</code>\n\n"
+            f"{link_section}\n\n"
+            f"Terima kasih telah berbelanja! 🙏\n\n"
+            f"Bantu kami berkembang dengan memberikan ulasan di bawah ini:"
+        ),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⭐ Beri Ulasan / Testimoni", callback_data=f"rate_start|{order_id}")]
+        ])
+    )
+    return link, bool(group_link)
+
+async def _send_prereq_hold_message(bot, user_id: int, order_id: str, paket: dict, paid_amount: int, progress: dict):
+    await mark_delivery_held(order_id, 'Syarat belum terpenuhi')
+    product_name = f"{paket.get('emoji','📦')} {paket.get('nama','Produk')}"
+    await bot.send_message(
+        chat_id=user_id,
+        text=(
+            f"✅ <b>ORDER BERHASIL</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📦 <b>Produk</b>\n"
+            f"Paket : {esc(product_name)}\n"
+            f"Total : {format_harga(paid_amount)}\n\n"
+            f"🔐 <b>Akses Produk</b>\n"
+            f"Status : ⏸️ Link {esc(paket.get('nama','Produk'))} ditahan sementara\n"
+            f"Alasan : Kamu belum memenuhi semua syarat akses\n\n"
+            f"📋 <b>Progress Syarat {esc(paket.get('nama','Produk'))}</b>\n"
+            f"Progress : {progress['fulfilled_count']}/{progress['total_count']} terpenuhi\n\n"
+            f"{progress['text']}\n\n"
+            f"Silakan lengkapi produk yang masih bertanda ❌.\n"
+            f"Setelah semua syarat terpenuhi, link {esc(paket.get('nama','Produk'))} akan otomatis dikirim.\n\n"
+            f"🔖 <b>Order ID</b>\n"
+            f"<code>{esc(order_id)}</code>"
+        ),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(progress['buttons']) if progress['buttons'] else None
+    )
+
+async def _notify_parent_prereq_progress(bot, user_id: int, user_name: str, parent_order: dict,
+                                          parent_paket: dict, progress: dict, purchased_paket_id: str):
+    if purchased_paket_id not in progress['all_ids']:
+        return
+    if progress['missing']:
+        missing_count = len(progress['missing'])
+        try:
+            await bot.send_message(
+                chat_id=user_id,
+                text=(
+                    f"📋 <b>UPDATE PROGRESS {esc(parent_paket.get('nama','Produk'))}</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"Pesanan {esc(parent_paket.get('nama','Produk'))} kamu masih menunggu syarat terpenuhi.\n\n"
+                    f"📦 <b>Produk Utama</b>\n"
+                    f"Paket : {esc(parent_paket.get('emoji','📦'))} {esc(parent_paket.get('nama','Produk'))}\n\n"
+                    f"📊 <b>Progress Saat Ini</b>\n"
+                    f"Progress : {progress['fulfilled_count']}/{progress['total_count']} terpenuhi\n\n"
+                    f"{progress['text']}\n\n"
+                    f"⏸️ Link {esc(parent_paket.get('nama','Produk'))} masih ditahan.\n"
+                    f"Silakan lengkapi {missing_count} produk lagi agar link otomatis dikirim."
+                ),
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(progress['buttons']) if progress['buttons'] else None
+            )
+        except Exception as e:
+            logger.error(f"[PREREQ PROGRESS] Gagal kirim progress parent ke buyer {user_id}: {e}")
+
+        extra = (
+            f"📋 <b>Progress Produk Terkait</b>\n"
+            f"Produk : {esc(parent_paket.get('emoji','📦'))} {esc(parent_paket.get('nama','Produk'))}\n"
+            f"Progress : {progress['fulfilled_count']}/{progress['total_count']} terpenuhi\n\n"
+            f"{progress['text']}"
+        )
+        msg_id = await kirim_notif(
+            bot,
+            _format_order_notif(
+                "📋 <b>UPDATE PROGRESS SYARAT</b>",
+                user_name, user_id, parent_paket, parent_order['order_id'],
+                amount=parent_order.get('harga_dibayar', 0),
+                extra=extra
+            ),
+            reply_markup=InlineKeyboardMarkup(progress['buttons']) if progress['buttons'] else None
+        )
+        if msg_id:
+            await set_admin_msg_id(parent_order['order_id'], msg_id)
+        return
+
+    try:
+        await bot.send_message(
+            chat_id=user_id,
+            text=(
+                f"🎉 <b>SYARAT {esc(parent_paket.get('nama','Produk'))} SUDAH LENGKAP</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"📦 <b>Produk Utama</b>\n"
+                f"Paket : {esc(parent_paket.get('emoji','📦'))} {esc(parent_paket.get('nama','Produk'))}\n\n"
+                f"📊 <b>Progress Akhir</b>\n"
+                f"Progress : {progress['fulfilled_count']}/{progress['total_count']} terpenuhi\n\n"
+                f"{progress['text']}\n\n"
+                f"✅ Semua syarat sudah terpenuhi.\n"
+                f"Link {esc(parent_paket.get('nama','Produk'))} akan dikirim otomatis sekarang."
+            ),
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"[PREREQ PROGRESS] Gagal kirim final progress ke buyer {user_id}: {e}")
+
+async def _process_completed_order_delivery(bot, order_id: str, paket_id: str, user_id: int,
+                                            user_name: str, paid_amount: int,
+                                            source_title: str = "✅ <b>PEMBAYARAN BERHASIL</b>"):
+    await hapus_qris_buyer_lama(bot, order_id, user_id)
+    paket = await get_product(paket_id) or {
+        "emoji": "📦", "nama": "Produk", "harga": paid_amount, "link": DEFAULT_LINK,
+        "requires_paket_ids": ""
+    }
+    paid_amount = paid_amount or paket.get('harga', 0)
+
+    requires_str = paket.get("requires_paket_ids") or ""
+    if requires_str:
+        progress = await _build_prereq_progress(user_id, requires_str, parent_order_id=order_id)
+        if progress['missing']:
+            try:
+                await _send_prereq_hold_message(bot, user_id, order_id, paket, paid_amount, progress)
+            except Exception as e:
+                logger.error(f"[PAYMENT] Gagal kirim notif prereq ke buyer {user_id}: {e}")
+                await set_delivery_status(order_id, 'failed', str(e)[:500])
+
+            await hapus_notif_lama(bot, order_id)
+            extra_prereq = (
+                f"🔐 <b>Akses Produk</b>\n"
+                f"Status : ⏸️ Link ditahan\n"
+                f"Alasan : Syarat belum terpenuhi\n\n"
+                f"📋 <b>Progress Syarat</b>\n"
+                f"Progress : {progress['fulfilled_count']}/{progress['total_count']} terpenuhi\n\n"
+                f"{progress['text']}"
+            )
+            msg_id = await kirim_notif(
+                bot,
+                _format_order_notif(
+                    source_title,
+                    user_name, user_id, paket, order_id,
+                    amount=paid_amount,
+                    extra=extra_prereq
+                ),
+                reply_markup=InlineKeyboardMarkup(progress['buttons'] + [[
+                    InlineKeyboardButton("📤 Kirim Link Manual", callback_data=f"admin_kirim_link_prereq|{order_id}")
+                ]])
+            )
+            if msg_id:
+                await set_admin_msg_id(order_id, msg_id)
+            return
+
+    claimed = await atomic_claim_for_delivery(order_id)
+    if not claimed:
+        logger.info(f"[DELIVERY] Order {order_id} sudah diklaim/terkirim, skip delivery duplikat.")
+        return
+
+    kirim_berhasil = False
+    link = None
+    try:
+        link, _ = await _send_buyer_product_link(bot, user_id, order_id, paket, paid_amount, source_title)
+        kirim_berhasil = True
+    except Exception as e:
+        logger.error(f"[PAYMENT] Gagal kirim link ke buyer {user_id}: {e}")
+        await _send_delivery_failed_alert(bot, order_id, user_id, user_name, paket, e)
+
+    await hapus_notif_lama(bot, order_id)
+
+    if kirim_berhasil:
+        await set_sent_link(order_id, link)
+        extra_paid = "🔗 <b>Pengiriman Link</b>\nStatus : ✅ Sudah dikirim"
+    else:
+        extra_paid = "🔗 <b>Pengiriman Link</b>\nStatus : ⚠️ Gagal dikirim - cek manual"
+
+    msg_id = await kirim_notif(
+        bot,
+        _format_order_notif(
+            source_title,
+            user_name, user_id, paket, order_id,
+            amount=paid_amount,
+            extra=extra_paid
+        )
+    )
+    if msg_id:
+        await set_admin_msg_id(order_id, msg_id)
+
+    if kirim_berhasil:
+        await _auto_deliver_pending_prereq_orders(
+            bot, user_id, user_name,
+            purchased_paket_id=paket_id,
+            exclude_order_id=order_id
+        )
 
 async def _handle_payment_success(bot, order_id: str, paket_id: str, user_id: int,
                                    user_name: str, amount: int, trans: dict):
@@ -2945,187 +3384,58 @@ async def _handle_payment_success(bot, order_id: str, paket_id: str, user_id: in
         logger.info(f"[PAYMENT] Order ID {order_id} sudah diproses sebelumnya, membatalkan duplikasi.")
         return
 
-    await hapus_qris_buyer_lama(bot, order_id, user_id)
-
-    paket = await get_product(paket_id) or {"emoji": "📦", "nama": "Produk", "harga": amount, "link": DEFAULT_LINK}
-    paid_amount = trans.get('amount', amount)
-
-    requires_str = paket.get("requires_paket_ids") or ""
-    missing_prereqs = await check_prerequisites_sync(user_id, requires_str)
-
-    if missing_prereqs:
-        all_req_ids = [p.strip() for p in requires_str.split(",") if p.strip()]
-        missing_set = set(missing_prereqs)
-        fulfilled_count = len(all_req_ids) - len(missing_set)
-        total_count = len(all_req_ids)
-
-        prereq_lines = []
-        buy_buttons = []
-        for pid in all_req_ids:
-            p_obj = await get_product(pid)
-            label = f"{p_obj['emoji']} {p_obj['nama']}" if p_obj else pid
-            if pid in missing_set:
-                prereq_lines.append(f"  ❌ {label}")
-                buy_buttons.append([InlineKeyboardButton(
-                    f"🛒 Beli {p_obj['nama'] if p_obj else pid}",
-                    callback_data=f"prereq_buy_{pid}|{order_id}"
-                )])
-            else:
-                prereq_lines.append(f"  ✅ {label}")
-
-        prereq_status = "\n".join(prereq_lines)
-
-        try:
-            await bot.send_message(
-                chat_id=user_id,
-                text=(
-                    f"<b>✅ PEMBAYARAN BERHASIL DITERIMA</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    f"📦 Paket: {esc(paket['emoji'])} {esc(paket['nama'])}\n"
-                    f"💰 Total: {format_harga(paid_amount)}\n"
-                    f"🔖 Order ID: <code>{esc(order_id)}</code>\n\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"⏸️ <b>Link ditahan — syarat belum terpenuhi</b>\n\n"
-                    f"📋 Progress syarat <b>({fulfilled_count}/{total_count} terpenuhi)</b>:\n"
-                    f"{prereq_status}\n\n"
-                    f"Beli paket ❌ di bawah. Setelah semua syarat\n"
-                    f"terpenuhi, link akan <b>otomatis dikirim</b>. 🚀"
-                ),
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup(buy_buttons)
-            )
-        except Exception as e:
-            logger.error(f"[PAYMENT] Gagal kirim notif prereq ke buyer {user_id}: {e}")
-
-        await hapus_notif_lama(bot, order_id)
-        extra_prereq = (
-            f"⏸️ <b>LINK DITAHAN — Syarat belum terpenuhi</b>\n"
-            f"Progress ({fulfilled_count}/{total_count} terpenuhi):\n{prereq_status}\n\n"
-            f"Buyer harus beli paket ❌ di atas. Link terkirim otomatis."
-        )
-        msg_id = await kirim_notif(
-            bot,
-            _format_order_notif(
-                "✅ <b>PEMBAYARAN BERHASIL</b>",
-                user_name, user_id, paket, order_id,
-                amount=paid_amount,
-                extra=extra_prereq
-            ),
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("📤 Kirim Link VIP (Syarat Terpenuhi)", callback_data=f"admin_kirim_link_prereq|{order_id}")
-            ]])
-        )
-        if msg_id:
-            await set_admin_msg_id(order_id, msg_id)
-        return
-
-    group_link = await generate_group_link(bot, paket, order_id)
-    link = group_link or (paket.get("link") or DEFAULT_LINK)
-    link_section = _build_link_section(group_link, link)
-
-    kirim_berhasil = False
-    try:
-        await bot.send_message(
-            chat_id=user_id,
-            text=(
-                f"<b>✅ PEMBAYARAN BERHASIL</b>\n"
-                f"========================\n\n"
-                f"📦 <b>Detail Pesanan</b>\n"
-                f"- Paket: {esc(paket['emoji'])} {esc(paket['nama'])}\n"
-                f"- Order ID: <code>{esc(order_id)}</code>\n"
-                f"- Total: {format_harga(paid_amount)}\n\n"
-                f"========================\n"
-                f"{link_section}\n\n"
-                f"Terima kasih telah berbelanja! 🙏\n\n"
-                f"Bantu kami berkembang dengan memberikan ulasan di bawah ini:"
-            ),
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⭐ Beri Ulasan / Testimoni", callback_data=f"rate_start|{order_id}")]
-            ])
-        )
-        kirim_berhasil = True
-    except Exception as e:
-        logger.error(f"[PAYMENT] Gagal kirim link ke buyer {user_id}: {e}")
-
-    await set_sent_link(order_id, link)
-    await hapus_notif_lama(bot, order_id)
-
-    extra_paid = "✅ Link produk sudah terkirim ke buyer" if kirim_berhasil else "⚠️ GAGAL kirim link ke buyer - cek manual!"
-    msg_id = await kirim_notif(
-        bot,
-        _format_order_notif(
-            "✅ <b>PEMBAYARAN BERHASIL</b>",
-            user_name, user_id, paket, order_id,
-            amount=paid_amount,
-            extra=extra_paid
-        )
+    paid_amount = _safe_int(trans.get('amount', amount), amount)
+    await _process_completed_order_delivery(
+        bot, order_id, paket_id, user_id, user_name, paid_amount,
+        source_title="✅ <b>PEMBAYARAN BERHASIL</b>"
     )
-    if msg_id:
-        await set_admin_msg_id(order_id, msg_id)
-
-    if not kirim_berhasil:
-        try:
-            await bot.send_message(
-                chat_id=ADMIN_ID,
-                text=(
-                    f"🚨 <b>ALERT: GAGAL KIRIM LINK</b>\n"
-                    f"Order <code>{esc(order_id)}</code> sudah lunas tapi link tidak bisa dikirim ke buyer!\n"
-                    f"Buyer ID: <code>{user_id}</code> - kirim manual segera!"
-                ),
-                parse_mode="HTML"
-            )
-        except Exception as ex:
-            logger.error(f"Gagal kirim emergency alert ke admin: {ex}")
-
-    await _auto_deliver_pending_prereq_orders(bot, user_id, user_name)
 
 # =================== AUTO-DELIVER PENDING PREREQ ORDERS ===================
 
-async def _auto_deliver_pending_prereq_orders(bot, user_id: int, user_name: str):
+async def _auto_deliver_pending_prereq_orders(bot, user_id: int, user_name: str,
+                                              purchased_paket_id: str = None,
+                                              exclude_order_id: str = None):
     pending = await get_completed_no_link_orders(user_id)
     if not pending:
         return
+
     for order in pending:
         pid = order['paket_id']
         oid = order['order_id']
+        if exclude_order_id and oid == exclude_order_id:
+            continue
+
         paket = await get_product(pid)
         if not paket:
             continue
+
         req_str = paket.get("requires_paket_ids") or ""
         if not req_str:
             continue
-        missing = await check_prerequisites_sync(user_id, req_str)
-        if missing:
+
+        progress = await _build_prereq_progress(user_id, req_str, parent_order_id=oid)
+        if progress['missing']:
+            if purchased_paket_id:
+                await _notify_parent_prereq_progress(bot, user_id, user_name, order, paket, progress, purchased_paket_id)
             continue
+
+        if purchased_paket_id:
+            await _notify_parent_prereq_progress(bot, user_id, user_name, order, paket, progress, purchased_paket_id)
 
         claimed = await atomic_claim_for_delivery(oid)
         if not claimed:
             continue
 
-        group_link = await generate_group_link(bot, paket, oid)
-        link = group_link or (paket.get("link") or DEFAULT_LINK)
-        link_section = _build_link_section(group_link, link)
+        link = None
         try:
-            await bot.send_message(
-                chat_id=user_id,
-                text=(
-                    f"<b>🎉 SEMUA SYARAT TERPENUHI!</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    f"📦 Paket: {esc(paket['emoji'])} {esc(paket['nama'])}\n"
-                    f"🔖 Order ID: <code>{esc(oid)}</code>\n\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"{link_section}\n\n"
-                    f"Terima kasih! Nikmati paketmu. 🙏\n\n"
-                    f"Bantu kami berkembang dengan memberikan ulasan:"
-                ),
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("⭐ Beri Ulasan / Testimoni", callback_data=f"rate_start|{oid}")]
-                ])
+            link, _ = await _send_buyer_product_link(
+                bot, user_id, oid, paket,
+                order.get('harga_dibayar', 0) or paket.get('harga', 0),
+                "🔓 <b>AKSES PRODUK TERBUKA</b>"
             )
         except Exception as e:
             logger.error(f"[AUTO-PREREQ] Gagal kirim link ke buyer {user_id}: {e}")
+            await _send_delivery_failed_alert(bot, oid, user_id, user_name, paket, e)
             continue
 
         await set_sent_link(oid, link)
@@ -3133,10 +3443,10 @@ async def _auto_deliver_pending_prereq_orders(bot, user_id: int, user_name: str)
         msg_id = await kirim_notif(
             bot,
             _format_order_notif(
-                "✅ <b>LINK AUTO-TERKIRIM (Syarat Terpenuhi)</b>",
+                "✅ <b>LINK AUTO-TERKIRIM</b>",
                 user_name, user_id, paket, oid,
                 amount=order.get('harga_dibayar', 0),
-                extra="🤖 Link dikirim otomatis setelah semua syarat terpenuhi."
+                extra="🔗 <b>Pengiriman Link</b>\nStatus : ✅ Sudah dikirim otomatis karena semua syarat terpenuhi."
             )
         )
         if msg_id:
@@ -3189,7 +3499,10 @@ async def admin_kirim_link_prereq(update: Update, context: ContextTypes.DEFAULT_
     except Exception as e:
         logger.error(f"[PREREQ] Gagal kirim link manual ke buyer {user_id}: {e}")
 
-    await set_sent_link(order_id, link)
+    if kirim_berhasil:
+        await set_sent_link(order_id, link)
+    else:
+        await set_delivery_status(order_id, 'failed', 'Manual prereq delivery gagal')
 
     if kirim_berhasil:
         await query.edit_message_text(
@@ -3251,6 +3564,10 @@ async def handle_rate_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     order_id = query.data.split("|")[1]
+    order = await get_completed_order_for_user(order_id, query.from_user.id)
+    if not order:
+        await query.edit_message_text("⚠️ Pesanan tidak ditemukan atau bukan milik kamu.")
+        return
 
     keyboard = InlineKeyboardMarkup([
         [
@@ -3280,6 +3597,11 @@ async def handle_rate_val(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = query.data.split("|")
     rating = int(parts[1])
     order_id = parts[2]
+
+    order = await get_completed_order_for_user(order_id, query.from_user.id)
+    if not order:
+        await query.edit_message_text("⚠️ Pesanan tidak ditemukan atau bukan milik kamu.")
+        return
 
     context.user_data['temp_rating'] = {'order_id': order_id, 'rating': rating}
     context.user_data['awaiting_review_text'] = True
@@ -3312,9 +3634,12 @@ async def handle_rate_text_skip(update: Update, context: ContextTypes.DEFAULT_TY
     rating = temp['rating']
     review_text = "Tidak ada ulasan tertulis."
 
-    order = await get_order_by_id(order_id)
-    paket_id_testi = order['paket_id'] if order else ""
-    paket = await get_product(paket_id_testi) if order else None
+    order = await get_completed_order_for_user(order_id, query.from_user.id)
+    if not order:
+        await query.edit_message_text("⚠️ Pesanan tidak ditemukan atau bukan milik kamu.")
+        return
+    paket_id_testi = order['paket_id']
+    paket = await get_product(paket_id_testi)
     paket_nama = paket['nama'] if paket else "Produk"
     paket_emoji = paket['emoji'] if paket else "📦"
 
@@ -3361,9 +3686,9 @@ async def handle_rate_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop('awaiting_review_text', None)
     context.user_data.pop('temp_rating', None)
 
-    order = await get_order_by_id(order_id)
+    order = await get_completed_order_for_user(order_id, query.from_user.id)
     if not order:
-        await query.edit_message_text("⚠️ Data pesanan tidak ditemukan.")
+        await query.edit_message_text("⚠️ Data pesanan tidak ditemukan atau bukan milik kamu.")
         return
 
     paket = await get_product(order['paket_id']) or {"emoji": "📦", "nama": "Produk", "harga": 0}
@@ -3936,6 +4261,7 @@ async def admin_cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await hapus_notif_lama(context.bot, order_id)
 
     await set_cooldown_db(target_user_id)
+    cooldown_sisa = await get_cooldown_sisa_db(target_user_id)
 
     msg_id = await kirim_notif(
         context.bot,
@@ -3954,7 +4280,7 @@ async def admin_cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 "<b>❌ PESANAN DIBATALKAN</b>\n"
                 "========================\n\n"
                 "Pesanan kamu telah dibatalkan oleh admin.\n\n"
-                f"⏳ Kamu bisa membuat order baru dalam <b>{COOLDOWN_MENIT} menit</b>.\n\n"
+                f"⏳ Kamu bisa membuat order baru dalam <b>{cooldown_sisa} menit</b>.\n\n"
                 "Hubungi admin jika ada pertanyaan.\n"
                 "Ketik /start untuk membuat pesanan baru."
             ),
@@ -4000,52 +4326,32 @@ async def admin_manual_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
     if not ok:
         await query.edit_message_text("⚠️ Order sudah diproses sebelumnya (mungkin oleh webhook).")
         return
-    await hapus_qris_buyer_lama(context.bot, order_id, target_user_id)
 
-    group_link = await generate_group_link(context.bot, paket, order_id)
-    link = group_link or (paket.get("link") or DEFAULT_LINK)
-    link_section = _build_link_section(group_link, link)
-    harga = paket.get("harga", 0)
-
-    try:
-        await context.bot.send_message(
-            chat_id=target_user_id,
-            text=(
-                f"<b>✅ PEMBAYARAN DIKONFIRMASI</b>\n"
-                f"========================\n\n"
-                f"📦 <b>Detail Pesanan</b>\n"
-                f"- Paket: {esc(paket['emoji'])} {esc(paket['nama'])}\n"
-                f"- Order ID: <code>{esc(order_id)}</code>\n"
-                f"- Total: {format_harga(harga)}\n\n"
-                f"========================\n"
-                f"{link_section}\n\n"
-                f"Terima kasih telah berbelanja! 🙏"
-            ),
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        logger.error(f"[KONFIRMASI MANUAL] Gagal kirim link ke buyer {target_user_id}: {e}")
-
-    await set_sent_link(order_id, link)
-    await hapus_notif_lama(context.bot, order_id)
-
-    msg_id = await kirim_notif(
+    await _process_completed_order_delivery(
         context.bot,
-        _format_order_notif(
-            "✅ <b>DIKONFIRMASI MANUAL</b>",
-            order.get('user_name', '-'), target_user_id, paket, order_id,
-            amount=harga
-        )
+        order_id=order_id,
+        paket_id=order['paket_id'],
+        user_id=target_user_id,
+        user_name=order.get('user_name', '-'),
+        paid_amount=order.get('harga_dibayar') or paket.get('harga', 0),
+        source_title="✅ <b>DIKONFIRMASI MANUAL</b>"
     )
-    if msg_id:
-        await set_admin_msg_id(order_id, msg_id)
+
+    refreshed = await get_order_by_id(order_id)
+    delivery_status = (refreshed or {}).get('delivery_status', 'processed')
+    delivery_label = {
+        'sent': '✅ Link terkirim',
+        'held': '⏸️ Link ditahan karena syarat belum terpenuhi',
+        'failed': '⚠️ Link gagal dikirim, cek manual',
+        'pending': '⏳ Pengiriman sedang diproses',
+    }.get(delivery_status, '✅ Diproses')
 
     await query.edit_message_text(
         f"✅ <b>Pembayaran Dikonfirmasi Manual</b>\n\n"
-        f"👤 Buyer: {esc(order.get('user_name', '-'))}\n"
+        f"👤 Buyer: {tg_user_link(target_user_id, order.get('user_name', '-'))}\n"
         f"📦 Paket: {esc(paket['emoji'])} {esc(paket['nama'])}\n"
         f"📝 Order ID: <code>{esc(order_id)}</code>\n"
-        f"🔗 Link produk sudah terkirim ke buyer.",
+        f"🔗 Status: {delivery_label}",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali ke Orders", callback_data="admpanel_orders")]])
     )
@@ -4931,9 +5237,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         rating = temp['rating']
         order_id = temp['order_id']
-        order = await get_order_by_id(order_id)
+        order = await get_completed_order_for_user(order_id, user_id)
         if not order:
-            await update.message.reply_text("❌ Pesanan tidak ditemukan.")
+            await update.message.reply_text("❌ Pesanan tidak ditemukan atau bukan milik kamu.")
             return
 
         await save_testimonial(user_id, update.effective_user.full_name, order['paket_id'], order_id, rating, text)
@@ -5011,23 +5317,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"❌ Order tidak ditemukan.\n\nID yang dicari: <code>{esc(order_id)}</code>", parse_mode="HTML", reply_markup=back_orders_kb)
                 return
             paket = await get_product(order['paket_id']) or {"emoji": "📦", "nama": order['paket_id'], "harga": 0}
-            STATUS_LABEL = {
-                'completed': '✅ Selesai / Lunas', 'waiting': '⏳ Menunggu Bayar',
-                'pending': '🔄 Diproses Manual', 'cancelled': '❌ Dibatalkan',
-                'expired': '⏰ Kedaluwarsa', 'rejected': '🚫 Ditolak',
-            }
-            status = STATUS_LABEL.get(order['status'], order['status'])
-            sent_link = order.get('sent_link') or '-'
+            detail_text = await build_order_detail_text(order, paket)
             await update.message.reply_text(
-                f"<b>🔍 DETAIL ORDER</b>\n"
-                f"========================\n\n"
-                f"Order ID: <code>{esc(order['order_id'])}</code>\n"
-                f"Buyer: {esc(order.get('user_name', '-'))} (<code>{order['user_id']}</code>)\n"
-                f"Paket: {esc(paket['emoji'])} {esc(paket['nama'])}\n"
-                f"Harga Dibayar: {format_harga(order.get('harga_dibayar') or paket['harga'])}\n"
-                f"Status: {status}\n"
-                f"Dibuat: {order.get('waktu', '-')}\n"
-                f"Link terkirim: {esc(sent_link)}",
+                detail_text,
                 parse_mode="HTML",
                 reply_markup=back_orders_kb
             )
@@ -5511,50 +5803,31 @@ async def admin_konfirmasi(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("⚠️ Order sudah diproses sebelumnya (mungkin oleh webhook).")
             return
 
-        await hapus_qris_buyer_lama(context.bot, order["order_id"], user_id)
-
-        group_link = await generate_group_link(context.bot, paket, order["order_id"])
-        link = group_link or (paket.get("link") or DEFAULT_LINK)
-        link_section = _build_link_section(group_link, link)
-
-        msg = await context.bot.send_message(
-            chat_id=user_id,
-            text=(
-                f"<b>✅ PESANAN SELESAI</b>\n"
-                f"========================\n\n"
-                f"📦 <b>Detail</b>\n"
-                f"- Paket: {esc(paket['emoji'])} {esc(paket['nama'])}\n"
-                f"- Konten: {esc(paket['deskripsi'])}\n\n"
-                f"========================\n"
-                f"{link_section}\n\n"
-                f"Terima kasih telah berbelanja! 🙏"
-            ),
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⭐ Beri Ulasan / Testimoni", callback_data=f"rate_start|{order['order_id']}")]
-            ])
-        )
-        simpan_msg_user(context, user_id, msg.message_id)
-        await hapus_msg_user_lama(context, user_id, keep_last=2)
-        await set_sent_link(order["order_id"], link)
-
-        await hapus_notif_lama(context.bot, order["order_id"])
-        msg_id = await kirim_notif(
+        await _process_completed_order_delivery(
             context.bot,
-            _format_order_notif(
-                "✅ <b>ORDER SELESAI (KONFIRMASI MANUAL)</b>",
-                order['user_name'], user_id, paket, order['order_id']
-            )
+            order_id=order["order_id"],
+            paket_id=order["paket_id"],
+            user_id=user_id,
+            user_name=order.get('user_name', '-'),
+            paid_amount=order.get('harga_dibayar') or paket.get('harga', 0),
+            source_title="✅ <b>ORDER SELESAI (KONFIRMASI MANUAL)</b>"
         )
-        if msg_id:
-            await set_admin_msg_id(order["order_id"], msg_id)
+
+        refreshed = await get_order_by_id(order["order_id"])
+        delivery_status = (refreshed or {}).get('delivery_status', 'processed')
+        delivery_label = {
+            'sent': '✅ Link terkirim',
+            'held': '⏸️ Link ditahan karena syarat belum terpenuhi',
+            'failed': '⚠️ Link gagal dikirim, cek manual',
+            'pending': '⏳ Pengiriman sedang diproses',
+        }.get(delivery_status, '✅ Diproses')
 
         await query.edit_message_text(
             f"✅ <b>Dikonfirmasi</b>\n"
             f"========================\n\n"
-            f"👤 Pembeli: {esc(order['user_name'])}\n"
+            f"👤 Pembeli: {tg_user_link(user_id, order.get('user_name', '-'))}\n"
             f"📦 Paket: {esc(paket['emoji'])} {esc(paket['nama'])}\n\n"
-            f"🔗 Link produk sudah terkirim ke buyer.",
+            f"🔗 Status: {delivery_label}",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali ke Panel", callback_data="admpanel_back")]])
         )
@@ -6426,25 +6699,8 @@ async def cmd_cari(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Order tidak ditemukan: <code>{esc(order_id)}</code>", parse_mode="HTML")
         return
     paket = await get_product(order['paket_id']) or {"emoji": "📦", "nama": order['paket_id'], "harga": 0}
-    STATUS_LABEL = {
-        'completed': '✅ Selesai / Lunas', 'waiting': '⏳ Menunggu Bayar',
-        'pending': '🔄 Diproses Manual', 'cancelled': '❌ Dibatalkan',
-        'expired': '⏰ Kedaluwarsa', 'rejected': '🚫 Ditolak',
-    }
-    status = STATUS_LABEL.get(order['status'], order['status'])
-    sent_link = order.get('sent_link') or '-'
-    await update.message.reply_text(
-        f"<b>🔍 DETAIL ORDER</b>\n"
-        f"========================\n\n"
-        f"📝 Order ID: <code>{esc(order['order_id'])}</code>\n"
-        f"👤 Buyer: {esc(order.get('user_name', '-'))} (<code>{order['user_id']}</code>)\n"
-        f"📦 Paket: {esc(paket['emoji'])} {esc(paket['nama'])}\n"
-        f"💰 Harga Dibayar: {format_harga(order.get('harga_dibayar') or paket['harga'])}\n"
-        f"📊 Status: {status}\n"
-        f"🕒 Dibuat: {order.get('waktu', '-')}\n"
-        f"🔗 Link terkirim: {esc(sent_link)}",
-        parse_mode="HTML"
-    )
+    detail_text = await build_order_detail_text(order, paket)
+    await update.message.reply_text(detail_text, parse_mode="HTML")
 
 # =================== ADMIN: KELOLA ADMIN (SUPER ADMIN ONLY) ===================
 
@@ -6579,7 +6835,6 @@ def main():
     # User Callback Query Handlers
     app.add_handler(CallbackQueryHandler(buy_callback,         pattern="^buy$"))
     app.add_handler(CallbackQueryHandler(pilih_paket,          pattern="^pilih_"))
-    app.add_handler(CallbackQueryHandler(konfirm_beli,         pattern="^konfirm_beli_"))
     app.add_handler(CallbackQueryHandler(prereq_buy_handler,   pattern="^prereq_buy_"))
     app.add_handler(CallbackQueryHandler(cancel_order_handler, pattern="^cancel_order$"))
     app.add_handler(CallbackQueryHandler(back_to_menu,         pattern="^back_to_menu$"))

@@ -1374,39 +1374,54 @@ async def is_maintenance() -> bool:
 
 # =================== NOTIFIKASI ORDER ===================
 
+def _compact_waktu(value=None) -> str:
+    """Format waktu compact: HH:MM · DD/MM/YYYY."""
+    if not value:
+        return now_wib().strftime('%H:%M · %d/%m/%Y')
+    text = str(value).strip()
+    # format lama: "HH:MM - DD/MM/YYYY"
+    text = re.sub(r'\s*-\s*', ' · ', text, count=1)
+    text = text.replace(',', ' ·')
+    return text
+
+def _default_order_note(judul: str) -> str:
+    title = (judul or '').upper()
+    if 'DIBATALKAN BUYER' in title:
+        return 'ℹ️ Dibatalkan oleh buyer'
+    if 'DIBATALKAN ADMIN' in title:
+        return 'ℹ️ Dibatalkan oleh admin'
+    if 'DITOLAK' in title or 'REJECT' in title:
+        return 'ℹ️ Order ditolak admin'
+    if 'EXPIRED' in title:
+        return 'ℹ️ Sesi pembayaran expired'
+    if 'BARU' in title:
+        return '⏳ Menunggu pembayaran'
+    if 'BERHASIL' in title or 'COMPLETED' in title or 'KONFIRM' in title:
+        return '✅ Order completed'
+    if 'AUTO' in title or 'LINK' in title:
+        return '🔗 Link produk terkirim'
+    return ''
+
 def _format_order_notif(judul: str, user_name: str, user_id: int,
                          paket: dict, order_id: str,
                          amount: int = None, extra: str = None) -> str:
-    """Format order status admin yang lebih terstruktur dan buyer clickable."""
-    status_label = _infer_order_status_label(judul)
+    """Format notif admin compact, tetap rapi dan buyer clickable."""
     lines = [
         judul,
         "━━━━━━━━━━━━━━━━━━━━",
-        "",
-        "👤 <b>Buyer</b>",
-        f"Nama : {tg_user_link(user_id, user_name)}",
-        f"ID   : <code>{esc(user_id)}</code>",
-        "",
-        "📦 <b>Produk</b>",
-        f"Paket : {esc(paket.get('emoji','📦'))} {esc(paket.get('nama','?'))}",
+        f"👤 Buyer   : {tg_user_link(user_id, user_name)} · <code>{esc(user_id)}</code>",
+        f"📦 Paket   : {esc(paket.get('emoji','📦'))} {esc(paket.get('nama','?'))}",
     ]
     if amount is not None:
-        lines.append(f"Total : {format_harga(amount)}")
+        lines.append(f"💰 Total   : {format_harga(amount)}")
     lines.extend([
-        "",
-        "📌 <b>Status Order</b>",
-        f"Status : {status_label}",
+        f"🧾 Order   : <code>{esc(order_id)}</code>",
+        f"🕒 Waktu   : {_compact_waktu()}",
     ])
-    if extra:
-        lines.extend(["", str(extra)])
-    lines.extend([
-        "",
-        "🕒 <b>Waktu</b>",
-        now_wib().strftime('%H:%M, %d/%m/%Y'),
-        "",
-        "🔖 <b>Order ID</b>",
-        f"<code>{esc(order_id)}</code>",
-    ])
+
+    note = str(extra).strip() if extra else _default_order_note(judul)
+    if note:
+        lines.extend(["", note])
     return "\n".join(lines)
 
 async def build_order_detail_text(order: dict, paket: dict) -> str:
@@ -1424,48 +1439,32 @@ async def build_order_detail_text(order: dict, paket: dict) -> str:
         None: '—',
     }
     amount = order.get('harga_dibayar') or paket.get('harga', 0)
+    delivery_label = DELIVERY_LABEL.get(order.get('delivery_status'), order.get('delivery_status') or '—')
     text = (
-        f"<b>🧾 ORDER STATUS</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"👤 <b>Buyer</b>\n"
-        f"Nama : {tg_user_link(order.get('user_id'), order.get('user_name', '-'))}\n"
-        f"ID   : <code>{esc(order.get('user_id', '-'))}</code>\n\n"
-        f"📦 <b>Produk</b>\n"
-        f"Paket : {esc(paket.get('emoji','📦'))} {esc(paket.get('nama','Produk'))}\n"
-        f"Total : {format_harga(amount)}\n\n"
-        f"📌 <b>Status Order</b>\n"
-        f"Status : {STATUS_LABEL.get(order.get('status'), order.get('status', '-'))}\n"
-        f"Link   : {DELIVERY_LABEL.get(order.get('delivery_status'), order.get('delivery_status') or '—')}\n"
+        f"🧾 <b>ORDER STATUS</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 Buyer   : {tg_user_link(order.get('user_id'), order.get('user_name', '-'))} · <code>{esc(order.get('user_id', '-'))}</code>\n"
+        f"📦 Paket   : {esc(paket.get('emoji','📦'))} {esc(paket.get('nama','Produk'))}\n"
+        f"💰 Total   : {format_harga(amount)}\n"
+        f"📌 Status  : {STATUS_LABEL.get(order.get('status'), order.get('status', '-'))}\n"
+        f"🔗 Link    : {delivery_label}\n"
+        f"🧾 Order   : <code>{esc(order.get('order_id', '-'))}</code>\n"
+        f"🕒 Waktu   : {_compact_waktu(order.get('waktu', '-'))}"
     )
 
     requires_str = paket.get('requires_paket_ids') or ''
     if requires_str:
         progress = await _build_prereq_progress(order.get('user_id'), requires_str, parent_order_id=order.get('order_id'))
-        if progress['missing']:
-            akses_status = '⏸️ Link ditahan'
-            alasan = 'Syarat belum terpenuhi'
-        else:
-            akses_status = '✅ Syarat terpenuhi'
-            alasan = 'Semua syarat akses sudah lengkap'
+        akses_status = '⏸️ Link ditahan' if progress['missing'] else '✅ Syarat terpenuhi'
         text += (
-            f"\n🔐 <b>Akses Produk</b>\n"
-            f"Status : {akses_status}\n"
-            f"Alasan : {alasan}\n\n"
-            f"📋 <b>Progress Syarat</b>\n"
-            f"Progress : {progress['fulfilled_count']}/{progress['total_count']} terpenuhi\n\n"
-            f"{progress['text']}\n"
+            f"\n\n🔐 Akses  : {akses_status}\n"
+            f"📋 Syarat  : {progress['fulfilled_count']}/{progress['total_count']} terpenuhi\n\n"
+            f"{progress['text']}"
         )
 
     sent_link = order.get('sent_link')
     if sent_link and sent_link != 'pending':
-        text += f"\n🔗 <b>Link Terkirim</b>\n{esc(sent_link)}\n"
-
-    text += (
-        f"\n🕒 <b>Waktu</b>\n"
-        f"{esc(order.get('waktu', '-'))}\n\n"
-        f"🔖 <b>Order ID</b>\n"
-        f"<code>{esc(order.get('order_id', '-'))}</code>"
-    )
+        text += f"\n\n🔗 <b>Link Terkirim</b>\n{esc(sent_link)}"
     return text
 
 async def kirim_notif(bot, text: str, reply_markup=None):
@@ -2705,7 +2704,7 @@ async def _buat_order_baru(update, context, query, user_id, user_name, paket, or
             "📢 <b>ORDER BARU MASUK</b>",
             user_name, user_id, paket, order_id,
             amount=total_payment,
-            extra=f"⏰ Berlaku: {expire} WIB · ⏳ Menunggu pembayaran"
+            extra=f"⏳ Menunggu pembayaran · berlaku sampai {expire} WIB"
         )
     )
     if msg_id:
@@ -3105,7 +3104,7 @@ async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
             _format_order_notif(
                 "⏰ <b>ORDER EXPIRED</b>",
                 user_name, user_id, paket_exp, order_id,
-                extra="Buyer tidak bayar sampai waktu habis"
+                extra="ℹ️ Buyer tidak bayar sampai waktu habis"
             )
         )
         if msg_id:
@@ -3205,20 +3204,14 @@ async def _send_prereq_hold_message(bot, user_id: int, order_id: str, paket: dic
         chat_id=user_id,
         text=(
             f"✅ <b>ORDER BERHASIL</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📦 <b>Produk</b>\n"
-            f"Paket : {esc(product_name)}\n"
-            f"Total : {format_harga(paid_amount)}\n\n"
-            f"🔐 <b>Akses Produk</b>\n"
-            f"Status : ⏸️ Link {esc(paket.get('nama','Produk'))} ditahan sementara\n"
-            f"Alasan : Kamu belum memenuhi semua syarat akses\n\n"
-            f"📋 <b>Progress Syarat {esc(paket.get('nama','Produk'))}</b>\n"
-            f"Progress : {progress['fulfilled_count']}/{progress['total_count']} terpenuhi\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📦 Paket   : {esc(product_name)}\n"
+            f"💰 Total   : {format_harga(paid_amount)}\n"
+            f"🧾 Order   : <code>{esc(order_id)}</code>\n\n"
+            f"🔐 Link {esc(paket.get('nama','Produk'))} ditahan\n"
+            f"📋 Syarat  : {progress['fulfilled_count']}/{progress['total_count']} terpenuhi\n\n"
             f"{progress['text']}\n\n"
-            f"Silakan lengkapi produk yang masih bertanda ❌.\n"
-            f"Setelah semua syarat terpenuhi, link {esc(paket.get('nama','Produk'))} akan otomatis dikirim.\n\n"
-            f"🔖 <b>Order ID</b>\n"
-            f"<code>{esc(order_id)}</code>"
+            f"Lengkapi produk bertanda ❌. Setelah semua syarat terpenuhi, link {esc(paket.get('nama','Produk'))} otomatis dikirim."
         ),
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(progress['buttons']) if progress['buttons'] else None
@@ -3228,22 +3221,23 @@ async def _notify_parent_prereq_progress(bot, user_id: int, user_name: str, pare
                                           parent_paket: dict, progress: dict, purchased_paket_id: str):
     if purchased_paket_id not in progress['all_ids']:
         return
+
+    parent_name = parent_paket.get('nama', 'Produk')
+    parent_label = f"{parent_paket.get('emoji','📦')} {parent_name}"
+
     if progress['missing']:
         missing_count = len(progress['missing'])
         try:
             await bot.send_message(
                 chat_id=user_id,
                 text=(
-                    f"📋 <b>UPDATE PROGRESS {esc(parent_paket.get('nama','Produk'))}</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━━━\n\n"
-                    f"Pesanan {esc(parent_paket.get('nama','Produk'))} kamu masih menunggu syarat terpenuhi.\n\n"
-                    f"📦 <b>Produk Utama</b>\n"
-                    f"Paket : {esc(parent_paket.get('emoji','📦'))} {esc(parent_paket.get('nama','Produk'))}\n\n"
-                    f"📊 <b>Progress Saat Ini</b>\n"
-                    f"Progress : {progress['fulfilled_count']}/{progress['total_count']} terpenuhi\n\n"
+                    f"📋 <b>UPDATE SYARAT</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🎯 Target  : {esc(parent_label)}\n"
+                    f"📊 Progress: {progress['fulfilled_count']}/{progress['total_count']} terpenuhi\n\n"
                     f"{progress['text']}\n\n"
-                    f"⏸️ Link {esc(parent_paket.get('nama','Produk'))} masih ditahan.\n"
-                    f"Silakan lengkapi {missing_count} produk lagi agar link otomatis dikirim."
+                    f"🔐 Link {esc(parent_name)} masih ditahan.\n"
+                    f"Lengkapi {missing_count} produk lagi agar link otomatis dikirim."
                 ),
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup(progress['buttons']) if progress['buttons'] else None
@@ -3252,15 +3246,15 @@ async def _notify_parent_prereq_progress(bot, user_id: int, user_name: str, pare
             logger.error(f"[PREREQ PROGRESS] Gagal kirim progress parent ke buyer {user_id}: {e}")
 
         extra = (
-            f"📋 <b>Progress Produk Terkait</b>\n"
-            f"Produk : {esc(parent_paket.get('emoji','📦'))} {esc(parent_paket.get('nama','Produk'))}\n"
-            f"Progress : {progress['fulfilled_count']}/{progress['total_count']} terpenuhi\n\n"
-            f"{progress['text']}"
+            f"🎯 Target  : {esc(parent_label)}\n"
+            f"📊 Progress: {progress['fulfilled_count']}/{progress['total_count']} terpenuhi\n\n"
+            f"{progress['text']}\n\n"
+            f"🔐 Link {esc(parent_name)} masih ditahan"
         )
         msg_id = await kirim_notif(
             bot,
             _format_order_notif(
-                "📋 <b>UPDATE PROGRESS SYARAT</b>",
+                "📋 <b>UPDATE SYARAT</b>",
                 user_name, user_id, parent_paket, parent_order['order_id'],
                 amount=parent_order.get('harga_dibayar', 0),
                 extra=extra
@@ -3275,15 +3269,12 @@ async def _notify_parent_prereq_progress(bot, user_id: int, user_name: str, pare
         await bot.send_message(
             chat_id=user_id,
             text=(
-                f"🎉 <b>SYARAT {esc(parent_paket.get('nama','Produk'))} SUDAH LENGKAP</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"📦 <b>Produk Utama</b>\n"
-                f"Paket : {esc(parent_paket.get('emoji','📦'))} {esc(parent_paket.get('nama','Produk'))}\n\n"
-                f"📊 <b>Progress Akhir</b>\n"
-                f"Progress : {progress['fulfilled_count']}/{progress['total_count']} terpenuhi\n\n"
+                f"🎉 <b>SYARAT TERPENUHI</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"🎯 Target  : {esc(parent_label)}\n"
+                f"📊 Progress: {progress['fulfilled_count']}/{progress['total_count']} terpenuhi\n\n"
                 f"{progress['text']}\n\n"
-                f"✅ Semua syarat sudah terpenuhi.\n"
-                f"Link {esc(parent_paket.get('nama','Produk'))} akan dikirim otomatis sekarang."
+                f"🔓 Link {esc(parent_name)} otomatis dikirim sekarang ✅"
             ),
             parse_mode="HTML"
         )
@@ -3312,11 +3303,8 @@ async def _process_completed_order_delivery(bot, order_id: str, paket_id: str, u
 
             await hapus_notif_lama(bot, order_id)
             extra_prereq = (
-                f"🔐 <b>Akses Produk</b>\n"
-                f"Status : ⏸️ Link ditahan\n"
-                f"Alasan : Syarat belum terpenuhi\n\n"
-                f"📋 <b>Progress Syarat</b>\n"
-                f"Progress : {progress['fulfilled_count']}/{progress['total_count']} terpenuhi\n\n"
+                f"🔐 Link {esc(paket.get('nama','Produk'))} ditahan\n"
+                f"📋 Syarat  : {progress['fulfilled_count']}/{progress['total_count']} terpenuhi\n\n"
                 f"{progress['text']}"
             )
             msg_id = await kirim_notif(
@@ -3353,9 +3341,9 @@ async def _process_completed_order_delivery(bot, order_id: str, paket_id: str, u
 
     if kirim_berhasil:
         await set_sent_link(order_id, link)
-        extra_paid = "🔗 <b>Pengiriman Link</b>\nStatus : ✅ Sudah dikirim"
+        extra_paid = "🔗 Link produk berhasil dikirim ✅"
     else:
-        extra_paid = "🔗 <b>Pengiriman Link</b>\nStatus : ⚠️ Gagal dikirim - cek manual"
+        extra_paid = "⚠️ Link gagal dikirim — cek manual"
 
     msg_id = await kirim_notif(
         bot,
@@ -3446,7 +3434,7 @@ async def _auto_deliver_pending_prereq_orders(bot, user_id: int, user_name: str,
                 "✅ <b>LINK AUTO-TERKIRIM</b>",
                 user_name, user_id, paket, oid,
                 amount=order.get('harga_dibayar', 0),
-                extra="🔗 <b>Pengiriman Link</b>\nStatus : ✅ Sudah dikirim otomatis karena semua syarat terpenuhi."
+                extra="🔓 Link otomatis dikirim karena semua syarat terpenuhi ✅"
             )
         )
         if msg_id:

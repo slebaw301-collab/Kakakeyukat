@@ -1425,10 +1425,13 @@ def _format_order_notif(judul: str, user_name: str, user_id: int,
     return "\n".join(lines)
 
 async def build_order_detail_text(order: dict, paket: dict) -> str:
-    STATUS_LABEL = {
-        'completed': '✅ Completed', 'waiting': '⏳ Waiting',
-        'pending': '🔄 Pending Manual', 'cancelled': '❌ Cancelled',
-        'expired': '⏰ Expired', 'rejected': '🚫 Rejected',
+    STATUS_TITLE = {
+        'completed': '✅ ORDER COMPLETED',
+        'waiting': '⏳ ORDER WAITING',
+        'pending': '🔄 ORDER PENDING',
+        'cancelled': '❌ ORDER CANCELLED',
+        'expired': '⏰ ORDER EXPIRED',
+        'rejected': '🚫 ORDER REJECTED',
     }
     DELIVERY_LABEL = {
         'sent': '✅ Sudah dikirim',
@@ -1440,13 +1443,13 @@ async def build_order_detail_text(order: dict, paket: dict) -> str:
     }
     amount = order.get('harga_dibayar') or paket.get('harga', 0)
     delivery_label = DELIVERY_LABEL.get(order.get('delivery_status'), order.get('delivery_status') or '—')
+    title = STATUS_TITLE.get(order.get('status'), '🧾 ORDER STATUS')
     text = (
-        f"🧾 <b>ORDER STATUS</b>\n"
+        f"<b>{title}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"👤 Buyer   : {tg_user_link(order.get('user_id'), order.get('user_name', '-'))} · <code>{esc(order.get('user_id', '-'))}</code>\n"
         f"📦 Paket   : {esc(paket.get('emoji','📦'))} {esc(paket.get('nama','Produk'))}\n"
         f"💰 Total   : {format_harga(amount)}\n"
-        f"📌 Status  : {STATUS_LABEL.get(order.get('status'), order.get('status', '-'))}\n"
         f"🔗 Link    : {delivery_label}\n"
         f"🧾 Order   : <code>{esc(order.get('order_id', '-'))}</code>\n"
         f"🕒 Waktu   : {_compact_waktu(order.get('waktu', '-'))}"
@@ -1455,12 +1458,16 @@ async def build_order_detail_text(order: dict, paket: dict) -> str:
     requires_str = paket.get('requires_paket_ids') or ''
     if requires_str:
         progress = await _build_prereq_progress(order.get('user_id'), requires_str, parent_order_id=order.get('order_id'))
-        akses_status = '⏸️ Link ditahan' if progress['missing'] else '✅ Syarat terpenuhi'
-        text += (
-            f"\n\n🔐 Akses  : {akses_status}\n"
-            f"📋 Syarat  : {progress['fulfilled_count']}/{progress['total_count']} terpenuhi\n\n"
-            f"{progress['text']}"
-        )
+        if progress['missing']:
+            text += (
+                f"\n\n📋 Syarat  : {progress['fulfilled_count']}/{progress['total_count']} terpenuhi\n\n"
+                f"{progress['text']}"
+            )
+        else:
+            text += (
+                f"\n\n📋 Syarat  : ✅ Lengkap · "
+                f"{progress['fulfilled_count']}/{progress['total_count']} terpenuhi"
+            )
 
     sent_link = order.get('sent_link')
     if sent_link and sent_link != 'pending':
@@ -1571,6 +1578,52 @@ async def hapus_msg_user_lama(context, user_id, keep_last=1):
                 await context.bot.delete_message(chat_id=user_id, message_id=msg_id)
             except Exception as e:
                 logger.debug(f"Gagal hapus pesan user lama: {e}")
+
+# =================== COOLDOWN MESSAGE ANTI-SPAM ===================
+COOLDOWN_NOTICE_DEBOUNCE_SECONDS = 5
+
+async def _safe_delete_chat_message(bot, chat_id, message_id, label="pesan"):
+    if not chat_id or not message_id:
+        return
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=int(message_id))
+    except Exception as e:
+        logger.debug(f"Gagal hapus {label}: {e}")
+
+async def _send_single_cooldown_notice(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, sisa: int):
+    """Kirim satu pesan cooldown saja agar chat tidak numpuk saat user spam /start."""
+    chat_id = update.effective_chat.id
+
+    # Bersihkan command /start dari user jika Telegram mengizinkan.
+    if update.message:
+        await _safe_delete_chat_message(context.bot, chat_id, update.message.message_id, "pesan /start user")
+
+    now_mono = _time.monotonic()
+    last_ts = context.user_data.get('_cooldown_notice_ts', 0)
+    last_msg_id = context.user_data.get('_cooldown_notice_msg_id')
+
+    # Debounce ringan: kalau user spam sangat cepat, cukup hapus /start-nya tanpa kirim ulang.
+    if last_msg_id and (now_mono - last_ts) < COOLDOWN_NOTICE_DEBOUNCE_SECONDS:
+        return
+
+    # Replace pesan cooldown lama supaya yang tersisa hanya pesan terbaru.
+    if last_msg_id:
+        await _safe_delete_chat_message(context.bot, chat_id, last_msg_id, "pesan cooldown lama")
+
+    end_time = (now_wib() + timedelta(minutes=sisa)).strftime('%H:%M')
+    msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"⏳ <b>Cooldown Aktif</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"Kamu baru saja membatalkan pesanan.\n\n"
+            f"⏱ Sisa waktu : <b>{sisa} menit</b>\n"
+            f"⏰ Berakhir   : <b>{end_time} WIB</b>"
+        ),
+        parse_mode="HTML"
+    )
+    context.user_data['_cooldown_notice_msg_id'] = msg.message_id
+    context.user_data['_cooldown_notice_ts'] = now_mono
 
 async def kirim_link_ke_buyer(context, user_id, paket, order_id, amount):
     group_link = await generate_group_link(context.bot, paket, order_id)
@@ -2363,13 +2416,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if sisa > 0:
-        await update.message.reply_text(
-            f"⏳ <b>Cooldown Aktif</b>\n"
-            f"========================\n\n"
-            f"Kamu baru saja membatalkan pesanan. Tunggu <b>{sisa} menit</b> lagi sebelum bisa membuat order baru.\n\n"
-            f"⏰ Cooldown berakhir sekitar pukul <b>{(now_wib() + timedelta(minutes=sisa)).strftime('%H:%M')} WIB</b>",
-            parse_mode="HTML"
-        )
+        await _send_single_cooldown_notice(update, context, user_id, sisa)
         return
     if active:
         paket = await get_product(active["paket_id"])
@@ -2477,15 +2524,23 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     products = await get_all_products()
     aktif = [p for p in products if p.get('aktif', True)]
-    text = "<b>📦 PILIH PAKET</b>\n========================\n\n"
-    for p in aktif:
-        text += (
-            f"{esc(p['emoji'])} <b>{esc(p['nama']).upper()}</b>\n"
-            f"- {esc(p['deskripsi'])}\n"
-            f"- Harga: {format_harga(p['harga'])}\n"
-            f"- Status: Tersedia ✅\n\n"
+    if not aktif:
+        await query.edit_message_text(
+            "<b>📦 PILIH PAKET</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "Belum ada paket yang tersedia saat ini.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ Kembali", callback_data="back_to_menu")]
+            ])
         )
-    text += "========================"
+        return
+
+    text = (
+        "<b>📦 PILIH PAKET</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Silakan pilih paket yang ingin kamu beli:"
+    )
 
     keyboard = [
         [InlineKeyboardButton(f"{p['emoji']} {p['nama']} - {format_harga(p['harga'])}", callback_data=f"pilih_{p['paket_id']}")]
@@ -2497,7 +2552,6 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def pilih_paket(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
-    user_name = query.from_user.full_name
 
     if await is_banned(user_id):
         await query.answer("🚫 Akun kamu diblokir. Hubungi admin.", show_alert=True)
@@ -2507,6 +2561,48 @@ async def pilih_paket(update: Update, context: ContextTypes.DEFAULT_TYPE):
     paket = await get_product(paket_id)
     if not paket:
         await query.answer("❌ Produk tidak ditemukan.", show_alert=True)
+        return
+
+    await query.answer()
+
+    status_text = "Tersedia ✅" if paket.get('aktif', True) else "Tidak tersedia ❌"
+    text = (
+        f"{esc(paket.get('emoji', '📦'))} <b>DETAIL PAKET</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📦 Paket : <b>{esc(paket.get('nama', 'Produk'))}</b>\n"
+        f"🎬 Isi   : {esc(paket.get('deskripsi') or '-')}\n"
+        f"💰 Harga : {format_harga(paket.get('harga', 0))}\n"
+        f"✅ Status: {status_text}\n\n"
+    )
+
+    if paket.get('aktif', True):
+        text += "Lanjut buat order dan bayar via QRIS?"
+        keyboard = [
+            [InlineKeyboardButton("✅ Lanjut Bayar", callback_data=f"confirm_buy_{paket_id}")],
+            [InlineKeyboardButton("⬅️ Kembali", callback_data="buy")]
+        ]
+    else:
+        text += "Paket ini sedang tidak bisa dibeli. Silakan pilih paket lain."
+        keyboard = [[InlineKeyboardButton("⬅️ Kembali", callback_data="buy")]]
+
+    await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def confirm_buy_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    user_name = query.from_user.full_name
+
+    if await is_banned(user_id):
+        await query.answer("🚫 Akun kamu diblokir. Hubungi admin.", show_alert=True)
+        return
+
+    paket_id = query.data.replace("confirm_buy_", "")
+    paket = await get_product(paket_id)
+    if not paket:
+        await query.answer("❌ Produk tidak ditemukan.", show_alert=True)
+        return
+    if not paket.get('aktif', True):
+        await query.answer("❌ Paket ini sedang tidak tersedia.", show_alert=True)
         return
 
     active = await get_active_order(user_id)
@@ -2538,7 +2634,7 @@ async def pilih_paket(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await query.answer()
+    await query.answer("⏳ Membuat invoice QRIS...")
     await _buat_order_baru(update, context, query, user_id, user_name, paket, order_changes=0)
 
 async def prereq_buy_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6823,6 +6919,7 @@ def main():
     # User Callback Query Handlers
     app.add_handler(CallbackQueryHandler(buy_callback,         pattern="^buy$"))
     app.add_handler(CallbackQueryHandler(pilih_paket,          pattern="^pilih_"))
+    app.add_handler(CallbackQueryHandler(confirm_buy_handler,  pattern="^confirm_buy_"))
     app.add_handler(CallbackQueryHandler(prereq_buy_handler,   pattern="^prereq_buy_"))
     app.add_handler(CallbackQueryHandler(cancel_order_handler, pattern="^cancel_order$"))
     app.add_handler(CallbackQueryHandler(back_to_menu,         pattern="^back_to_menu$"))

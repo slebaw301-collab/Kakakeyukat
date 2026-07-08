@@ -3237,6 +3237,27 @@ async def _build_prereq_progress(user_id: int, requires_str: str, parent_order_i
         'buttons': buttons,
     }
 
+
+def _admin_prereq_action_keyboard(order_id: str):
+    """Keyboard khusus admin/channel untuk order bersyarat.
+
+    Penting: jangan memakai progress['buttons'] di notif admin/channel karena
+    tombol itu adalah tombol beli syarat untuk buyer. Di admin/channel cukup
+    tampilkan tombol aksi admin saja agar tidak muncul tombol "Beli GB ...".
+    """
+    return InlineKeyboardMarkup([[InlineKeyboardButton(
+        "📤 Kirim Link Manual",
+        callback_data=f"admin_kirim_link_prereq|{order_id}"
+    )]])
+
+async def _replace_admin_order_status(bot, order_id: str, text: str, reply_markup=None):
+    """Replace status order di admin/channel: hapus pesan lama lalu kirim status terbaru."""
+    await hapus_notif_lama(bot, order_id)
+    msg_id = await kirim_notif(bot, text, reply_markup=reply_markup)
+    if msg_id:
+        await set_admin_msg_id(order_id, msg_id)
+    return msg_id
+
 async def _send_delivery_failed_alert(bot, order_id: str, user_id: int, user_name: str, paket: dict, error: Exception):
     await reset_delivery_claim(order_id, str(error)[:500])
     try:
@@ -3336,18 +3357,20 @@ async def _notify_parent_prereq_progress(bot, user_id: int, user_name: str, pare
             f"{progress['text']}\n\n"
             f"🔐 Link {esc(parent_name)} masih ditahan"
         )
-        msg_id = await kirim_notif(
+        # Admin/channel memakai sistem replace message agar status parent (GB VIP/produk bersyarat)
+        # tidak dobel. Tombol beli syarat sengaja tidak dikirim ke admin/channel;
+        # tombol itu hanya untuk private chat buyer.
+        msg_id = await _replace_admin_order_status(
             bot,
+            parent_order['order_id'],
             _format_order_notif(
                 "📋 <b>UPDATE SYARAT</b>",
                 user_name, user_id, parent_paket, parent_order['order_id'],
                 amount=parent_order.get('harga_dibayar', 0),
                 extra=extra
             ),
-            reply_markup=InlineKeyboardMarkup(progress['buttons']) if progress['buttons'] else None
+            reply_markup=_admin_prereq_action_keyboard(parent_order['order_id'])
         )
-        if msg_id:
-            await set_admin_msg_id(parent_order['order_id'], msg_id)
         return
 
     try:
@@ -3386,26 +3409,22 @@ async def _process_completed_order_delivery(bot, order_id: str, paket_id: str, u
                 logger.error(f"[PAYMENT] Gagal kirim notif prereq ke buyer {user_id}: {e}")
                 await set_delivery_status(order_id, 'failed', str(e)[:500])
 
-            await hapus_notif_lama(bot, order_id)
             extra_prereq = (
                 f"🔐 Link {esc(paket.get('nama','Produk'))} ditahan\n"
                 f"📋 Syarat  : {progress['fulfilled_count']}/{progress['total_count']} terpenuhi\n\n"
                 f"{progress['text']}"
             )
-            msg_id = await kirim_notif(
+            await _replace_admin_order_status(
                 bot,
+                order_id,
                 _format_order_notif(
                     source_title,
                     user_name, user_id, paket, order_id,
                     amount=paid_amount,
                     extra=extra_prereq
                 ),
-                reply_markup=InlineKeyboardMarkup(progress['buttons'] + [[
-                    InlineKeyboardButton("📤 Kirim Link Manual", callback_data=f"admin_kirim_link_prereq|{order_id}")
-                ]])
+                reply_markup=_admin_prereq_action_keyboard(order_id)
             )
-            if msg_id:
-                await set_admin_msg_id(order_id, msg_id)
             return
 
     claimed = await atomic_claim_for_delivery(order_id)

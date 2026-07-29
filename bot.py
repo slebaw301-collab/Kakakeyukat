@@ -178,13 +178,23 @@ def now_utc() -> datetime:
 # =================== KONFIGURASI ===================
 TOKEN = os.environ.get("BOT_TOKEN")
 _ADMIN_ID_RAW = os.environ.get("ADMIN_ID", "")
-PAKASIR_API_KEY = os.environ.get("PAKASIR_API_KEY")
 DATABASE_URL = os.environ.get("DATABASE_URL")
-PAKASIR_WEBHOOK_SECRET = os.environ.get("PAKASIR_WEBHOOK_SECRET", "")
 APP_ENV = os.environ.get("APP_ENV") or os.environ.get("ENV") or "development"
 
-PAKASIR_SLUG = "atkikukkvd"
-PAKASIR_BASE_URL = "https://app.pakasir.com"
+# Provider utama untuk order baru. Order lama tetap membaca provider yang tersimpan di database.
+PAYMENT_PROVIDER = (os.environ.get("PAYMENT_PROVIDER") or "autogopay").strip().lower()
+
+AUTOGOPAY_API_KEY = (os.environ.get("AUTOGOPAY_API_KEY") or "").strip()
+AUTOGOPAY_BASE_URL = (os.environ.get("AUTOGOPAY_BASE_URL") or "https://v1-gateway.autogopay.site").rstrip("/")
+AUTOGOPAY_DEFAULT_TIMEOUT_SECONDS = 15 * 60
+
+# Pakasir dipertahankan hanya untuk kompatibilitas order lama selama masa migrasi.
+PAKASIR_API_KEY = (os.environ.get("PAKASIR_API_KEY") or "").strip()
+PAKASIR_WEBHOOK_SECRET = (os.environ.get("PAKASIR_WEBHOOK_SECRET") or "").strip()
+PAKASIR_SLUG = (os.environ.get("PAKASIR_SLUG") or "atkikukkvd").strip()
+PAKASIR_BASE_URL = (os.environ.get("PAKASIR_BASE_URL") or "https://app.pakasir.com").rstrip("/")
+PAKASIR_DEFAULT_TIMEOUT_SECONDS = 30 * 60
+
 DEFAULT_LINK = "https://t.me/Kikukkvd"
 
 if not TOKEN:
@@ -192,12 +202,14 @@ if not TOKEN:
 if not _ADMIN_ID_RAW or not _ADMIN_ID_RAW.strip().isdigit():
     raise ValueError("ADMIN_ID tidak di-set atau bukan angka valid!")
 ADMIN_ID = int(_ADMIN_ID_RAW.strip())
-if not PAKASIR_API_KEY:
-    raise ValueError("PAKASIR_API_KEY tidak di-set!")
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL tidak di-set!")
-if APP_ENV.lower() == "production" and not PAKASIR_WEBHOOK_SECRET:
-    raise ValueError("PAKASIR_WEBHOOK_SECRET wajib di-set saat APP_ENV/ENV=production!")
+if PAYMENT_PROVIDER not in {"autogopay", "pakasir"}:
+    raise ValueError("PAYMENT_PROVIDER harus 'autogopay' atau 'pakasir'!")
+if PAYMENT_PROVIDER == "autogopay" and not AUTOGOPAY_API_KEY:
+    raise ValueError("AUTOGOPAY_API_KEY tidak di-set!")
+if PAYMENT_PROVIDER == "pakasir" and not PAKASIR_API_KEY:
+    raise ValueError("PAKASIR_API_KEY tidak di-set!")
 
 # =================== SINGLETON HTTP SESSION ===================
 _http_session: aiohttp.ClientSession = None
@@ -208,34 +220,203 @@ async def get_http_session() -> aiohttp.ClientSession:
         _http_session = aiohttp.ClientSession()
     return _http_session
 
-# =================== PAKASIR API ===================
+# =================== PAYMENT PROVIDER API ===================
 
-async def create_transaction_qris(order_id, amount, description):
-    payload = {
-        "project": PAKASIR_SLUG,
-        "order_id": order_id,
-        "amount": amount,
-        "api_key": PAKASIR_API_KEY,
-    }
+AUTOGOPAY_STATUS_MAP = {
+    "pending": "waiting",
+    "settlement": "completed",
+    "expire": "expired",
+    "expired": "expired",
+    "cancel": "cancelled",
+    "cancelled": "cancelled",
+    "canceled": "cancelled",
+}
+
+
+def normalize_autogopay_status(status: str) -> str:
+    """Ubah status AutoGoPay menjadi status internal bot."""
+    raw = str(status or "").strip().lower()
+    return AUTOGOPAY_STATUS_MAP.get(raw, raw or "waiting")
+
+
+def parse_provider_datetime(value):
+    """Parse waktu provider menjadi datetime timezone-aware WIB."""
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=WIB) if value.tzinfo is None else value.astimezone(WIB)
+
+    text = str(value).strip()
+    if not text:
+        return None
     try:
-        session = await get_http_session()
-        async with session.post(
-            f'{PAKASIR_BASE_URL}/api/transactioncreate/qris',
-            json=payload,
-            headers={'Content-Type': 'application/json'},
-            timeout=aiohttp.ClientTimeout(total=30)
-        ) as response:
-            result = await response.json()
-            if 'payment' in result:
-                return result['payment']
-            logger.error(f"Pakasir error: {result}")
+        normalized = text[:-1] + "+00:00" if text.endswith("Z") else text
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        parsed = None
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+            try:
+                parsed = datetime.strptime(text, fmt)
+                break
+            except ValueError:
+                continue
+        if parsed is None:
+            logger.warning(f"[PAYMENT] Format waktu provider tidak dikenali: {text}")
             return None
-    except Exception as e:
-        logger.error(f"Error saat membuat transaksi QRIS: {e}", exc_info=True)
-        return None
 
-async def cancel_transaction(order_id, amount):
-    if not amount:
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=WIB)
+    return parsed.astimezone(WIB)
+
+
+async def _read_json_response(response: aiohttp.ClientResponse) -> dict:
+    """Baca respons JSON tanpa membuat bot crash jika provider mengirim HTML/plain text."""
+    raw_text = await response.text()
+    if not raw_text:
+        return {}
+    try:
+        result = json.loads(raw_text)
+        return result if isinstance(result, dict) else {"data": result}
+    except json.JSONDecodeError:
+        logger.error(
+            f"[PAYMENT] Respons non-JSON dari provider (HTTP {response.status}): "
+            f"{raw_text[:500]}"
+        )
+        return {"success": False, "message": raw_text[:500]}
+
+
+def _autogopay_headers() -> dict:
+    return {
+        "Authorization": f"Bearer {AUTOGOPAY_API_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+
+def _extract_autogopay_data(result: dict) -> dict:
+    data = result.get("data")
+    if isinstance(data, dict):
+        nested = data.get("transaction")
+        return nested if isinstance(nested, dict) else data
+    transaction = result.get("transaction")
+    if isinstance(transaction, dict):
+        return transaction
+    return result
+
+
+def _normalize_autogopay_transaction(data: dict, fallback_amount: int = 0) -> dict:
+    provider_status = (
+        data.get("transaction_status")
+        or data.get("status")
+        or "pending"
+    )
+    transaction_id = data.get("transaction_id") or data.get("id")
+    return {
+        "payment_provider": "autogopay",
+        "provider_transaction_id": transaction_id,
+        "provider_order_id": data.get("order_id"),
+        "provider_status": str(provider_status).lower(),
+        "status": normalize_autogopay_status(provider_status),
+        "amount": _safe_int(data.get("amount"), _safe_int(fallback_amount)),
+        "fee": _safe_int(data.get("fee"), 0),
+        # Alias payment_number dipertahankan agar alur QR lama tetap kompatibel.
+        "payment_number": data.get("qr_string") or data.get("payment_number") or "",
+        "qr_string": data.get("qr_string") or data.get("payment_number") or "",
+        "qr_url": data.get("qr_url"),
+        "checkout_url": data.get("checkout_url"),
+        "transaction_time": data.get("transaction_time") or data.get("time"),
+        "expiry_time": data.get("expiry_time"),
+        "raw": data,
+    }
+
+
+async def _autogopay_create_transaction(amount: int):
+    if not AUTOGOPAY_API_KEY:
+        logger.error("[AUTOGOPAY] AUTOGOPAY_API_KEY tidak tersedia.")
+        return None
+    try:
+        session = await get_http_session()
+        async with session.post(
+            f"{AUTOGOPAY_BASE_URL}/qris/generate",
+            json={"amount": int(amount)},
+            headers=_autogopay_headers(),
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as response:
+            result = await _read_json_response(response)
+            if response.status < 200 or response.status >= 300 or result.get("success") is False:
+                logger.error(f"[AUTOGOPAY] Gagal generate QRIS HTTP {response.status}: {result}")
+                return None
+            data = _extract_autogopay_data(result)
+            normalized = _normalize_autogopay_transaction(data, amount)
+            if not normalized.get("provider_transaction_id") or not normalized.get("qr_string"):
+                logger.error(f"[AUTOGOPAY] Respons generate tidak lengkap: {result}")
+                return None
+            return normalized
+    except asyncio.TimeoutError:
+        logger.error("[AUTOGOPAY] Timeout saat membuat transaksi QRIS.")
+    except aiohttp.ClientError as e:
+        logger.error(f"[AUTOGOPAY] Gangguan koneksi saat membuat QRIS: {e}")
+    except Exception as e:
+        logger.error(f"[AUTOGOPAY] Error saat membuat QRIS: {e}", exc_info=True)
+    return None
+
+
+async def _autogopay_get_status(transaction_id: str, fallback_amount: int = 0):
+    if not AUTOGOPAY_API_KEY or not transaction_id:
+        return None
+    try:
+        session = await get_http_session()
+        async with session.post(
+            f"{AUTOGOPAY_BASE_URL}/qris/status",
+            json={"transaction_id": transaction_id},
+            headers=_autogopay_headers(),
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as response:
+            result = await _read_json_response(response)
+            if response.status < 200 or response.status >= 300 or result.get("success") is False:
+                logger.warning(f"[AUTOGOPAY] Gagal cek status HTTP {response.status}: {result}")
+                return None
+            data = _extract_autogopay_data(result)
+            normalized = _normalize_autogopay_transaction(data, fallback_amount)
+            normalized["provider_transaction_id"] = normalized.get("provider_transaction_id") or transaction_id
+            return normalized
+    except asyncio.TimeoutError:
+        logger.warning(f"[AUTOGOPAY] Timeout cek status transaksi {transaction_id}")
+    except aiohttp.ClientError as e:
+        logger.warning(f"[AUTOGOPAY] Gangguan koneksi cek status {transaction_id}: {e}")
+    except Exception as e:
+        logger.error(f"[AUTOGOPAY] Error cek status {transaction_id}: {e}", exc_info=True)
+    return None
+
+
+async def _autogopay_cancel_transaction(transaction_id: str):
+    if not AUTOGOPAY_API_KEY or not transaction_id:
+        return None
+    try:
+        session = await get_http_session()
+        async with session.post(
+            f"{AUTOGOPAY_BASE_URL}/qris/cancel",
+            json={"transaction_id": transaction_id},
+            headers=_autogopay_headers(),
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as response:
+            result = await _read_json_response(response)
+            if response.status < 200 or response.status >= 300 or result.get("success") is False:
+                logger.warning(f"[AUTOGOPAY] Gagal cancel HTTP {response.status}: {result}")
+                return None
+            return result
+    except asyncio.TimeoutError:
+        logger.warning(f"[AUTOGOPAY] Timeout cancel transaksi {transaction_id}")
+    except aiohttp.ClientError as e:
+        logger.warning(f"[AUTOGOPAY] Gangguan koneksi cancel {transaction_id}: {e}")
+    except Exception as e:
+        logger.error(f"[AUTOGOPAY] Error cancel {transaction_id}: {e}", exc_info=True)
+    return None
+
+
+async def _pakasir_create_transaction(order_id: str, amount: int):
+    if not PAKASIR_API_KEY:
+        logger.error("[PAKASIR] API key tidak tersedia untuk order lama/legacy.")
         return None
     payload = {
         "project": PAKASIR_SLUG,
@@ -246,36 +427,107 @@ async def cancel_transaction(order_id, amount):
     try:
         session = await get_http_session()
         async with session.post(
-            f'{PAKASIR_BASE_URL}/api/transactioncancel',
+            f"{PAKASIR_BASE_URL}/api/transactioncreate/qris",
             json=payload,
-            headers={'Content-Type': 'application/json'},
-            timeout=aiohttp.ClientTimeout(total=30)
+            headers={"Content-Type": "application/json"},
+            timeout=aiohttp.ClientTimeout(total=30),
         ) as response:
-            return await response.json()
+            result = await _read_json_response(response)
+            payment = result.get("payment")
+            if isinstance(payment, dict):
+                payment = dict(payment)
+                payment["payment_provider"] = "pakasir"
+                payment["provider_status"] = payment.get("status", "waiting")
+                return payment
+            logger.error(f"[PAKASIR] Gagal membuat transaksi: {result}")
     except Exception as e:
-        logger.error(f"Error saat membatalkan transaksi: {e}", exc_info=True)
+        logger.error(f"[PAKASIR] Error membuat transaksi QRIS: {e}", exc_info=True)
+    return None
+
+
+async def _pakasir_cancel_transaction(order_id: str, amount: int):
+    if not PAKASIR_API_KEY or not amount:
+        return None
+    payload = {
+        "project": PAKASIR_SLUG,
+        "order_id": order_id,
+        "amount": amount,
+        "api_key": PAKASIR_API_KEY,
+    }
+    try:
+        session = await get_http_session()
+        async with session.post(
+            f"{PAKASIR_BASE_URL}/api/transactioncancel",
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as response:
+            return await _read_json_response(response)
+    except Exception as e:
+        logger.error(f"[PAKASIR] Error membatalkan transaksi: {e}", exc_info=True)
         return None
 
-async def get_transaction_detail(order_id, amount):
+
+async def _pakasir_get_transaction_detail(order_id: str, amount: int):
+    if not PAKASIR_API_KEY:
+        return None
     try:
         session = await get_http_session()
         async with session.get(
-            f'{PAKASIR_BASE_URL}/api/transactiondetail',
+            f"{PAKASIR_BASE_URL}/api/transactiondetail",
             params={
-                'project': PAKASIR_SLUG,
-                'amount': amount,
-                'order_id': order_id,
-                'api_key': PAKASIR_API_KEY,
+                "project": PAKASIR_SLUG,
+                "amount": amount,
+                "order_id": order_id,
+                "api_key": PAKASIR_API_KEY,
             },
-            timeout=aiohttp.ClientTimeout(total=30)
+            timeout=aiohttp.ClientTimeout(total=30),
         ) as response:
-            result = await response.json()
-            if 'transaction' in result:
-                return result['transaction']
+            result = await _read_json_response(response)
+            transaction = result.get("transaction")
+            if isinstance(transaction, dict):
+                transaction = dict(transaction)
+                transaction["payment_provider"] = "pakasir"
+                transaction["provider_status"] = transaction.get("status")
+                return transaction
             return None
     except Exception as e:
-        logger.error(f"Error saat mengambil detail transaksi: {e}", exc_info=True)
+        logger.error(f"[PAKASIR] Error mengambil detail transaksi: {e}", exc_info=True)
         return None
+
+
+async def create_transaction_qris(order_id, amount, description):
+    """Buat transaksi pada provider utama untuk order baru."""
+    del description  # AutoGoPay belum mendokumentasikan parameter description.
+    if PAYMENT_PROVIDER == "autogopay":
+        return await _autogopay_create_transaction(amount)
+    return await _pakasir_create_transaction(order_id, amount)
+
+
+async def get_transaction_detail(order_id, amount):
+    """Cek transaksi berdasarkan provider yang tersimpan pada order."""
+    order = await get_order_by_id(order_id)
+    provider = str((order or {}).get("payment_provider") or "pakasir").lower()
+    if provider == "autogopay":
+        transaction_id = (order or {}).get("provider_transaction_id")
+        detail = await _autogopay_get_status(transaction_id, amount)
+        if detail:
+            await update_order_provider_status(order_id, detail.get("provider_status"))
+        return detail
+    return await _pakasir_get_transaction_detail(order_id, amount)
+
+
+async def cancel_transaction(order_id, amount):
+    """Batalkan transaksi berdasarkan provider yang tersimpan pada order."""
+    order = await get_order_by_id(order_id)
+    provider = str((order or {}).get("payment_provider") or "pakasir").lower()
+    if provider == "autogopay":
+        transaction_id = (order or {}).get("provider_transaction_id")
+        result = await _autogopay_cancel_transaction(transaction_id)
+        if result is not None:
+            await update_order_provider_status(order_id, "cancel")
+        return result
+    return await _pakasir_cancel_transaction(order_id, amount)
 
 # =================== QR CODE GENERATOR ===================
 
@@ -382,6 +634,13 @@ def init_db():
                     sent_link TEXT DEFAULT NULL,
                     harga_dibayar INTEGER DEFAULT 0,
                     order_changes INTEGER DEFAULT 0,
+                    payment_provider TEXT DEFAULT 'pakasir',
+                    provider_transaction_id TEXT DEFAULT NULL,
+                    provider_order_id TEXT DEFAULT NULL,
+                    provider_status TEXT DEFAULT NULL,
+                    payment_expires_at TIMESTAMPTZ DEFAULT NULL,
+                    checkout_url TEXT DEFAULT NULL,
+                    qr_url TEXT DEFAULT NULL,
                     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
                 )
             """)
@@ -392,6 +651,14 @@ def init_db():
             c.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_error TEXT DEFAULT NULL")
             c.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS harga_dibayar INTEGER DEFAULT 0")
             c.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS order_changes INTEGER DEFAULT 0")
+            # Kolom provider: baris lama otomatis dianggap Pakasir; order baru disimpan eksplisit.
+            c.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_provider TEXT DEFAULT 'pakasir'")
+            c.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS provider_transaction_id TEXT DEFAULT NULL")
+            c.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS provider_order_id TEXT DEFAULT NULL")
+            c.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS provider_status TEXT DEFAULT NULL")
+            c.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_expires_at TIMESTAMPTZ DEFAULT NULL")
+            c.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS checkout_url TEXT DEFAULT NULL")
+            c.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS qr_url TEXT DEFAULT NULL")
             c.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP")
 
 
@@ -439,6 +706,12 @@ def init_db():
             c.execute("CREATE INDEX IF NOT EXISTS idx_orders_user_status ON orders(user_id, status)")
             c.execute("CREATE INDEX IF NOT EXISTS idx_orders_status_created ON orders(status, created_at)")
             c.execute("CREATE INDEX IF NOT EXISTS idx_orders_delivery_status ON orders(delivery_status)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_orders_payment_provider ON orders(payment_provider)")
+            c.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_provider_transaction_id
+                ON orders(provider_transaction_id)
+                WHERE provider_transaction_id IS NOT NULL
+            """)
             c.execute("CREATE INDEX IF NOT EXISTS idx_testimonials_status ON testimonials(status)")
             c.execute("CREATE INDEX IF NOT EXISTS idx_cooldowns_user_id ON cooldowns(user_id)")
 
@@ -952,6 +1225,28 @@ def get_order_by_id(order_id):
             return dict(row) if row else None
 
 @async_wrap
+def get_order_by_provider_transaction_id(provider_transaction_id: str):
+    with db_session_safe() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                "SELECT * FROM orders WHERE provider_transaction_id=%s LIMIT 1",
+                (provider_transaction_id,)
+            )
+            row = c.fetchone()
+            return dict(row) if row else None
+
+@async_wrap
+def update_order_provider_status(order_id: str, provider_status: str):
+    if not provider_status:
+        return
+    with db_session_safe() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                "UPDATE orders SET provider_status=%s WHERE order_id=%s",
+                (str(provider_status).lower(), order_id)
+            )
+
+@async_wrap
 def get_completed_order_for_user(order_id: str, user_id: int):
     with db_session_safe() as conn:
         with conn.cursor() as c:
@@ -1080,14 +1375,31 @@ def atomic_claim_for_delivery(order_id: str) -> bool:
             return c.rowcount > 0
 
 @async_wrap
-def save_order(user_id, user_name, paket_id, order_id, harga_dibayar=0, order_changes=0):
+def save_order(user_id, user_name, paket_id, order_id, harga_dibayar=0, order_changes=0,
+               payment_provider="pakasir", provider_transaction_id=None,
+               provider_order_id=None, provider_status=None,
+               payment_expires_at=None, checkout_url=None, qr_url=None):
     with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute(
-                """INSERT INTO orders (user_id, user_name, paket_id, order_id, status, waktu, harga_dibayar, order_changes)
-                   VALUES (%s, %s, %s, %s, 'waiting', %s, %s, %s)""",
-                (user_id, user_name, paket_id, order_id,
-                 now_wib().strftime("%H:%M - %d/%m/%Y"), harga_dibayar, order_changes)
+                """INSERT INTO orders (
+                       user_id, user_name, paket_id, order_id, status, waktu,
+                       harga_dibayar, order_changes, payment_provider,
+                       provider_transaction_id, provider_order_id, provider_status,
+                       payment_expires_at, checkout_url, qr_url
+                   ) VALUES (
+                       %s, %s, %s, %s, 'waiting', %s,
+                       %s, %s, %s,
+                       %s, %s, %s,
+                       %s, %s, %s
+                   )""",
+                (
+                    user_id, user_name, paket_id, order_id,
+                    now_wib().strftime("%H:%M - %d/%m/%Y"),
+                    harga_dibayar, order_changes, payment_provider,
+                    provider_transaction_id, provider_order_id, provider_status,
+                    payment_expires_at, checkout_url, qr_url,
+                )
             )
 
 # =================== BAN DB FUNCTIONS ===================
@@ -1677,7 +1989,111 @@ def verify_telegram_webapp_signature(init_data: str, bot_token: str) -> bool:
         logger.error(f"[SECURITY] Gagal memverifikasi signature Telegram WebApp: {e}")
         return False
 
-# =================== WEBHOOK SERVER (PAKASIR) ===================
+# =================== PAYMENT WEBHOOK SERVER ===================
+
+async def _process_autogopay_settlement(order: dict, paid_amount: int):
+    """Proses delivery di luar response webhook agar callback dibalas cepat."""
+    try:
+        await _stop_payment_task(order["user_id"])
+        await _handle_payment_success(
+            _current_bot,
+            order["order_id"],
+            order["paket_id"],
+            order["user_id"],
+            order.get("user_name", "User"),
+            paid_amount,
+            {
+                "amount": paid_amount,
+                "status": "completed",
+                "provider_status": "settlement",
+            },
+        )
+        logger.info(f"[AUTOGOPAY WEBHOOK] Settlement diproses: {order['order_id']}")
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.error(
+            f"[AUTOGOPAY WEBHOOK] Gagal memproses settlement {order.get('order_id')}: {e}",
+            exc_info=True,
+        )
+
+
+async def autogopay_webhook_handler(request: aio_web.Request) -> aio_web.Response:
+    if not AUTOGOPAY_API_KEY:
+        logger.error("[AUTOGOPAY WEBHOOK] API key belum dikonfigurasi.")
+        return aio_web.Response(status=503, text="webhook not configured")
+
+    try:
+        body = await request.read()
+    except Exception:
+        return aio_web.Response(status=400, text="invalid request")
+
+    received_signature = (request.headers.get("X-Signature") or "").strip()
+    if received_signature.lower().startswith("sha256="):
+        received_signature = received_signature.split("=", 1)[1].strip()
+    expected_signature = hmac.new(
+        AUTOGOPAY_API_KEY.encode("utf-8"),
+        body,
+        hashlib.sha256,
+    ).hexdigest()
+    if not received_signature or not hmac.compare_digest(received_signature, expected_signature):
+        logger.warning("[AUTOGOPAY WEBHOOK] Signature tidak valid.")
+        return aio_web.Response(status=401, text="invalid signature")
+
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        return aio_web.Response(status=400, text="invalid json")
+
+    callback_event = str(
+        data.get("event") or request.headers.get("X-Callback-Event") or ""
+    ).strip().lower()
+    if callback_event != "transaction.received":
+        return aio_web.json_response({"success": True, "ignored": True})
+
+    transaction = data.get("transaction")
+    if not isinstance(transaction, dict):
+        return aio_web.Response(status=400, text="missing transaction")
+
+    provider_transaction_id = transaction.get("id") or transaction.get("transaction_id")
+    provider_status = str(transaction.get("status") or "").strip().lower()
+    paid_amount = _safe_int(transaction.get("amount"), -1)
+
+    if not provider_transaction_id:
+        return aio_web.Response(status=400, text="missing transaction id")
+
+    order = await get_order_by_provider_transaction_id(str(provider_transaction_id))
+    if not order:
+        logger.warning(
+            f"[AUTOGOPAY WEBHOOK] Transaction ID tidak ditemukan: {provider_transaction_id}"
+        )
+        return aio_web.Response(status=404, text="order not found")
+
+    await update_order_provider_status(order["order_id"], provider_status)
+
+    # Event non-settlement cukup dicatat. Polling tetap menjadi fallback status.
+    if provider_status != "settlement":
+        return aio_web.json_response({"success": True, "ignored": True})
+
+    if order.get("status") != "waiting":
+        return aio_web.json_response({"success": True, "already_processed": True})
+
+    expected_amount = _safe_int(order.get("harga_dibayar"), 0)
+    if paid_amount < 0 or expected_amount <= 0 or paid_amount != expected_amount:
+        logger.error(
+            f"[AUTOGOPAY WEBHOOK] Nominal tidak cocok untuk {order['order_id']}: "
+            f"expected={expected_amount}, received={paid_amount}"
+        )
+        return aio_web.Response(status=400, text="amount mismatch")
+
+    if not _current_bot:
+        logger.error(f"[AUTOGOPAY WEBHOOK] Bot belum siap: {order['order_id']}")
+        return aio_web.Response(status=503, text="bot not ready")
+
+    # AutoGoPay meminta HTTP 200 maksimal 10 detik. Delivery Telegram dilakukan async.
+    asyncio.create_task(_process_autogopay_settlement(order, paid_amount))
+    return aio_web.json_response({"success": True})
+
 
 async def pakasir_webhook_handler(request: aio_web.Request) -> aio_web.Response:
     if PAKASIR_WEBHOOK_SECRET:
@@ -2247,6 +2663,8 @@ async def _start_webhook_server():
     webhook_app = aio_web.Application(middlewares=[_api_error_middleware])
 
     # Endpoints Webhook & Status
+    webhook_app.router.add_post('/webhook/autogopay', autogopay_webhook_handler)
+    # Route Pakasir lama dipertahankan sampai semua invoice legacy selesai.
     webhook_app.router.add_post('/webhook/pakasir', pakasir_webhook_handler)
     webhook_app.router.add_get('/health', lambda r: aio_web.Response(text='ok'))
     webhook_app.router.add_get('/', lambda r: aio_web.Response(text='Hyper Family Store Bot - OK'))
@@ -2327,15 +2745,27 @@ async def post_init(application: Application):
             if not paket:
                 continue
             recovery_amount = order.get('harga_dibayar') or paket['harga']
-            if order.get('created_at'):
+            provider = str(order.get('payment_provider') or 'pakasir').lower()
+            fallback_timeout = (
+                AUTOGOPAY_DEFAULT_TIMEOUT_SECONDS
+                if provider == 'autogopay'
+                else PAKASIR_DEFAULT_TIMEOUT_SECONDS
+            )
+            expiry_dt = parse_provider_datetime(order.get('payment_expires_at'))
+            if expiry_dt is not None:
+                recovery_timeout = max(1, int((expiry_dt - now_wib()).total_seconds()))
+            elif order.get('created_at'):
                 try:
-                    elapsed = int((now_wib() - order['created_at']).total_seconds())
-                    recovery_timeout = max(300, 1800 - elapsed)
+                    created_at = order['created_at']
+                    if created_at.tzinfo is None:
+                        created_at = created_at.replace(tzinfo=timezone.utc)
+                    elapsed = int((now_wib() - created_at.astimezone(WIB)).total_seconds())
+                    recovery_timeout = max(1, fallback_timeout - elapsed)
                 except Exception as e:
                     logger.debug(f"Gagal menghitung selisih durasi order untuk recovery: {e}")
-                    recovery_timeout = 300
+                    recovery_timeout = 60
             else:
-                recovery_timeout = 300
+                recovery_timeout = 60
             _start_payment_task(
                 application.bot,
                 order_id=order['order_id'],
@@ -2703,7 +3133,7 @@ async def _buat_order_baru(update, context, query, user_id, user_name, paket, or
         await hapus_msg_user_lama(context, user_id, keep_last=2)
         return
 
-    qris_string = trans_data.get('payment_number', '')
+    qris_string = trans_data.get('qr_string') or trans_data.get('payment_number', '')
     if not qris_string:
         msg = await context.bot.send_message(
             chat_id=update.effective_chat.id,
@@ -2717,11 +3147,43 @@ async def _buat_order_baru(update, context, query, user_id, user_name, paket, or
     fee = trans_data.get('fee', 0)
     total_payment = amount + fee
 
-    await save_order(user_id, user_name, paket['paket_id'], order_id,
-                     harga_dibayar=total_payment, order_changes=order_changes)
+    payment_provider = trans_data.get('payment_provider') or PAYMENT_PROVIDER
+    expiry_dt = parse_provider_datetime(trans_data.get('expiry_time'))
+    if expiry_dt is None:
+        fallback_seconds = (
+            AUTOGOPAY_DEFAULT_TIMEOUT_SECONDS
+            if payment_provider == 'autogopay'
+            else PAKASIR_DEFAULT_TIMEOUT_SECONDS
+        )
+        expiry_dt = now_wib() + timedelta(seconds=fallback_seconds)
+    timeout_secs = max(1, int((expiry_dt - now_wib()).total_seconds()))
+    expire = expiry_dt.strftime("%H:%M")
 
-    QRIS_TIMEOUT_MENIT = 30
-    expire = (now_wib() + timedelta(minutes=QRIS_TIMEOUT_MENIT)).strftime("%H:%M")
+    try:
+        await save_order(
+            user_id, user_name, paket['paket_id'], order_id,
+            harga_dibayar=total_payment,
+            order_changes=order_changes,
+            payment_provider=payment_provider,
+            provider_transaction_id=trans_data.get('provider_transaction_id'),
+            provider_order_id=trans_data.get('provider_order_id'),
+            provider_status=trans_data.get('provider_status'),
+            payment_expires_at=expiry_dt,
+            checkout_url=trans_data.get('checkout_url'),
+            qr_url=trans_data.get('qr_url'),
+        )
+    except Exception as e:
+        logger.error(f"[PAYMENT] Gagal menyimpan order {order_id}: {e}", exc_info=True)
+        if payment_provider == 'autogopay':
+            await _autogopay_cancel_transaction(trans_data.get('provider_transaction_id'))
+        else:
+            await _pakasir_cancel_transaction(order_id, total_payment)
+        msg = await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="❌ Gagal menyimpan invoice. Silakan coba lagi.\nKetik /start untuk memulai ulang.",
+        )
+        simpan_msg_user(context, user_id, msg.message_id)
+        return
 
     qr_buffer = await asyncio.to_thread(generate_qr_image, qris_string)
 
@@ -2757,13 +3219,14 @@ async def _buat_order_baru(update, context, query, user_id, user_name, paket, or
         f"⏳ Menunggu pembayaran..."
     )
 
+    kb = []
+    checkout_url = str(trans_data.get('checkout_url') or '').strip()
+    parsed_checkout = urllib.parse.urlparse(checkout_url) if checkout_url else None
+    if parsed_checkout and parsed_checkout.scheme == 'https' and parsed_checkout.netloc:
+        kb.append([InlineKeyboardButton("🌐 Buka Halaman Pembayaran", url=checkout_url)])
     if sisa_ganti > 0:
-        kb = [
-            [InlineKeyboardButton(f"🔄 Ganti Paket (sisa {sisa_ganti}x)", callback_data="ganti_paket_list")],
-            [InlineKeyboardButton("❌ Batalkan Pesanan", callback_data="cancel_order")],
-        ]
-    else:
-        kb = [[InlineKeyboardButton("❌ Batalkan Pesanan", callback_data="cancel_order")]]
+        kb.append([InlineKeyboardButton(f"🔄 Ganti Paket (sisa {sisa_ganti}x)", callback_data="ganti_paket_list")])
+    kb.append([InlineKeyboardButton("❌ Batalkan Pesanan", callback_data="cancel_order")])
 
     if query:
         try:
@@ -2794,8 +3257,6 @@ async def _buat_order_baru(update, context, query, user_id, user_name, paket, or
     )
     if msg_id:
         await set_admin_msg_id(order_id, msg_id)
-
-    timeout_secs = QRIS_TIMEOUT_MENIT * 60
 
     _start_payment_task(
         context.bot, order_id, paket['paket_id'], user_id, user_name,
@@ -3134,8 +3595,9 @@ async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
     elapsed = 0
     try:
         while elapsed < timeout_seconds:
-            await asyncio.sleep(30)
-            elapsed += 30
+            sleep_for = min(30, max(1, timeout_seconds - elapsed))
+            await asyncio.sleep(sleep_for)
+            elapsed += sleep_for
 
             row = await _check_order_status(order_id)
             if not row or row['status'] != 'waiting':

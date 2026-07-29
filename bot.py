@@ -14,6 +14,9 @@ import string
 import functools
 import urllib.parse
 import time as _time
+import copy
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 from aiohttp import web as aio_web
 import aiohttp
 import qrcode
@@ -32,6 +35,12 @@ from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, ChatJoinRequestHandler, filters, ContextTypes
 )
+
+try:
+    # Tersedia mulai python-telegram-bot 20.4.
+    from telegram.ext import BaseUpdateProcessor
+except ImportError:  # Fallback aman untuk PTB 20.0-20.3.
+    BaseUpdateProcessor = None
 
 # =================== LOGGING SETUP ===================
 logging.basicConfig(
@@ -165,6 +174,19 @@ def _safe_int(value, default=0) -> int:
     except (TypeError, ValueError):
         return default
 
+
+def _env_int(name: str, default: int, minimum: int = 1, maximum: int = 1000) -> int:
+    value = _safe_int(os.environ.get(name), default)
+    return max(minimum, min(maximum, value))
+
+
+def _env_float(name: str, default: float, minimum: float = 0.0, maximum: float = 300.0) -> float:
+    try:
+        value = float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
+
 # =================== TIMEZONE ===================
 WIB = timezone(timedelta(hours=7))
 
@@ -185,6 +207,20 @@ APP_ENV = os.environ.get("APP_ENV") or os.environ.get("ENV") or "development"
 AUTOGOPAY_API_KEY = (os.environ.get("AUTOGOPAY_API_KEY") or "").strip()
 AUTOGOPAY_BASE_URL = (os.environ.get("AUTOGOPAY_BASE_URL") or "https://v1-gateway.autogopay.site").rstrip("/")
 AUTOGOPAY_DEFAULT_TIMEOUT_SECONDS = 15 * 60
+
+# =================== PERFORMANCE TUNING ===================
+# Berbeda user/chat diproses paralel, tetapi update dari chat yang sama tetap berurutan.
+BOT_CONCURRENT_UPDATES = _env_int("BOT_CONCURRENT_UPDATES", 24, 4, 128)
+TELEGRAM_CONNECTION_POOL_SIZE = _env_int("TELEGRAM_CONNECTION_POOL_SIZE", 64, 16, 256)
+TELEGRAM_POOL_TIMEOUT_SECONDS = _env_float("TELEGRAM_POOL_TIMEOUT_SECONDS", 15.0, 1.0, 60.0)
+DB_POOL_MIN = _env_int("DB_POOL_MIN", 2, 1, 10)
+DB_POOL_MAX = _env_int("DB_POOL_MAX", 20, DB_POOL_MIN, 50)
+DB_THREAD_WORKERS = _env_int("DB_THREAD_WORKERS", min(24, DB_POOL_MAX), 4, 50)
+DB_SLOW_SESSION_SECONDS = _env_float("DB_SLOW_SESSION_SECONDS", 1.0, 0.1, 30.0)
+SLOW_UPDATE_THRESHOLD_SECONDS = _env_float("SLOW_UPDATE_THRESHOLD_SECONDS", 1.5, 0.2, 30.0)
+EVENT_LOOP_LAG_WARNING_SECONDS = _env_float("EVENT_LOOP_LAG_WARNING_SECONDS", 0.75, 0.1, 10.0)
+STATS_CACHE_TTL_SECONDS = _env_float("STATS_CACHE_TTL_SECONDS", 10.0, 1.0, 120.0)
+AUTOGOPAY_MAX_CONCURRENT_REQUESTS = _env_int("AUTOGOPAY_MAX_CONCURRENT_REQUESTS", 20, 2, 50)
 
 # Timeout dibuat lebih pendek agar gangguan provider tidak menahan update Telegram terlalu lama.
 AUTOGOPAY_HTTP_TIMEOUT = aiohttp.ClientTimeout(
@@ -211,23 +247,120 @@ if not DATABASE_URL:
 if not AUTOGOPAY_API_KEY:
     raise ValueError("AUTOGOPAY_API_KEY tidak di-set!")
 
+# =================== CONCURRENCY & BACKGROUND TASKS ===================
+_background_tasks: set = set()
+
+
+def spawn_background(coro, *, name: str = None):
+    """Jalankan coroutine tanpa menahan handler dan tetap laporkan exception-nya."""
+    task = asyncio.create_task(coro, name=name)
+    _background_tasks.add(task)
+
+    def _done(done_task):
+        _background_tasks.discard(done_task)
+        if done_task.cancelled():
+            return
+        try:
+            exc = done_task.exception()
+        except asyncio.CancelledError:
+            return
+        if exc:
+            logger.error(
+                f"[BACKGROUND] Task {done_task.get_name()} gagal: {exc}",
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+
+    task.add_done_callback(_done)
+    return task
+
+
+if BaseUpdateProcessor is not None:
+    class PerChatUpdateProcessor(BaseUpdateProcessor):
+        """Paralel antar-chat, serial di chat yang sama agar state/order tidak race."""
+
+        def __init__(self, max_concurrent_updates: int):
+            super().__init__(max_concurrent_updates)
+            self._chat_locks = {}
+            self._locks_guard = None
+
+        async def initialize(self):
+            self._locks_guard = asyncio.Lock()
+
+        async def shutdown(self):
+            self._chat_locks.clear()
+
+        async def _get_lock(self, key):
+            if self._locks_guard is None:
+                self._locks_guard = asyncio.Lock()
+            async with self._locks_guard:
+                lock = self._chat_locks.get(key)
+                if lock is None:
+                    lock = asyncio.Lock()
+                    self._chat_locks[key] = lock
+                return lock
+
+        async def do_process_update(self, update, coroutine):
+            chat = getattr(update, "effective_chat", None)
+            user = getattr(update, "effective_user", None)
+            key = (
+                ("chat", chat.id) if chat is not None
+                else ("user", user.id) if user is not None
+                else ("update", getattr(update, "update_id", id(update)))
+            )
+            lock = await self._get_lock(key)
+            started = _time.monotonic()
+            try:
+                async with lock:
+                    await coroutine
+            finally:
+                elapsed = _time.monotonic() - started
+                if elapsed >= SLOW_UPDATE_THRESHOLD_SECONDS:
+                    logger.warning(
+                        f"[SLOW UPDATE] key={key} update_id={getattr(update, 'update_id', '-')} "
+                        f"durasi={elapsed:.2f}s"
+                    )
+else:
+    PerChatUpdateProcessor = None
+
 # =================== SINGLETON HTTP SESSION ===================
 _http_session: aiohttp.ClientSession = None
+_http_session_lock: asyncio.Lock = None
+_autogopay_request_semaphore: asyncio.Semaphore = None
+
+
+async def _get_http_session_lock() -> asyncio.Lock:
+    global _http_session_lock
+    if _http_session_lock is None:
+        _http_session_lock = asyncio.Lock()
+    return _http_session_lock
+
+
+async def _get_autogopay_semaphore() -> asyncio.Semaphore:
+    global _autogopay_request_semaphore
+    if _autogopay_request_semaphore is None:
+        _autogopay_request_semaphore = asyncio.Semaphore(AUTOGOPAY_MAX_CONCURRENT_REQUESTS)
+    return _autogopay_request_semaphore
+
 
 async def get_http_session() -> aiohttp.ClientSession:
     global _http_session
-    if _http_session is None or _http_session.closed:
-        connector = aiohttp.TCPConnector(
-            limit=50,
-            limit_per_host=20,
-            ttl_dns_cache=300,
-            keepalive_timeout=30,
-            enable_cleanup_closed=True,
-        )
-        _http_session = aiohttp.ClientSession(
-            connector=connector,
-            timeout=AUTOGOPAY_HTTP_TIMEOUT,
-        )
+    if _http_session is not None and not _http_session.closed:
+        return _http_session
+
+    lock = await _get_http_session_lock()
+    async with lock:
+        if _http_session is None or _http_session.closed:
+            connector = aiohttp.TCPConnector(
+                limit=50,
+                limit_per_host=AUTOGOPAY_MAX_CONCURRENT_REQUESTS,
+                ttl_dns_cache=600,
+                keepalive_timeout=45,
+                enable_cleanup_closed=True,
+            )
+            _http_session = aiohttp.ClientSession(
+                connector=connector,
+                timeout=AUTOGOPAY_HTTP_TIMEOUT,
+            )
     return _http_session
 
 # =================== PAYMENT PROVIDER API ===================
@@ -345,23 +478,25 @@ async def _autogopay_create_transaction(amount: int):
         logger.error("[AUTOGOPAY] AUTOGOPAY_API_KEY tidak tersedia.")
         return None
     try:
-        session = await get_http_session()
-        async with session.post(
-            f"{AUTOGOPAY_BASE_URL}/qris/generate",
-            json={"amount": int(amount)},
-            headers=_autogopay_headers(),
-            timeout=AUTOGOPAY_HTTP_TIMEOUT,
-        ) as response:
-            result = await _read_json_response(response)
-            if response.status < 200 or response.status >= 300 or result.get("success") is False:
-                logger.error(f"[AUTOGOPAY] Gagal generate QRIS HTTP {response.status}: {result}")
-                return None
-            data = _extract_autogopay_data(result)
-            normalized = _normalize_autogopay_transaction(data, amount)
-            if not normalized.get("provider_transaction_id") or not normalized.get("qr_string"):
-                logger.error(f"[AUTOGOPAY] Respons generate tidak lengkap: {result}")
-                return None
-            return normalized
+        semaphore = await _get_autogopay_semaphore()
+        async with semaphore:
+            session = await get_http_session()
+            async with session.post(
+                f"{AUTOGOPAY_BASE_URL}/qris/generate",
+                json={"amount": int(amount)},
+                headers=_autogopay_headers(),
+                timeout=AUTOGOPAY_HTTP_TIMEOUT,
+            ) as response:
+                result = await _read_json_response(response)
+                if response.status < 200 or response.status >= 300 or result.get("success") is False:
+                    logger.error(f"[AUTOGOPAY] Gagal generate QRIS HTTP {response.status}: {result}")
+                    return None
+                data = _extract_autogopay_data(result)
+                normalized = _normalize_autogopay_transaction(data, amount)
+                if not normalized.get("provider_transaction_id") or not normalized.get("qr_string"):
+                    logger.error(f"[AUTOGOPAY] Respons generate tidak lengkap: {result}")
+                    return None
+                return normalized
     except asyncio.TimeoutError:
         logger.error("[AUTOGOPAY] Timeout saat membuat transaksi QRIS.")
     except aiohttp.ClientError as e:
@@ -375,21 +510,23 @@ async def _autogopay_get_status(transaction_id: str, fallback_amount: int = 0):
     if not AUTOGOPAY_API_KEY or not transaction_id:
         return None
     try:
-        session = await get_http_session()
-        async with session.post(
-            f"{AUTOGOPAY_BASE_URL}/qris/status",
-            json={"transaction_id": transaction_id},
-            headers=_autogopay_headers(),
-            timeout=AUTOGOPAY_HTTP_TIMEOUT,
-        ) as response:
-            result = await _read_json_response(response)
-            if response.status < 200 or response.status >= 300 or result.get("success") is False:
-                logger.warning(f"[AUTOGOPAY] Gagal cek status HTTP {response.status}: {result}")
-                return None
-            data = _extract_autogopay_data(result)
-            normalized = _normalize_autogopay_transaction(data, fallback_amount)
-            normalized["provider_transaction_id"] = normalized.get("provider_transaction_id") or transaction_id
-            return normalized
+        semaphore = await _get_autogopay_semaphore()
+        async with semaphore:
+            session = await get_http_session()
+            async with session.post(
+                f"{AUTOGOPAY_BASE_URL}/qris/status",
+                json={"transaction_id": transaction_id},
+                headers=_autogopay_headers(),
+                timeout=AUTOGOPAY_HTTP_TIMEOUT,
+            ) as response:
+                result = await _read_json_response(response)
+                if response.status < 200 or response.status >= 300 or result.get("success") is False:
+                    logger.warning(f"[AUTOGOPAY] Gagal cek status HTTP {response.status}: {result}")
+                    return None
+                data = _extract_autogopay_data(result)
+                normalized = _normalize_autogopay_transaction(data, fallback_amount)
+                normalized["provider_transaction_id"] = normalized.get("provider_transaction_id") or transaction_id
+                return normalized
     except asyncio.TimeoutError:
         logger.warning(f"[AUTOGOPAY] Timeout cek status transaksi {transaction_id}")
     except aiohttp.ClientError as e:
@@ -403,18 +540,20 @@ async def _autogopay_cancel_transaction(transaction_id: str):
     if not AUTOGOPAY_API_KEY or not transaction_id:
         return None
     try:
-        session = await get_http_session()
-        async with session.post(
-            f"{AUTOGOPAY_BASE_URL}/qris/cancel",
-            json={"transaction_id": transaction_id},
-            headers=_autogopay_headers(),
-            timeout=AUTOGOPAY_HTTP_TIMEOUT,
-        ) as response:
-            result = await _read_json_response(response)
-            if response.status < 200 or response.status >= 300 or result.get("success") is False:
-                logger.warning(f"[AUTOGOPAY] Gagal cancel HTTP {response.status}: {result}")
-                return None
-            return result
+        semaphore = await _get_autogopay_semaphore()
+        async with semaphore:
+            session = await get_http_session()
+            async with session.post(
+                f"{AUTOGOPAY_BASE_URL}/qris/cancel",
+                json={"transaction_id": transaction_id},
+                headers=_autogopay_headers(),
+                timeout=AUTOGOPAY_HTTP_TIMEOUT,
+            ) as response:
+                result = await _read_json_response(response)
+                if response.status < 200 or response.status >= 300 or result.get("success") is False:
+                    logger.warning(f"[AUTOGOPAY] Gagal cancel HTTP {response.status}: {result}")
+                    return None
+                return result
     except asyncio.TimeoutError:
         logger.warning(f"[AUTOGOPAY] Timeout cancel transaksi {transaction_id}")
     except aiohttp.ClientError as e:
@@ -475,41 +614,71 @@ def generate_qr_image(qris_string):
 
 _pool: ThreadedConnectionPool = None
 
+
 def init_pool():
     global _pool
-    # Alokasi pool dinamis yang lebih tinggi untuk mengantisipasi concurrent request
-    _pool = ThreadedConnectionPool(5, 30, DATABASE_URL, cursor_factory=RealDictCursor)
-    logger.info("[DB] Threaded Connection pool berhasil diinisialisasi (min=5, max=30)")
+    _pool = ThreadedConnectionPool(
+        DB_POOL_MIN,
+        DB_POOL_MAX,
+        DATABASE_URL,
+        cursor_factory=RealDictCursor,
+        connect_timeout=10,
+        application_name="hyperfamily_bot",
+    )
+    logger.info(
+        f"[DB] Connection pool aktif (min={DB_POOL_MIN}, max={DB_POOL_MAX}, "
+        f"workers={DB_THREAD_WORKERS})"
+    )
+
 
 @contextmanager
-def db_session_safe(retries=3, delay=0.5):
+def db_session_safe(retries=3, delay=0.15):
     """
-    Context manager aman dengan mekanisme retry eksponensial.
-    Mencegah crash aplikasi akibat Pool Exhaustion pada beban konkurensi tinggi.
+    Koneksi memakai autocommit agar query SELECT tidak melakukan COMMIT tambahan.
+    Semua fungsi database tetap dijalankan di thread worker melalui async_wrap/to_thread.
     """
     conn = None
+    started = _time.monotonic()
     for attempt in range(retries):
         try:
             conn = _pool.getconn()
+            if conn.closed:
+                _pool.putconn(conn, close=True)
+                conn = None
+                raise psycopg2.InterfaceError("Koneksi database tertutup")
+            # Pastikan koneksi yang kembali dari pool tidak membawa transaksi lama.
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            conn.autocommit = True
             break
-        except psycopg2.pool.PoolError:
+        except (psycopg2.pool.PoolError, psycopg2.InterfaceError, psycopg2.OperationalError):
             if attempt == retries - 1:
-                logger.error("[DB CRITICAL] Connection pool habis dan seluruh upaya retry gagal!")
+                logger.error("[DB CRITICAL] Gagal memperoleh koneksi database setelah retry.")
                 raise
             time_sleep = delay * (2 ** attempt)
-            logger.warning(f"[DB WARN] Pool exhausted. Menunggu {time_sleep}s sebelum mencoba kembali (Percobaan ke-{attempt+1})...")
             _time.sleep(time_sleep)
     try:
         yield conn
-        conn.commit()
     except Exception as e:
-        if conn:
-            conn.rollback()
-        logger.error(f"[DB ERROR] Transaksi database gagal dan di-rollback: {e}", exc_info=True)
+        if conn and not conn.closed:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        logger.error(f"[DB ERROR] Operasi database gagal: {e}", exc_info=True)
         raise
     finally:
         if conn and _pool:
-            _pool.putconn(conn)
+            try:
+                conn.autocommit = True
+            except Exception:
+                pass
+            _pool.putconn(conn, close=bool(conn.closed))
+        elapsed = _time.monotonic() - started
+        if elapsed >= DB_SLOW_SESSION_SECONDS:
+            logger.warning(f"[SLOW DB] Sesi database memakan {elapsed:.2f}s")
 
 def async_wrap(func):
     @functools.wraps(func)
@@ -1122,6 +1291,33 @@ def get_order_stats(today_start: datetime, month_start: datetime):
         'days_elapsed': days_elapsed,
     }
 
+_stats_cache = None
+_stats_cache_lock: asyncio.Lock = None
+
+
+async def get_order_stats_cached(today_start: datetime, month_start: datetime, force: bool = False):
+    """Cache singkat agar dashboard polling tidak membebani DB dengan banyak agregasi."""
+    global _stats_cache, _stats_cache_lock
+    key = (today_start.isoformat(), month_start.isoformat())
+    now_mono = _time.monotonic()
+    if not force and _stats_cache:
+        cache_key, expires_at, value = _stats_cache
+        if cache_key == key and now_mono < expires_at:
+            return copy.deepcopy(value)
+
+    if _stats_cache_lock is None:
+        _stats_cache_lock = asyncio.Lock()
+    async with _stats_cache_lock:
+        now_mono = _time.monotonic()
+        if not force and _stats_cache:
+            cache_key, expires_at, value = _stats_cache
+            if cache_key == key and now_mono < expires_at:
+                return copy.deepcopy(value)
+        value = await get_order_stats(today_start, month_start)
+        _stats_cache = (key, now_mono + STATS_CACHE_TTL_SECONDS, copy.deepcopy(value))
+        return copy.deepcopy(value)
+
+
 @async_wrap
 def update_order_status(order_id, status):
     with db_session_safe() as conn:
@@ -1330,12 +1526,22 @@ def save_order(user_id, user_name, paket_id, order_id, harga_dibayar=0, order_ch
 
 # =================== BAN DB FUNCTIONS ===================
 
+_banned_cache: dict = {}
+_BANNED_CACHE_TTL = 30
+
+
 @async_wrap
 def is_banned(user_id):
+    now_mono = _time.monotonic()
+    cached = _banned_cache.get(user_id)
+    if cached and now_mono < cached[1]:
+        return cached[0]
     with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("SELECT 1 FROM banned_users WHERE user_id=%s", (user_id,))
-            return c.fetchone() is not None
+            result = c.fetchone() is not None
+    _banned_cache[user_id] = (result, now_mono + _BANNED_CACHE_TTL)
+    return result
 
 @async_wrap
 def ban_user(user_id, reason=""):
@@ -1347,12 +1553,14 @@ def ban_user(user_id, reason=""):
                    ON CONFLICT (user_id) DO UPDATE SET reason=EXCLUDED.reason, banned_at=EXCLUDED.banned_at""",
                 (user_id, reason, now_wib().strftime("%H:%M - %d/%m/%Y"))
             )
+    _banned_cache[user_id] = (True, _time.monotonic() + _BANNED_CACHE_TTL)
 
 @async_wrap
 def unban_user(user_id):
     with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("DELETE FROM banned_users WHERE user_id=%s", (user_id,))
+    _banned_cache[user_id] = (False, _time.monotonic() + _BANNED_CACHE_TTL)
 
 @async_wrap
 def get_all_banned():
@@ -1795,11 +2003,16 @@ def simpan_admin_msg(context, user_id, message_id):
 
 async def hapus_admin_msg(context, user_id):
     msg_ids = context.bot_data.get('admin_messages', {}).pop(user_id, [])
-    for msg_id in msg_ids:
-        try:
-            await context.bot.delete_message(chat_id=user_id, message_id=msg_id)
-        except Exception as e:
-            logger.debug(f"Gagal hapus pesan admin: {e}")
+    if not msg_ids:
+        return
+
+    async def _cleanup():
+        await asyncio.gather(*[
+            _safe_delete_chat_message(context.bot, user_id, msg_id, "pesan admin lama")
+            for msg_id in msg_ids
+        ], return_exceptions=True)
+
+    spawn_background(_cleanup(), name=f"cleanup-admin-{user_id}")
 
 def simpan_msg_user(context, user_id, message_id):
     context.bot_data.setdefault('user_messages', {})
@@ -1808,14 +2021,18 @@ def simpan_msg_user(context, user_id, message_id):
 
 async def hapus_msg_user_lama(context, user_id, keep_last=1):
     msgs = context.bot_data.get('user_messages', {}).get(user_id, [])
-    if len(msgs) > keep_last:
-        to_delete = msgs[:-keep_last]
-        context.bot_data['user_messages'][user_id] = msgs[-keep_last:]
-        for msg_id in to_delete:
-            try:
-                await context.bot.delete_message(chat_id=user_id, message_id=msg_id)
-            except Exception as e:
-                logger.debug(f"Gagal hapus pesan user lama: {e}")
+    if len(msgs) <= keep_last:
+        return
+    to_delete = msgs[:-keep_last] if keep_last else list(msgs)
+    context.bot_data['user_messages'][user_id] = msgs[-keep_last:] if keep_last else []
+
+    async def _cleanup():
+        await asyncio.gather(*[
+            _safe_delete_chat_message(context.bot, user_id, msg_id, "pesan user lama")
+            for msg_id in to_delete
+        ], return_exceptions=True)
+
+    spawn_background(_cleanup(), name=f"cleanup-user-{user_id}")
 
 # =================== COOLDOWN MESSAGE ANTI-SPAM ===================
 COOLDOWN_NOTICE_DEBOUNCE_SECONDS = 5
@@ -2018,7 +2235,7 @@ async def autogopay_webhook_handler(request: aio_web.Request) -> aio_web.Respons
         return aio_web.Response(status=503, text="bot not ready")
 
     # AutoGoPay meminta HTTP 200 maksimal 10 detik. Delivery Telegram dilakukan async.
-    asyncio.create_task(_process_autogopay_settlement(order, paid_amount))
+    spawn_background(_process_autogopay_settlement(order, paid_amount), name=f"settlement-{order.get('order_id')}")
     return aio_web.json_response({"success": True})
 
 
@@ -2134,12 +2351,32 @@ async def _api_error_middleware(request: aio_web.Request, handler):
             text=json.dumps({'error': 'Internal server error'})
         )
 
+_dashboard_html_cache = None
+_dashboard_html_cache_lock: asyncio.Lock = None
+
+
 async def api_serve_dashboard(request: aio_web.Request) -> aio_web.Response:
+    global _dashboard_html_cache, _dashboard_html_cache_lock
     path = _dashboard_html_path()
     if not path:
         return aio_web.Response(status=404, text='dashboard.html tidak ditemukan.')
-    with open(path, 'r', encoding='utf-8') as f:
-        content = f.read()
+
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return aio_web.Response(status=404, text='dashboard.html tidak ditemukan.')
+
+    if _dashboard_html_cache and _dashboard_html_cache[0] == path and _dashboard_html_cache[1] == mtime:
+        return aio_web.Response(content_type='text/html', text=_dashboard_html_cache[2])
+
+    if _dashboard_html_cache_lock is None:
+        _dashboard_html_cache_lock = asyncio.Lock()
+    async with _dashboard_html_cache_lock:
+        if _dashboard_html_cache and _dashboard_html_cache[0] == path and _dashboard_html_cache[1] == mtime:
+            content = _dashboard_html_cache[2]
+        else:
+            content = await asyncio.to_thread(Path(path).read_text, encoding='utf-8')
+            _dashboard_html_cache = (path, mtime, content)
     return aio_web.Response(content_type='text/html', text=content)
 
 
@@ -2231,9 +2468,29 @@ def _get_all_orders_api():
             """)
             return [dict(r) for r in c.fetchall()]
 
+_api_orders_cache = None
+_api_orders_cache_lock: asyncio.Lock = None
+
+
+async def _get_all_orders_api_cached():
+    global _api_orders_cache, _api_orders_cache_lock
+    now_mono = _time.monotonic()
+    if _api_orders_cache and now_mono < _api_orders_cache[0]:
+        return copy.deepcopy(_api_orders_cache[1])
+    if _api_orders_cache_lock is None:
+        _api_orders_cache_lock = asyncio.Lock()
+    async with _api_orders_cache_lock:
+        now_mono = _time.monotonic()
+        if _api_orders_cache and now_mono < _api_orders_cache[0]:
+            return copy.deepcopy(_api_orders_cache[1])
+        value = await _get_all_orders_api()
+        _api_orders_cache = (now_mono + 2.0, copy.deepcopy(value))
+        return value
+
+
 async def api_get_orders(request: aio_web.Request) -> aio_web.Response:
     if not await _api_auth(request): return _err('Unauthorized', 401)
-    return _json_resp(await _get_all_orders_api())
+    return _json_resp(await _get_all_orders_api_cached())
 
 async def api_confirm_order(request: aio_web.Request) -> aio_web.Response:
     if not await _api_auth(request): return _err('Unauthorized', 401)
@@ -2295,9 +2552,29 @@ def _get_all_testimonials_api():
             c.execute("SELECT * FROM testimonials ORDER BY created_at DESC")
             return [dict(r) for r in c.fetchall()]
 
+_api_testimonials_cache = None
+_api_testimonials_cache_lock: asyncio.Lock = None
+
+
+async def _get_all_testimonials_api_cached():
+    global _api_testimonials_cache, _api_testimonials_cache_lock
+    now_mono = _time.monotonic()
+    if _api_testimonials_cache and now_mono < _api_testimonials_cache[0]:
+        return copy.deepcopy(_api_testimonials_cache[1])
+    if _api_testimonials_cache_lock is None:
+        _api_testimonials_cache_lock = asyncio.Lock()
+    async with _api_testimonials_cache_lock:
+        now_mono = _time.monotonic()
+        if _api_testimonials_cache and now_mono < _api_testimonials_cache[0]:
+            return copy.deepcopy(_api_testimonials_cache[1])
+        value = await _get_all_testimonials_api()
+        _api_testimonials_cache = (now_mono + 5.0, copy.deepcopy(value))
+        return value
+
+
 async def api_get_testimonials(request: aio_web.Request) -> aio_web.Response:
     if not await _api_auth(request): return _err('Unauthorized', 401)
-    return _json_resp(await _get_all_testimonials_api())
+    return _json_resp(await _get_all_testimonials_api_cached())
 
 async def api_testimonial_action(request: aio_web.Request) -> aio_web.Response:
     if not await _api_auth(request): return _err('Unauthorized', 401)
@@ -2379,7 +2656,7 @@ async def api_get_stats(request: aio_web.Request) -> aio_web.Response:
     if not await _api_auth(request): return _err('Unauthorized', 401)
     today = now_wib().replace(hour=0, minute=0, second=0, microsecond=0)
     month = today.replace(day=1)
-    stats = await get_order_stats(today, month)
+    stats = await get_order_stats_cached(today, month)
     if 'trend_7d' in stats:
         formatted = []
         for row in stats['trend_7d']:
@@ -2492,6 +2769,7 @@ async def api_backup(request: aio_web.Request) -> aio_web.Response:
     if not await _api_auth(request): return _err('Unauthorized', 401)
     data = await _get_backup_data()
     filename = f"backup_{now_wib().strftime('%Y%m%d_%H%M')}.json"
+    payload_text = await asyncio.to_thread(json.dumps, data, default=str)
     return aio_web.Response(
         status=200,
         content_type='application/json',
@@ -2500,7 +2778,7 @@ async def api_backup(request: aio_web.Request) -> aio_web.Response:
             'Vary': 'Origin',
             'Content-Disposition': f'attachment; filename="{filename}"',
         },
-        text=json.dumps(data, default=str)
+        text=payload_text
     )
 
 # =================== WEB SERVER MANAGEMENT ===================
@@ -2560,33 +2838,56 @@ async def _start_webhook_server():
 
 # =================== POST INIT ===================
 
+
+async def _event_loop_lag_monitor():
+    """Mendeteksi CPU starvation/blocking I/O pada hosting tanpa mengganggu bot."""
+    interval = 5.0
+    expected = _time.monotonic() + interval
+    while True:
+        await asyncio.sleep(interval)
+        now_mono = _time.monotonic()
+        lag = max(0.0, now_mono - expected)
+        expected = now_mono + interval
+        if lag >= EVENT_LOOP_LAG_WARNING_SECONDS:
+            logger.warning(f"[EVENT LOOP LAG] Event loop tertahan {lag:.2f}s")
+
+
 async def post_init(application: Application):
-    global _current_bot, _http_session
+    global _current_bot
     _current_bot = application.bot
-    _http_session = aiohttp.ClientSession()
 
-    await application.bot.set_my_commands(
-        [
-            BotCommand("start",   "Buka toko"),
-            BotCommand("help",    "Bantuan penggunaan bot"),
-            BotCommand("riwayat", "Lihat riwayat ordermu"),
-        ],
-        scope=BotCommandScopeDefault()
+    # Perbesar executor untuk query DB/file tanpa memblokir event loop.
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(
+        ThreadPoolExecutor(max_workers=DB_THREAD_WORKERS, thread_name_prefix="hyperfamily-worker")
     )
-    await application.bot.set_my_commands(
-        [
-            BotCommand("start", "Buka toko"),
-            BotCommand("help", "Bantuan"),
-            BotCommand("admin", "Panel admin"),
-        ],
-        scope=BotCommandScopeChat(chat_id=ADMIN_ID)
+    await get_http_session()
+
+    await asyncio.gather(
+        application.bot.set_my_commands(
+            [
+                BotCommand("start",   "Buka toko"),
+                BotCommand("help",    "Bantuan penggunaan bot"),
+                BotCommand("riwayat", "Lihat riwayat ordermu"),
+            ],
+            scope=BotCommandScopeDefault()
+        ),
+        application.bot.set_my_commands(
+            [
+                BotCommand("start", "Buka toko"),
+                BotCommand("help", "Bantuan"),
+                BotCommand("admin", "Panel admin"),
+            ],
+            scope=BotCommandScopeChat(chat_id=ADMIN_ID)
+        ),
     )
 
-    waiting_orders = await get_all_waiting()
+    waiting_orders, all_products = await asyncio.gather(get_all_waiting(), get_all_products())
+    products_by_id = {p['paket_id']: p for p in all_products}
     if waiting_orders:
         logger.info(f"[POST_INIT] Menemukan {len(waiting_orders)} order aktif, memulihkan background task pembayaran...")
         for order in waiting_orders:
-            paket = await get_product(order['paket_id'])
+            paket = products_by_id.get(order['paket_id'])
             if not paket:
                 continue
             recovery_amount = order.get('harga_dibayar') or paket['harga']
@@ -2617,17 +2918,23 @@ async def post_init(application: Application):
             )
             logger.info(f"[POST_INIT] Task monitoring diaktifkan kembali untuk Order ID: {order['order_id']}")
 
-    asyncio.create_task(_auto_backup_loop())
-    asyncio.create_task(_buyer_reminder_loop(_current_bot))
-    asyncio.create_task(_cleanup_cooldowns_loop())
-    asyncio.create_task(_start_webhook_server())
-    logger.info("[POST_INIT] Seluruh background task berkala berhasil dijadwalkan.")
+    spawn_background(_auto_backup_loop(), name="auto-backup-loop")
+    spawn_background(_buyer_reminder_loop(_current_bot), name="buyer-reminder-loop")
+    spawn_background(_cleanup_cooldowns_loop(), name="cooldown-cleanup-loop")
+    spawn_background(_event_loop_lag_monitor(), name="event-loop-lag-monitor")
+    spawn_background(_start_webhook_server(), name="webhook-server")
+    logger.info("[POST_INIT] Background task aktif dan bot siap menerima update.")
 
 # =================== GRACEFUL SHUTDOWN ===================
 
 async def post_shutdown(application: Application):
     global _http_session, _pool, _webhook_runner
     logger.info("[SHUTDOWN] Memulai siklus anggun mematikan sistem (Graceful Shutdown)...")
+    pending_background = [task for task in list(_background_tasks) if not task.done()]
+    for task in pending_background:
+        task.cancel()
+    if pending_background:
+        await asyncio.gather(*pending_background, return_exceptions=True)
     if _http_session and not _http_session.closed:
         await _http_session.close()
         logger.info("[SHUTDOWN] Sesi client HTTP asinkron ditutup.")
@@ -2711,13 +3018,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not paket:
             paket = {"emoji": "📦", "nama": "Produk", "harga": 0, "link": DEFAULT_LINK}
 
-        asyncio.create_task(
-            _refresh_active_order_status(
-                context.bot,
-                active,
-                paket,
-                active.get('user_name', update.effective_user.full_name)
-            )
+        await _ensure_payment_task_for_order(
+            context.bot,
+            active,
+            paket,
+            active.get('user_name', update.effective_user.full_name)
         )
 
         total = active.get("harga_dibayar") or paket["harga"]
@@ -2736,11 +3041,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await hapus_msg_user_lama(context, user_id, keep_last=2)
         return
 
+    menu_text, menu_keyboard = await asyncio.gather(
+        build_main_menu_text(),
+        build_main_menu_keyboard(),
+    )
     msg = await context.bot.send_message(
         chat_id=update.effective_chat.id,
-        text=await build_main_menu_text(),
+        text=menu_text,
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(await build_main_menu_keyboard())
+        reply_markup=InlineKeyboardMarkup(menu_keyboard)
     )
     simpan_msg_user(context, user_id, msg.message_id)
     await hapus_msg_user_lama(context, user_id, keep_last=1)
@@ -2887,13 +3196,11 @@ async def confirm_buy_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     active = await get_active_order(user_id)
     if active:
         paket_active = await get_product(active["paket_id"]) or {"emoji": "📦", "nama": "Produk", "harga": 0}
-        asyncio.create_task(
-            _refresh_active_order_status(
-                context.bot,
-                active,
-                paket_active,
-                active.get('user_name', user_name)
-            )
+        await _ensure_payment_task_for_order(
+            context.bot,
+            active,
+            paket_active,
+            active.get('user_name', user_name)
         )
         await query.answer("⏳ Kamu sudah punya invoice aktif!", show_alert=True)
         total = active.get("harga_dibayar") or paket_active["harga"]
@@ -2986,16 +3293,19 @@ async def _post_invoice_created_tasks(bot, context, user_id: int, order_id: str,
 
 
 async def _buat_order_baru(update, context, query, user_id, user_name, paket, order_changes=0):
-    # Kirim typing indicator agar user tahu bot sedang memproses
-    try:
-        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_photo")
-    except Exception:
-        pass
-
-    loading_msg = await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text="⏳ Membuat invoice...",
-    )
+    # Gunakan pesan callback sebagai indikator loading agar tidak menambah request Telegram.
+    loading_msg = None
+    if query:
+        try:
+            await query.edit_message_text("⏳ Membuat invoice...")
+            loading_msg = query.message
+        except Exception:
+            loading_msg = None
+    if loading_msg is None:
+        loading_msg = await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="⏳ Membuat invoice...",
+        )
 
     rand_suffix = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
     order_id = f"HFB-{user_id}-{now_wib().strftime('%Y%m%d%H%M%S')}-{rand_suffix}"
@@ -3006,26 +3316,33 @@ async def _buat_order_baru(update, context, query, user_id, user_name, paket, or
         description=f"Hyper Family Buy - {paket['nama']}"
     )
 
-    try:
-        await loading_msg.delete()
-    except Exception as e:
-        logger.debug(f"Gagal menghapus pesan loading: {e}")
-
     if not trans_data:
-        msg = await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text="❌ Gagal membuat invoice. Silakan coba lagi.\nKetik /start untuk memulai ulang.",
-        )
+        try:
+            await loading_msg.edit_text(
+                "❌ Gagal membuat invoice. Silakan coba lagi.\nKetik /start untuk memulai ulang."
+            )
+            msg = loading_msg
+        except Exception:
+            msg = await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="❌ Gagal membuat invoice. Silakan coba lagi.\nKetik /start untuk memulai ulang.",
+            )
         simpan_msg_user(context, user_id, msg.message_id)
         await hapus_msg_user_lama(context, user_id, keep_last=2)
         return
 
     qris_string = trans_data.get('qr_string') or trans_data.get('payment_number', '')
     if not qris_string:
-        msg = await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text="❌ Gagal membuat QRIS. Silakan coba lagi.\nKetik /start untuk memulai ulang.",
-        )
+        try:
+            await loading_msg.edit_text(
+                "❌ Gagal membuat QRIS. Silakan coba lagi.\nKetik /start untuk memulai ulang."
+            )
+            msg = loading_msg
+        except Exception:
+            msg = await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="❌ Gagal membuat QRIS. Silakan coba lagi.\nKetik /start untuk memulai ulang.",
+            )
         simpan_msg_user(context, user_id, msg.message_id)
         await hapus_msg_user_lama(context, user_id, keep_last=2)
         return
@@ -3062,6 +3379,12 @@ async def _buat_order_baru(update, context, query, user_id, user_name, paket, or
             text="❌ Gagal menyimpan invoice. Silakan coba lagi.\nKetik /start untuk memulai ulang.",
         )
         simpan_msg_user(context, user_id, msg.message_id)
+        spawn_background(
+            _safe_delete_chat_message(
+                context.bot, update.effective_chat.id, loading_msg.message_id, "pesan loading gagal"
+            ),
+            name=f"delete-failed-loading-{order_id}"
+        )
         return
 
     qr_buffer = await asyncio.to_thread(generate_qr_image, qris_string)
@@ -3107,12 +3430,6 @@ async def _buat_order_baru(update, context, query, user_id, user_name, paket, or
         kb.append([InlineKeyboardButton(f"🔄 Ganti Paket (sisa {sisa_ganti}x)", callback_data="ganti_paket_list")])
     kb.append([InlineKeyboardButton("❌ Batalkan Pesanan", callback_data="cancel_order")])
 
-    if query:
-        try:
-            await query.message.delete()
-        except Exception as e:
-            logger.debug(f"Gagal menghapus pesan sebelumnya: {e}")
-
     msg = await context.bot.send_photo(
         chat_id=update.effective_chat.id,
         photo=qr_buffer,
@@ -3123,17 +3440,24 @@ async def _buat_order_baru(update, context, query, user_id, user_name, paket, or
 
     await set_buyer_msg_id(order_id, msg.message_id)
     simpan_msg_user(context, user_id, msg.message_id)
+    spawn_background(
+        _safe_delete_chat_message(
+            context.bot, update.effective_chat.id, loading_msg.message_id, "pesan loading invoice"
+        ),
+        name=f"delete-loading-{order_id}"
+    )
 
     # Polling dimulai segera setelah QR diterima buyer. Notifikasi admin berjalan di background.
     _start_payment_task(
         context.bot, order_id, paket['paket_id'], user_id, user_name,
         total_payment, timeout_seconds=timeout_secs
     )
-    asyncio.create_task(
+    spawn_background(
         _post_invoice_created_tasks(
             context.bot, context, user_id, order_id, user_name,
             paket, total_payment, expire
-        )
+        ),
+        name=f"invoice-post-{order_id}"
     )
 
 # =================== CANCEL ORDER ===================
@@ -3440,18 +3764,50 @@ def _start_payment_task(bot, order_id: str, paket_id: str, user_id: int,
         loop = asyncio.get_running_loop()
     except RuntimeError:
         loop = asyncio.get_event_loop()
-    loop.create_task(
-        _start_payment_task_async(bot, order_id, paket_id, user_id, user_name, amount, timeout_seconds)
+    spawn_background(
+        _start_payment_task_async(
+            bot, order_id, paket_id, user_id, user_name, amount, timeout_seconds
+        ),
+        name=f"payment-bootstrap-{order_id}"
     )
 
 async def _start_payment_task_async(bot, order_id: str, paket_id: str, user_id: int,
                                      user_name: str, amount: int, timeout_seconds: int = 1800):
     await _stop_payment_task(user_id)
     task = asyncio.create_task(
-        _payment_poll_loop(bot, order_id, paket_id, user_id, user_name, amount, timeout_seconds)
+        _payment_poll_loop(bot, order_id, paket_id, user_id, user_name, amount, timeout_seconds),
+        name=f"payment-poll-{order_id}"
     )
     async with _payment_tasks_lock:
         _payment_tasks[user_id] = task
+
+
+async def _ensure_payment_task_for_order(bot, order: dict, paket: dict, user_name: str):
+    """Pastikan monitoring aktif tanpa membuat request status duplikat saat /start ditekan."""
+    user_id = order.get('user_id')
+    if not user_id:
+        return
+    async with _payment_tasks_lock:
+        existing = _payment_tasks.get(user_id)
+        if existing and not existing.done():
+            return
+
+    expiry_dt = parse_provider_datetime(order.get('payment_expires_at'))
+    if expiry_dt is not None:
+        timeout_seconds = max(1, int((expiry_dt - now_wib()).total_seconds()))
+    else:
+        timeout_seconds = AUTOGOPAY_DEFAULT_TIMEOUT_SECONDS
+    amount = order.get('harga_dibayar') or paket.get('harga', 0)
+    _start_payment_task(
+        bot,
+        order_id=order['order_id'],
+        paket_id=order['paket_id'],
+        user_id=user_id,
+        user_name=user_name,
+        amount=amount,
+        timeout_seconds=timeout_seconds,
+    )
+
 
 def _check_order_status_sync(order_id):
     with db_session_safe() as conn:
@@ -3474,6 +3830,7 @@ async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
             logger.error(f"[PAYMENT] transaction_id AutoGoPay tidak ditemukan untuk {order_id}")
             return
 
+        last_db_check_elapsed = -30
         while elapsed < timeout_seconds:
             if elapsed < 60:
                 interval = AUTOGOPAY_POLL_FAST_SECONDS
@@ -3486,9 +3843,13 @@ async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
             await asyncio.sleep(sleep_for)
             elapsed += sleep_for
 
-            row = await _check_order_status(order_id)
-            if not row or row['status'] != 'waiting':
-                return
+            # Status lokal umumnya dihentikan lewat task.cancel(). Cek DB periodik saja
+            # agar banyak invoice aktif tidak membanjiri PostgreSQL setiap 3 detik.
+            if elapsed - last_db_check_elapsed >= 30:
+                row = await _check_order_status(order_id)
+                last_db_check_elapsed = elapsed
+                if not row or row['status'] != 'waiting':
+                    return
 
             trans = await _autogopay_get_status(transaction_id, amount)
             if not trans:
@@ -4979,7 +5340,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     now = now_wib()
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    s = await get_order_stats(today_start, month_start)
+    s = await get_order_stats_cached(today_start, month_start)
     text = _build_stats_text(s, now)
     await update.message.reply_text(text, parse_mode="HTML")
 
@@ -5065,10 +5426,10 @@ async def _generate_json_export():
         "settings": settings,
         "admins": admins,
     }
-    return (
-        json.dumps(payload, ensure_ascii=False, indent=2, default=str),
-        len(products), len(orders), len(banned)
+    payload_text = await asyncio.to_thread(
+        json.dumps, payload, ensure_ascii=False, indent=2, default=str
     )
+    return payload_text, len(products), len(orders), len(banned)
 
 async def _kirim_backup(bot):
     ts = now_wib().strftime('%Y%m%d_%H%M%S')
@@ -5076,38 +5437,50 @@ async def _kirim_backup(bot):
     try:
         products, orders, banned, testimonials, settings, admins = await asyncio.to_thread(_generate_full_export_sync)
 
-        payload = {
-            "export_time": now_wib().strftime('%H:%M, %d/%m/%Y'),
-            "version": "3.0",
-            "products": products,
-            "orders": orders,
-            "banned_users": banned,
-            "testimonials": testimonials,
-            "settings": settings,
-            "admins": admins,
-        }
-        json_bytes = json.dumps(payload, ensure_ascii=False, indent=2, default=str).encode("utf-8")
+        def _build_backup_zip():
+            payload = {
+                "export_time": now_wib().strftime('%H:%M, %d/%m/%Y'),
+                "version": "3.0",
+                "products": products,
+                "orders": orders,
+                "banned_users": banned,
+                "testimonials": testimonials,
+                "settings": settings,
+                "admins": admins,
+            }
+            json_bytes = json.dumps(
+                payload, ensure_ascii=False, indent=2, default=str
+            ).encode("utf-8")
 
-        import io as _io
-        def _rows_to_csv_bytes(rows: list) -> bytes:
-            if not rows:
-                return b""
-            text_buf = _io.StringIO()
-            writer = csv.DictWriter(text_buf, fieldnames=list(rows[0].keys()), extrasaction='ignore')
-            writer.writeheader()
-            writer.writerows([{k: str(v) if v is not None else '' for k, v in row.items()} for row in rows])
-            return text_buf.getvalue().encode("utf-8")
+            import io as _io
 
-        zip_buf = BytesIO()
-        with zipfile.ZipFile(zip_buf, mode='w', compression=zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr("backup.json",        json_bytes)
-            zf.writestr("orders.csv",         _rows_to_csv_bytes(orders))
-            zf.writestr("products.csv",       _rows_to_csv_bytes(products))
-            zf.writestr("banned_users.csv",   _rows_to_csv_bytes(banned))
-            zf.writestr("testimonials.csv",   _rows_to_csv_bytes(testimonials))
-            zf.writestr("admins.csv",         _rows_to_csv_bytes(admins))
-        zip_buf.seek(0)
-        zip_buf.name = zip_name
+            def _rows_to_csv_bytes(rows: list) -> bytes:
+                if not rows:
+                    return b""
+                text_buf = _io.StringIO()
+                writer = csv.DictWriter(
+                    text_buf, fieldnames=list(rows[0].keys()), extrasaction='ignore'
+                )
+                writer.writeheader()
+                writer.writerows([
+                    {k: str(v) if v is not None else '' for k, v in row.items()}
+                    for row in rows
+                ])
+                return text_buf.getvalue().encode("utf-8")
+
+            buffer = BytesIO()
+            with zipfile.ZipFile(buffer, mode='w', compression=zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("backup.json", json_bytes)
+                zf.writestr("orders.csv", _rows_to_csv_bytes(orders))
+                zf.writestr("products.csv", _rows_to_csv_bytes(products))
+                zf.writestr("banned_users.csv", _rows_to_csv_bytes(banned))
+                zf.writestr("testimonials.csv", _rows_to_csv_bytes(testimonials))
+                zf.writestr("admins.csv", _rows_to_csv_bytes(admins))
+            buffer.seek(0)
+            buffer.name = zip_name
+            return buffer
+
+        zip_buf = await asyncio.to_thread(_build_backup_zip)
 
         await bot.send_document(
             chat_id=ADMIN_ID,
@@ -5327,7 +5700,8 @@ async def handle_json_document(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         file = await context.bot.get_file(doc.file_id)
         raw = await file.download_as_bytearray()
-        data = json.loads(raw.decode("utf-8"))
+        decoded = raw.decode("utf-8")
+        data = await asyncio.to_thread(json.loads, decoded)
     except Exception as e:
         await status_msg.edit_text(f"❌ Gagal membaca file JSON: {esc(str(e))}", parse_mode="HTML")
         return
@@ -6462,7 +6836,7 @@ async def admpanel_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     now = now_wib()
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    s = await get_order_stats(today_start, month_start)
+    s = await get_order_stats_cached(today_start, month_start)
     text = _build_stats_text(s, now)
     try:
         await query.edit_message_text(text, parse_mode="HTML",
@@ -7254,13 +7628,20 @@ def main():
     init_pool()
     init_db()
 
-    app = (
+    builder = (
         Application.builder()
         .token(TOKEN)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
-        .build()
+        .connection_pool_size(TELEGRAM_CONNECTION_POOL_SIZE)
+        .pool_timeout(TELEGRAM_POOL_TIMEOUT_SECONDS)
     )
+    if PerChatUpdateProcessor is not None:
+        builder = builder.concurrent_updates(PerChatUpdateProcessor(BOT_CONCURRENT_UPDATES))
+    else:
+        # PTB 20.0-20.3: tetap paralel, tetapi tanpa serializer per-chat bawaan kustom.
+        builder = builder.concurrent_updates(BOT_CONCURRENT_UPDATES)
+    app = builder.build()
 
     # User Commands
     app.add_handler(CommandHandler("start",   start))
@@ -7401,8 +7782,11 @@ def main():
         message_handler
     ))
 
-    logger.info("Bot Hyper Family Store berhasil berjalan...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    logger.info(
+        f"Bot Hyper Family Store berjalan | concurrent={BOT_CONCURRENT_UPDATES} | "
+        f"telegram_pool={TELEGRAM_CONNECTION_POOL_SIZE} | db_pool={DB_POOL_MAX}"
+    )
+    app.run_polling(allowed_updates=["message", "callback_query", "chat_join_request"])
 
 if __name__ == "__main__":
     main()

@@ -4026,18 +4026,21 @@ async def _send_buyer_product_link(bot, user_id: int, order_id: str, paket: dict
 async def _send_prereq_hold_message(bot, user_id: int, order_id: str, paket: dict, paid_amount: int, progress: dict):
     await mark_delivery_held(order_id, 'Syarat belum terpenuhi')
     product_name = f"{paket.get('emoji','📦')} {paket.get('nama','Produk')}"
+    prerequisite_text = "\n".join(
+        line.replace("❌ ", "⬜ ", 1) if line.startswith("❌ ") else line
+        for line in progress['lines']
+    )
     await bot.send_message(
         chat_id=user_id,
         text=(
-            f"✅ <b>ORDER BERHASIL</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📦 Paket   : {esc(product_name)}\n"
-            f"💰 Total   : {format_harga(paid_amount)}\n"
-            f"🧾 Order   : <code>{esc(order_id)}</code>\n\n"
-            f"🔐 Link {esc(paket.get('nama','Produk'))} ditahan\n"
-            f"📋 Syarat  : {progress['fulfilled_count']}/{progress['total_count']} terpenuhi\n\n"
-            f"{progress['text']}\n\n"
-            f"Lengkapi produk bertanda ❌. Setelah semua syarat terpenuhi, link {esc(paket.get('nama','Produk'))} otomatis dikirim."
+            f"🔒 <b>Akses {esc(paket.get('nama','Produk'))} Belum Terbuka</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"Pesanan {esc(product_name)} kamu tetap aman.\n\n"
+            f"Untuk mendapatkan link akses {esc(paket.get('nama','Produk'))}, kamu perlu melengkapi paket berikut:\n\n"
+            f"📋 Progress: {progress['fulfilled_count']} dari {progress['total_count']} paket\n\n"
+            f"{prerequisite_text}\n\n"
+            f"Pilih paket yang belum dimiliki melalui tombol di bawah.\n\n"
+            f"Link {esc(paket.get('nama','Produk'))} akan dikirim otomatis setelah semua paket terpenuhi."
         ),
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(progress['buttons']) if progress['buttons'] else None

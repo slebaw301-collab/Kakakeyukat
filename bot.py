@@ -215,11 +215,14 @@ TELEGRAM_POOL_TIMEOUT_SECONDS = _env_float("TELEGRAM_POOL_TIMEOUT_SECONDS", 15.0
 DB_POOL_MIN = _env_int("DB_POOL_MIN", 2, 1, 10)
 DB_POOL_MAX = _env_int("DB_POOL_MAX", 20, DB_POOL_MIN, 50)
 DB_THREAD_WORKERS = _env_int("DB_THREAD_WORKERS", min(24, DB_POOL_MAX), 4, 50)
+CPU_THREAD_WORKERS = _env_int("CPU_THREAD_WORKERS", 4, 2, 12)
 DB_SLOW_SESSION_SECONDS = _env_float("DB_SLOW_SESSION_SECONDS", 1.0, 0.1, 30.0)
 SLOW_UPDATE_THRESHOLD_SECONDS = _env_float("SLOW_UPDATE_THRESHOLD_SECONDS", 1.5, 0.2, 30.0)
+PERF_TRACE_THRESHOLD_SECONDS = _env_float("PERF_TRACE_THRESHOLD_SECONDS", 1.0, 0.1, 30.0)
 EVENT_LOOP_LAG_WARNING_SECONDS = _env_float("EVENT_LOOP_LAG_WARNING_SECONDS", 0.75, 0.1, 10.0)
 STATS_CACHE_TTL_SECONDS = _env_float("STATS_CACHE_TTL_SECONDS", 10.0, 1.0, 120.0)
 AUTOGOPAY_MAX_CONCURRENT_REQUESTS = _env_int("AUTOGOPAY_MAX_CONCURRENT_REQUESTS", 20, 2, 50)
+TELEGRAM_RETRY_ATTEMPTS = _env_int("TELEGRAM_RETRY_ATTEMPTS", 2, 1, 4)
 
 # Timeout dibuat lebih pendek agar gangguan provider tidak menahan update Telegram terlalu lama.
 AUTOGOPAY_HTTP_TIMEOUT = aiohttp.ClientTimeout(
@@ -248,6 +251,108 @@ if not AUTOGOPAY_API_KEY:
 
 # =================== CONCURRENCY & BACKGROUND TASKS ===================
 _background_tasks: set = set()
+_invoice_creation_in_progress: set = set()
+
+
+def claim_invoice_creation(user_id: int) -> bool:
+    """Single-flight per buyer untuk mencegah invoice ganda akibat double-click."""
+    if user_id in _invoice_creation_in_progress:
+        return False
+    _invoice_creation_in_progress.add(user_id)
+    return True
+
+
+def release_invoice_creation(user_id: int):
+    _invoice_creation_in_progress.discard(user_id)
+
+
+# Pisahkan antrean query database dari pekerjaan CPU/file (QR, ZIP, JSON).
+# Dengan begitu backup/export admin tidak ikut menahan respons buyer.
+_db_executor = ThreadPoolExecutor(
+    max_workers=DB_THREAD_WORKERS,
+    thread_name_prefix="hyperfamily-db",
+)
+_cpu_executor = ThreadPoolExecutor(
+    max_workers=CPU_THREAD_WORKERS,
+    thread_name_prefix="hyperfamily-cpu",
+)
+
+
+async def _run_executor(executor, func, *args, **kwargs):
+    loop = asyncio.get_running_loop()
+    call = functools.partial(func, *args, **kwargs)
+    return await loop.run_in_executor(executor, call)
+
+
+async def run_db(func, *args, **kwargs):
+    """Jalankan operasi database pada executor khusus database."""
+    return await _run_executor(_db_executor, func, *args, **kwargs)
+
+
+async def run_cpu(func, *args, **kwargs):
+    """Jalankan proses CPU/file pada executor terpisah dari query database."""
+    return await _run_executor(_cpu_executor, func, *args, **kwargs)
+
+
+class PerfTrace:
+    """Profiling ringan per alur; hanya menulis log saat proses terasa lambat."""
+
+    def __init__(self, label: str, **context):
+        self.label = label
+        self.context = context
+        self.started = _time.monotonic()
+        self.last_mark = self.started
+        self.stages = []
+
+    def mark(self, stage: str):
+        now_mono = _time.monotonic()
+        self.stages.append((stage, now_mono - self.last_mark))
+        self.last_mark = now_mono
+
+    def finish(self):
+        total = _time.monotonic() - self.started
+        if total < PERF_TRACE_THRESHOLD_SECONDS:
+            return
+        stage_text = ", ".join(f"{name}={duration:.2f}s" for name, duration in self.stages)
+        context_text = " ".join(f"{key}={value}" for key, value in self.context.items())
+        logger.info(
+            f"[PERF] {self.label} total={total:.2f}s"
+            f"{(' ' + context_text) if context_text else ''}"
+            f"{(' | ' + stage_text) if stage_text else ''}"
+        )
+
+
+async def telegram_retry(operation, *, label: str, attempts: int = None):
+    """Retry terkontrol untuk operasi Telegram yang aman diulang, seperti edit pesan."""
+    max_attempts = attempts or TELEGRAM_RETRY_ATTEMPTS
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return await operation()
+        except telegram.error.BadRequest as exc:
+            if "message is not modified" in str(exc).lower():
+                return None
+            raise
+        except telegram.error.RetryAfter as exc:
+            if attempt >= max_attempts:
+                raise
+            retry_after = exc.retry_after
+            delay = (
+                retry_after.total_seconds()
+                if hasattr(retry_after, "total_seconds")
+                else float(retry_after)
+            )
+            delay = max(0.1, delay)
+            logger.warning(f"[TELEGRAM RETRY] {label} rate-limit; retry {delay:.2f}s")
+            await asyncio.sleep(delay)
+        except (telegram.error.TimedOut, telegram.error.NetworkError) as exc:
+            if attempt >= max_attempts:
+                raise
+            delay = 0.35 * attempt
+            logger.warning(
+                f"[TELEGRAM RETRY] {label} gagal sementara ({type(exc).__name__}); "
+                f"retry {delay:.2f}s"
+            )
+            await asyncio.sleep(delay)
 
 
 def spawn_background(coro, *, name: str = None):
@@ -682,7 +787,7 @@ def db_session_safe(retries=3, delay=0.15):
 def async_wrap(func):
     @functools.wraps(func)
     async def run(*args, **kwargs):
-        return await asyncio.to_thread(func, *args, **kwargs)
+        return await run_db(func, *args, **kwargs)
     return run
 
 def init_db():
@@ -1068,10 +1173,10 @@ def _set_managed_groups_sync(groups: list):
             )
 
 async def get_managed_groups() -> list:
-    return await asyncio.to_thread(_get_managed_groups_sync)
+    return await run_db(_get_managed_groups_sync)
 
 async def set_managed_groups(groups: list):
-    return await asyncio.to_thread(_set_managed_groups_sync, groups)
+    return await run_db(_set_managed_groups_sync, groups)
 
 @async_wrap
 def get_order_stats(today_start: datetime, month_start: datetime):
@@ -1335,7 +1440,7 @@ def _mark_order_completed_sync(order_id) -> bool:
             return updated is not None
 
 async def mark_order_completed(order_id) -> bool:
-    return await asyncio.to_thread(_mark_order_completed_sync, order_id)
+    return await run_db(_mark_order_completed_sync, order_id)
 
 @async_wrap
 def get_order_by_id(order_id):
@@ -2259,10 +2364,10 @@ async def post_init(application: Application):
     global _current_bot
     _current_bot = application.bot
 
-    # Perbesar executor untuk query DB/file tanpa memblokir event loop.
-    loop = asyncio.get_running_loop()
-    loop.set_default_executor(
-        ThreadPoolExecutor(max_workers=DB_THREAD_WORKERS, thread_name_prefix="hyperfamily-worker")
+    # Executor DB dan CPU/file sudah dipisah agar pekerjaan admin tidak menahan buyer.
+    logger.info(
+        f"[PERFORMANCE] Executor aktif: db_workers={DB_THREAD_WORKERS}, "
+        f"cpu_workers={CPU_THREAD_WORKERS}"
     )
     await get_http_session()
 
@@ -2344,6 +2449,15 @@ async def post_shutdown(application: Application):
     if _webhook_runner:
         await _webhook_runner.cleanup()
         logger.info("[SHUTDOWN] Web Server API berhasil dibersihkan.")
+    # Tunggu pekerjaan executor selesai sebelum menutup pool database.
+    # Ini hanya berjalan saat shutdown, jadi tidak memengaruhi respons bot.
+    try:
+        _db_executor.shutdown(wait=True, cancel_futures=True)
+        _cpu_executor.shutdown(wait=True, cancel_futures=True)
+    except TypeError:  # Kompatibilitas Python lama yang belum punya cancel_futures.
+        _db_executor.shutdown(wait=True)
+        _cpu_executor.shutdown(wait=True)
+    logger.info("[SHUTDOWN] Executor database dan CPU/file dihentikan.")
     if _pool:
         _pool.closeall()
         logger.info("[SHUTDOWN] Seluruh koneksi ke DB PostgreSQL ditutup dengan aman.")
@@ -2582,95 +2696,144 @@ async def confirm_buy_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     query = update.callback_query
     user_id = query.from_user.id
     user_name = query.from_user.full_name
-
-    if await is_banned(user_id):
-        await query.answer("🚫 Akun kamu diblokir. Hubungi admin.", show_alert=True)
-        return
-
     paket_id = query.data.replace("confirm_buy_", "")
-    paket = await get_product(paket_id)
-    if not paket:
-        await query.answer("❌ Produk tidak ditemukan.", show_alert=True)
-        return
-    if not paket.get('aktif', True):
-        await query.answer("❌ Paket ini sedang tidak tersedia.", show_alert=True)
+    if not claim_invoice_creation(user_id):
+        await query.answer("⏳ Invoice sedang dibuat. Tunggu sebentar.")
         return
 
-    active = await get_active_order(user_id)
-    if active:
-        paket_active = await get_product(active["paket_id"]) or {"emoji": "📦", "nama": "Produk", "harga": 0}
-        await _ensure_payment_task_for_order(
-            context.bot,
-            active,
-            paket_active,
-            active.get('user_name', user_name)
-        )
-        await query.answer("⏳ Kamu sudah punya invoice aktif!", show_alert=True)
-        total = active.get("harga_dibayar") or paket_active["harga"]
-        caption = (
-            f"<b>⏳ ORDER AKTIF</b>\n"
-            f"========================\n\n"
-            f"📦 Paket: {esc(paket_active['emoji'])} {esc(paket_active['nama'])}\n"
-            f"💰 Total: {format_harga(total)}\n"
-            f"📝 Order ID: <code>{esc(active['order_id'])}</code>\n\n"
-            f"⚠️ Selesaikan pembayaran atau batalkan dulu."
-        )
-        keyboard = [[InlineKeyboardButton("❌ Batalkan", callback_data="cancel_order")]]
-        await query.edit_message_text(caption, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
-        return
+    trace = PerfTrace("confirm-buy", user_id=user_id, paket_id=paket_id)
 
-    sisa = await get_cooldown_sisa_db(user_id)
-    if sisa > 0:
-        await query.answer(
-            f"⏳ Kamu baru saja membatalkan order. Coba lagi dalam {sisa} menit.",
-            show_alert=True
+    try:
+        # Pengecekan yang tidak saling bergantung dijalankan bersamaan.
+        banned, paket, active, sisa = await asyncio.gather(
+            is_banned(user_id),
+            get_product(paket_id),
+            get_active_order(user_id),
+            get_cooldown_sisa_db(user_id),
         )
-        return
+        trace.mark("buyer-checks")
 
-    await query.answer("⏳ Membuat invoice QRIS...")
-    await _buat_order_baru(update, context, query, user_id, user_name, paket, order_changes=0)
+        if banned:
+            await query.answer("🚫 Akun kamu diblokir. Hubungi admin.", show_alert=True)
+            return
+
+        if not paket:
+            await query.answer("❌ Produk tidak ditemukan.", show_alert=True)
+            return
+        if not paket.get('aktif', True):
+            await query.answer("❌ Paket ini sedang tidak tersedia.", show_alert=True)
+            return
+
+        # Prioritas perilaku tetap sama: invoice aktif dicek sebelum cooldown.
+        if active:
+            paket_active = await get_product(active["paket_id"]) or {
+                "emoji": "📦", "nama": "Produk", "harga": 0
+            }
+            await _ensure_payment_task_for_order(
+                context.bot,
+                active,
+                paket_active,
+                active.get('user_name', user_name)
+            )
+            await query.answer("⏳ Kamu sudah punya invoice aktif!", show_alert=True)
+            total = active.get("harga_dibayar") or paket_active["harga"]
+            caption = (
+                f"<b>⏳ ORDER AKTIF</b>\n"
+                f"========================\n\n"
+                f"📦 Paket: {esc(paket_active['emoji'])} {esc(paket_active['nama'])}\n"
+                f"💰 Total: {format_harga(total)}\n"
+                f"📝 Order ID: <code>{esc(active['order_id'])}</code>\n\n"
+                f"⚠️ Selesaikan pembayaran atau batalkan dulu."
+            )
+            keyboard = [[InlineKeyboardButton("❌ Batalkan", callback_data="cancel_order")]]
+            await telegram_retry(
+                lambda: query.edit_message_text(
+                    caption,
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                ),
+                label="tampilkan invoice aktif",
+            )
+            trace.mark("active-order")
+            return
+
+        if sisa > 0:
+            await query.answer(
+                f"⏳ Kamu baru saja membatalkan order. Coba lagi dalam {sisa} menit.",
+                show_alert=True
+            )
+            return
+
+        await query.answer("⏳ Membuat invoice QRIS...")
+        trace.mark("callback-answer")
+        await _buat_order_baru(
+            update, context, query, user_id, user_name, paket,
+            order_changes=0, perf_trace=trace
+        )
+    finally:
+        release_invoice_creation(user_id)
+        trace.finish()
 
 async def prereq_buy_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
     user_name = query.from_user.full_name
 
-    if await is_banned(user_id):
-        await query.answer("🚫 Akun kamu diblokir. Hubungi admin.", show_alert=True)
-        return
-
     parts = query.data.split("|")
     prereq_pid = parts[0].replace("prereq_buy_", "")
     parent_order_id = parts[1] if len(parts) > 1 else None
-
-    paket = await get_product(prereq_pid)
-    if not paket:
-        await query.answer("❌ Produk tidak ditemukan.", show_alert=True)
+    if not claim_invoice_creation(user_id):
+        await query.answer("⏳ Invoice sedang dibuat. Tunggu sebentar.")
         return
 
-    active = await get_active_order(user_id)
-    if active:
-        await query.answer("⏳ Kamu sudah punya invoice aktif! Batalkan dulu.", show_alert=True)
-        return
+    trace = PerfTrace("prereq-buy", user_id=user_id, paket_id=prereq_pid)
 
-    sisa = await get_cooldown_sisa_db(user_id)
-    if sisa > 0:
-        await query.answer(
-            f"⏳ Kamu baru saja membatalkan order. Coba lagi dalam {sisa} menit.",
-            show_alert=True
+    try:
+        banned, paket, active, sisa = await asyncio.gather(
+            is_banned(user_id),
+            get_product(prereq_pid),
+            get_active_order(user_id),
+            get_cooldown_sisa_db(user_id),
         )
-        return
+        trace.mark("buyer-checks")
 
-    if parent_order_id:
-        parent_order = await get_order_by_id(parent_order_id)
-        if parent_order:
-            context.user_data['prereq_ctx'] = {
-                'parent_order_id': parent_order_id,
-                'parent_paket_id': parent_order['paket_id'],
-            }
+        if banned:
+            await query.answer("🚫 Akun kamu diblokir. Hubungi admin.", show_alert=True)
+            return
 
-    await query.answer()
-    await _buat_order_baru(update, context, query, user_id, user_name, paket, order_changes=0)
+        if not paket:
+            await query.answer("❌ Produk tidak ditemukan.", show_alert=True)
+            return
+
+        if active:
+            await query.answer("⏳ Kamu sudah punya invoice aktif! Batalkan dulu.", show_alert=True)
+            return
+
+        if sisa > 0:
+            await query.answer(
+                f"⏳ Kamu baru saja membatalkan order. Coba lagi dalam {sisa} menit.",
+                show_alert=True
+            )
+            return
+
+        if parent_order_id:
+            parent_order = await get_order_by_id(parent_order_id)
+            if parent_order:
+                context.user_data['prereq_ctx'] = {
+                    'parent_order_id': parent_order_id,
+                    'parent_paket_id': parent_order['paket_id'],
+                }
+        trace.mark("prereq-context")
+
+        await query.answer()
+        trace.mark("callback-answer")
+        await _buat_order_baru(
+            update, context, query, user_id, user_name, paket,
+            order_changes=0, perf_trace=trace
+        )
+    finally:
+        release_invoice_creation(user_id)
+        trace.finish()
 
 async def _post_invoice_created_tasks(bot, context, user_id: int, order_id: str,
                                       user_name: str, paket: dict,
@@ -2695,20 +2858,26 @@ async def _post_invoice_created_tasks(bot, context, user_id: int, order_id: str,
         logger.error(f"[ORDER] Gagal menjalankan tugas setelah invoice {order_id}: {e}", exc_info=True)
 
 
-async def _buat_order_baru(update, context, query, user_id, user_name, paket, order_changes=0):
+async def _buat_order_baru(update, context, query, user_id, user_name, paket, order_changes=0, perf_trace=None):
     # Gunakan pesan callback sebagai indikator loading agar tidak menambah request Telegram.
     loading_msg = None
     if query:
         try:
-            await query.edit_message_text("⏳ Membuat invoice...")
+            await telegram_retry(
+                lambda: query.edit_message_text("⏳ Membuat invoice..."),
+                label="tampilkan loading invoice",
+            )
             loading_msg = query.message
-        except Exception:
+        except Exception as exc:
+            logger.warning(f"[ORDER] Gagal edit pesan loading, memakai pesan baru: {exc}")
             loading_msg = None
     if loading_msg is None:
         loading_msg = await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text="⏳ Membuat invoice...",
         )
+    if perf_trace:
+        perf_trace.mark("loading-ui")
 
     rand_suffix = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
     order_id = f"HFB-{user_id}-{now_wib().strftime('%Y%m%d%H%M%S')}-{rand_suffix}"
@@ -2718,11 +2887,16 @@ async def _buat_order_baru(update, context, query, user_id, user_name, paket, or
         amount=paket["harga"],
         description=f"Hyper Family Buy - {paket['nama']}"
     )
+    if perf_trace:
+        perf_trace.mark("autogopay-create")
 
     if not trans_data:
         try:
-            await loading_msg.edit_text(
-                "❌ Gagal membuat invoice. Silakan coba lagi.\nKetik /start untuk memulai ulang."
+            await telegram_retry(
+                lambda: loading_msg.edit_text(
+                    "❌ Gagal membuat invoice. Silakan coba lagi.\nKetik /start untuk memulai ulang."
+                ),
+                label="tampilkan gagal membuat invoice",
             )
             msg = loading_msg
         except Exception:
@@ -2737,8 +2911,11 @@ async def _buat_order_baru(update, context, query, user_id, user_name, paket, or
     qris_string = trans_data.get('qr_string') or trans_data.get('payment_number', '')
     if not qris_string:
         try:
-            await loading_msg.edit_text(
-                "❌ Gagal membuat QRIS. Silakan coba lagi.\nKetik /start untuk memulai ulang."
+            await telegram_retry(
+                lambda: loading_msg.edit_text(
+                    "❌ Gagal membuat QRIS. Silakan coba lagi.\nKetik /start untuk memulai ulang."
+                ),
+                label="tampilkan gagal membuat QRIS",
             )
             msg = loading_msg
         except Exception:
@@ -2774,6 +2951,8 @@ async def _buat_order_baru(update, context, query, user_id, user_name, paket, or
             checkout_url=trans_data.get('checkout_url'),
             qr_url=trans_data.get('qr_url'),
         )
+        if perf_trace:
+            perf_trace.mark("save-order")
     except Exception as e:
         logger.error(f"[PAYMENT] Gagal menyimpan order {order_id}: {e}", exc_info=True)
         await _autogopay_cancel_transaction(trans_data.get('provider_transaction_id'))
@@ -2790,7 +2969,9 @@ async def _buat_order_baru(update, context, query, user_id, user_name, paket, or
         )
         return
 
-    qr_buffer = await asyncio.to_thread(generate_qr_image, qris_string)
+    qr_buffer = await run_cpu(generate_qr_image, qris_string)
+    if perf_trace:
+        perf_trace.mark("generate-qr")
 
     sisa_ganti = 1 - order_changes
 
@@ -2840,6 +3021,8 @@ async def _buat_order_baru(update, context, query, user_id, user_name, paket, or
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(kb)
     )
+    if perf_trace:
+        perf_trace.mark("telegram-send-qr")
 
     await set_buyer_msg_id(order_id, msg.message_id)
     simpan_msg_user(context, user_id, msg.message_id)
@@ -2862,6 +3045,8 @@ async def _buat_order_baru(update, context, query, user_id, user_name, paket, or
         ),
         name=f"invoice-post-{order_id}"
     )
+    if perf_trace:
+        perf_trace.mark("finalize-invoice")
 
 # =================== CANCEL ORDER ===================
 
@@ -3215,7 +3400,7 @@ def _check_order_status_sync(order_id):
             return dict(row) if row else None
 
 async def _check_order_status(order_id):
-    return await asyncio.to_thread(_check_order_status_sync, order_id)
+    return await run_db(_check_order_status_sync, order_id)
 
 async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
                               user_name: str, amount: int, timeout_seconds: int):
@@ -3747,7 +3932,7 @@ async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE
     user_id = join_req.from_user.id
     chat_id = str(join_req.chat.id)
 
-    row = await asyncio.to_thread(_check_join_request_sync, user_id, chat_id)
+    row = await run_db(_check_join_request_sync, user_id, chat_id)
 
     if row:
         try:
@@ -4456,7 +4641,7 @@ async def admin_cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
     target_user_id = int(parts[1])
     order_id = parts[2]
 
-    order = await asyncio.to_thread(_check_waiting_order_sync, order_id)
+    order = await run_db(_check_waiting_order_sync, order_id)
     if not order:
         await query.edit_message_text("⚠️ Order tidak ditemukan atau sudah selesai/dibatalkan.")
         return
@@ -4526,7 +4711,7 @@ async def admin_manual_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
     target_user_id = int(parts[1])
     order_id = parts[2]
 
-    order = await asyncio.to_thread(_check_waiting_order_sync, order_id)
+    order = await run_db(_check_waiting_order_sync, order_id)
     if not order:
         await query.edit_message_text("⚠️ Order tidak ditemukan atau sudah selesai/dibatalkan.")
         return
@@ -4805,7 +4990,7 @@ def _generate_full_export_sync():
     return products, orders, banned, testimonials, settings, admins
 
 async def _generate_json_export():
-    products, orders, banned, testimonials, settings, admins = await asyncio.to_thread(_generate_full_export_sync)
+    products, orders, banned, testimonials, settings, admins = await run_db(_generate_full_export_sync)
     payload = {
         "meta": {
             "app": "Hyper Family Store",
@@ -4827,7 +5012,7 @@ async def _generate_json_export():
         "settings": settings,
         "admins": admins,
     }
-    payload_text = await asyncio.to_thread(
+    payload_text = await run_cpu(
         json.dumps, payload, ensure_ascii=False, indent=2, default=str
     )
     return payload_text, len(products), len(orders), len(banned)
@@ -4836,7 +5021,7 @@ async def _kirim_backup(bot):
     ts = now_wib().strftime('%Y%m%d_%H%M%S')
     zip_name = f"backup_{ts}.zip"
     try:
-        products, orders, banned, testimonials, settings, admins = await asyncio.to_thread(_generate_full_export_sync)
+        products, orders, banned, testimonials, settings, admins = await run_db(_generate_full_export_sync)
 
         def _build_backup_zip():
             payload = {
@@ -4881,7 +5066,7 @@ async def _kirim_backup(bot):
             buffer.name = zip_name
             return buffer
 
-        zip_buf = await asyncio.to_thread(_build_backup_zip)
+        zip_buf = await run_cpu(_build_backup_zip)
 
         await bot.send_document(
             chat_id=ADMIN_ID,
@@ -5102,7 +5287,7 @@ async def handle_json_document(update: Update, context: ContextTypes.DEFAULT_TYP
         file = await context.bot.get_file(doc.file_id)
         raw = await file.download_as_bytearray()
         decoded = raw.decode("utf-8")
-        data = await asyncio.to_thread(json.loads, decoded)
+        data = await run_cpu(json.loads, decoded)
     except Exception as e:
         await status_msg.edit_text(f"❌ Gagal membaca file JSON: {esc(str(e))}", parse_mode="HTML")
         return
@@ -5111,7 +5296,7 @@ async def handle_json_document(update: Update, context: ContextTypes.DEFAULT_TYP
         await status_msg.edit_text("❌ Format JSON tidak valid. Pastikan file berasal dari /export.")
         return
 
-    result = await asyncio.to_thread(_import_json_data_sync, data)
+    result = await run_db(_import_json_data_sync, data)
     ok_p, fail_p, ok_o, fail_o, ok_b, fail_b, ok_t, fail_t, ok_s, fail_s, ok_a, fail_a = result
 
     await status_msg.edit_text(
@@ -5149,7 +5334,7 @@ async def resend_group_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("⚠️ Order ID tidak valid.")
         return
 
-    order = await asyncio.to_thread(_get_completed_order_sync, order_id, user_id)
+    order = await run_db(_get_completed_order_sync, order_id, user_id)
     if not order:
         await query.edit_message_text("⚠️ Order tidak ditemukan atau belum lunas.")
         return
@@ -5197,7 +5382,7 @@ def _get_buyers_for_reminder_sync(hari: int):
             return [dict(r) for r in c.fetchall()]
 
 async def _send_buyer_reminders(bot):
-    buyers = await asyncio.to_thread(_get_buyers_for_reminder_sync, REMINDER_HARI)
+    buyers = await run_db(_get_buyers_for_reminder_sync, REMINDER_HARI)
     if not buyers:
         return
     logger.info(f"[REMINDER] Mengirim reminder ke {len(buyers)} buyer...")
@@ -5943,7 +6128,7 @@ async def admin_proses_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     user_id = int(query.data.replace("proses_", ""))
 
-    order = await asyncio.to_thread(_get_pending_order_sync, user_id)
+    order = await run_db(_get_pending_order_sync, user_id)
     if not order:
         await query.edit_message_text("⚠️ Order tidak ditemukan atau sudah diproses.")
         return
@@ -6022,7 +6207,7 @@ async def admin_konfirmasi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action = parts[0]
     user_id = int(parts[1])
 
-    order = await asyncio.to_thread(_get_pending_order_sync, user_id)
+    order = await run_db(_get_pending_order_sync, user_id)
     if not order:
         await query.edit_message_text("⚠️ Order tidak ditemukan atau sudah diproses.")
         return

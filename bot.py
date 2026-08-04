@@ -15,7 +15,6 @@ import functools
 import urllib.parse
 import time as _time
 import copy
-from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from aiohttp import web as aio_web
 import aiohttp
@@ -29,7 +28,7 @@ from contextlib import contextmanager
 import telegram.error
 from telegram import (
     Update, BotCommand, BotCommandScopeChat, BotCommandScopeDefault,
-    InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
+    InlineKeyboardButton, InlineKeyboardMarkup
 )
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
@@ -1296,7 +1295,7 @@ _stats_cache_lock: asyncio.Lock = None
 
 
 async def get_order_stats_cached(today_start: datetime, month_start: datetime, force: bool = False):
-    """Cache singkat agar dashboard polling tidak membebani DB dengan banyak agregasi."""
+    """Cache singkat agar permintaan statistik berulang tidak membebani DB."""
     global _stats_cache, _stats_cache_lock
     key = (today_start.isoformat(), month_start.isoformat())
     now_mono = _time.monotonic()
@@ -2112,26 +2111,6 @@ async def kirim_link_ke_buyer(context, user_id, paket, order_id, amount):
     await hapus_msg_user_lama(context, user_id, keep_last=2)
     return link
 
-# =================== SECURITY: KRIPTOGRAFIS SIGNATURE VERIFIER ===================
-
-def verify_telegram_webapp_signature(init_data: str, bot_token: str) -> bool:
-    """Memverifikasi keaslian initData dari Telegram WebApp (Mini App)."""
-    try:
-        parsed_data = dict(urllib.parse.parse_qsl(init_data))
-        if 'hash' not in parsed_data:
-            return False
-        
-        received_hash = parsed_data.pop('hash')
-        data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(parsed_data.items()))
-        
-        secret_key = hmac.new(b"WebAppData", bot_token.encode(), hashlib.sha256).digest()
-        computed_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
-        
-        return hmac.compare_digest(computed_hash, received_hash)
-    except Exception as e:
-        logger.error(f"[SECURITY] Gagal memverifikasi signature Telegram WebApp: {e}")
-        return False
-
 # =================== AUTOGOPAY WEBHOOK SERVER ===================
 
 async def _process_autogopay_settlement(order: dict, paid_amount: int):
@@ -2241,592 +2220,16 @@ async def autogopay_webhook_handler(request: aio_web.Request) -> aio_web.Respons
 
 _webhook_runner = None
 
-# =================== REST API DASHBOARD ===================
-
-from collections import defaultdict
-import time as _time_module
-
-DASHBOARD_API_KEY = os.environ.get('DASHBOARD_API_KEY')
-DASHBOARD_URL = os.environ.get('DASHBOARD_URL', '')
-
-# =================== RATE LIMITER ===================
-
-_rate_limit_store: dict = defaultdict(list)
-RATE_LIMIT_MAX_REQUESTS = 100
-RATE_LIMIT_WINDOW_SECONDS = 60
-
-def _check_rate_limit(client_id: str) -> bool:
-    """Cek apakah client masih dalam batas rate limit. Return True jika diizinkan."""
-    now = _time_module.time()
-    _rate_limit_store[client_id] = [t for t in _rate_limit_store[client_id] if now - t < RATE_LIMIT_WINDOW_SECONDS]
-    if len(_rate_limit_store[client_id]) >= RATE_LIMIT_MAX_REQUESTS:
-        return False
-    _rate_limit_store[client_id].append(now)
-    return True
-
-def _dashboard_html_path():
-    base = os.path.dirname(os.path.abspath(__file__))
-    for name in ('dashboard.html', 'premium_admin_dashboard.html'):
-        p = os.path.join(base, name)
-        if os.path.exists(p):
-            return p
-    for fname in os.listdir(base):
-        if fname.startswith('premium_admin_dashboard') and fname.endswith('.html'):
-            return os.path.join(base, fname)
-    return None
-
-def _allowed_cors_origin(request: aio_web.Request = None) -> str:
-    """Batasi CORS ke DASHBOARD_URL jika diset; fallback '*' untuk dev lokal."""
-    if not DASHBOARD_URL:
-        return '*'
-    allowed = {DASHBOARD_URL.rstrip('/')}
-    origin = request.headers.get('Origin') if request else None
-    if origin and origin.rstrip('/') in allowed:
-        return origin
-    return DASHBOARD_URL.rstrip('/')
-
-def _cors_headers(request: aio_web.Request = None) -> dict:
-    return {
-        'Access-Control-Allow-Origin': _allowed_cors_origin(request),
-        'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-        'Access-Control-Allow-Headers': 'Authorization, Content-Type',
-        'Vary': 'Origin',
-    }
-
-async def _api_auth(request: aio_web.Request) -> bool:
-    """Verifikasi API dashboard + pastikan Telegram WebApp user adalah admin."""
-    client_id = request.remote or 'unknown'
-    if not _check_rate_limit(client_id):
-        logger.warning(f"[RATE LIMIT] Client {client_id} melebihi batas request")
-        return False
-
-    if not DASHBOARD_API_KEY:
-        return False
-
-    auth = request.headers.get('Authorization', '')
-    if auth.startswith('Bearer '):
-        return hmac.compare_digest(auth[7:], DASHBOARD_API_KEY)
-
-    if auth.startswith('tma '):
-        init_data_raw = auth[4:]
-        if not verify_telegram_webapp_signature(init_data_raw, TOKEN):
-            return False
-        try:
-            parsed = dict(urllib.parse.parse_qsl(init_data_raw))
-            user_payload = json.loads(parsed.get('user', '{}'))
-            user_id = int(user_payload.get('id', 0))
-        except Exception as e:
-            logger.warning(f"[API AUTH] initData valid tapi user payload tidak valid: {e}")
-            return False
-        return await is_admin(user_id)
-
-    return False
-
-def _json_resp(data, status=200, request: aio_web.Request = None):
-    return aio_web.Response(
-        status=status,
-        content_type='application/json',
-        headers=_cors_headers(request),
-        text=json.dumps(data, default=str)
-    )
-
-def _err(msg, status=400, request: aio_web.Request = None):
-    return _json_resp({'error': msg}, status, request=request)
-
-async def _cors_handler(request: aio_web.Request) -> aio_web.Response:
-    return aio_web.Response(headers=_cors_headers(request))
-
-@aio_web.middleware
-async def _api_error_middleware(request: aio_web.Request, handler):
-    try:
-        resp = await handler(request)
-        resp.headers.update(_cors_headers(request))
-        return resp
-    except Exception as e:
-        logger.error(f"[API ERROR] {request.method} {request.path}: {e}", exc_info=True)
-        return aio_web.Response(
-            status=500,
-            content_type='application/json',
-            headers=_cors_headers(request),
-            text=json.dumps({'error': 'Internal server error'})
-        )
-
-_dashboard_html_cache = None
-_dashboard_html_cache_lock: asyncio.Lock = None
-
-
-async def api_serve_dashboard(request: aio_web.Request) -> aio_web.Response:
-    global _dashboard_html_cache, _dashboard_html_cache_lock
-    path = _dashboard_html_path()
-    if not path:
-        return aio_web.Response(status=404, text='dashboard.html tidak ditemukan.')
-
-    try:
-        mtime = os.path.getmtime(path)
-    except OSError:
-        return aio_web.Response(status=404, text='dashboard.html tidak ditemukan.')
-
-    if _dashboard_html_cache and _dashboard_html_cache[0] == path and _dashboard_html_cache[1] == mtime:
-        return aio_web.Response(content_type='text/html', text=_dashboard_html_cache[2])
-
-    if _dashboard_html_cache_lock is None:
-        _dashboard_html_cache_lock = asyncio.Lock()
-    async with _dashboard_html_cache_lock:
-        if _dashboard_html_cache and _dashboard_html_cache[0] == path and _dashboard_html_cache[1] == mtime:
-            content = _dashboard_html_cache[2]
-        else:
-            content = await asyncio.to_thread(Path(path).read_text, encoding='utf-8')
-            _dashboard_html_cache = (path, mtime, content)
-    return aio_web.Response(content_type='text/html', text=content)
-
-
-def _validate_product_payload(data: dict, partial: bool = False):
-    errors = []
-    nama = str(data.get('nama', '')).strip()
-    if not partial and not nama:
-        errors.append('nama wajib diisi')
-
-    if 'harga' in data or not partial:
-        try:
-            harga = int(data.get('harga', 0))
-            if harga <= 0:
-                errors.append('harga harus lebih dari 0')
-        except (TypeError, ValueError):
-            errors.append('harga harus angka')
-
-    paket_id = str(data.get('paket_id') or make_paket_id(nama)).strip()
-    if not partial and not re.match(r'^[a-z0-9_]{1,40}$', paket_id):
-        errors.append('paket_id hanya boleh huruf kecil, angka, underscore, maksimal 40 karakter')
-
-    for key in ('link',):
-        val = data.get(key)
-        if val and not (str(val).startswith('http://') or str(val).startswith('https://') or str(val).startswith('tg://')):
-            errors.append(f'{key} harus berupa URL valid')
-
-    if data.get('requires_paket_ids'):
-        ids = _split_required_ids(data.get('requires_paket_ids'))
-        if any(not re.match(r'^[a-z0-9_]{1,40}$', pid) for pid in ids):
-            errors.append('requires_paket_ids berisi paket_id tidak valid')
-
-    return errors
-
-async def api_get_products(request: aio_web.Request) -> aio_web.Response:
-    if not await _api_auth(request): return _err('Unauthorized', 401)
-    return _json_resp(await get_all_products())
-
-async def api_post_product(request: aio_web.Request) -> aio_web.Response:
-    if not await _api_auth(request): return _err('Unauthorized', 401)
-    try:
-        data = await request.json()
-    except Exception:
-        return _err('Invalid JSON')
-    errors = _validate_product_payload(data, partial=False)
-    if errors:
-        return _err('; '.join(errors))
-    paket_id = data.get('paket_id') or make_paket_id(data.get('nama', ''))
-    await add_product(
-        paket_id=paket_id, nama=data.get('nama', ''), emoji=data.get('emoji', '📦'),
-        deskripsi=data.get('deskripsi', ''), harga=int(data.get('harga', 0)),
-        link=data.get('link'), group_chat_id=data.get('group_chat_id') or None
-    )
-    if data.get('requires_paket_ids'):
-        await update_product_field(paket_id, 'requires_paket_ids', data['requires_paket_ids'])
-    return _json_resp({'ok': True, 'paket_id': paket_id})
-
-async def api_put_product(request: aio_web.Request) -> aio_web.Response:
-    if not await _api_auth(request): return _err('Unauthorized', 401)
-    paket_id = request.match_info['paket_id']
-    try:
-        data = await request.json()
-    except Exception:
-        return _err('Invalid JSON')
-    errors = _validate_product_payload(data, partial=True)
-    if errors:
-        return _err('; '.join(errors))
-    allowed = {'nama', 'emoji', 'deskripsi', 'harga', 'link', 'group_chat_id', 'aktif', 'requires_paket_ids'}
-    for field, value in data.items():
-        if field in allowed:
-            if field == 'harga':
-                value = int(value)
-            await update_product_field(paket_id, field, value)
-    return _json_resp({'ok': True})
-
-async def api_delete_product(request: aio_web.Request) -> aio_web.Response:
-    if not await _api_auth(request): return _err('Unauthorized', 401)
-    await delete_product(request.match_info['paket_id'])
-    return _json_resp({'ok': True})
-
-@async_wrap
-def _get_all_orders_api():
-    with db_session_safe() as conn:
-        with conn.cursor() as c:
-            c.execute("""
-                SELECT o.*, p.nama as paket_nama, p.emoji as paket_emoji
-                FROM orders o
-                LEFT JOIN products p ON o.paket_id = p.paket_id
-                ORDER BY o.id DESC LIMIT 500
-            """)
-            return [dict(r) for r in c.fetchall()]
-
-_api_orders_cache = None
-_api_orders_cache_lock: asyncio.Lock = None
-
-
-async def _get_all_orders_api_cached():
-    global _api_orders_cache, _api_orders_cache_lock
-    now_mono = _time.monotonic()
-    if _api_orders_cache and now_mono < _api_orders_cache[0]:
-        return copy.deepcopy(_api_orders_cache[1])
-    if _api_orders_cache_lock is None:
-        _api_orders_cache_lock = asyncio.Lock()
-    async with _api_orders_cache_lock:
-        now_mono = _time.monotonic()
-        if _api_orders_cache and now_mono < _api_orders_cache[0]:
-            return copy.deepcopy(_api_orders_cache[1])
-        value = await _get_all_orders_api()
-        _api_orders_cache = (now_mono + 2.0, copy.deepcopy(value))
-        return value
-
-
-async def api_get_orders(request: aio_web.Request) -> aio_web.Response:
-    if not await _api_auth(request): return _err('Unauthorized', 401)
-    return _json_resp(await _get_all_orders_api_cached())
-
-async def api_confirm_order(request: aio_web.Request) -> aio_web.Response:
-    if not await _api_auth(request): return _err('Unauthorized', 401)
-    order_id = request.match_info['order_id']
-    order = await get_order_by_id(order_id)
-    if not order:
-        return _err('Order tidak ditemukan', 404)
-    if order['status'] != 'waiting':
-        return _err(f"Status order: {order['status']}, bukan waiting")
-    if not _current_bot:
-        return _err('Bot tidak tersedia', 503)
-
-    ok = await mark_order_completed(order_id)
-    if not ok:
-        return _err('Gagal konfirmasi, mungkin sudah diproses')
-
-    await _process_completed_order_delivery(
-        _current_bot,
-        order_id=order_id,
-        paket_id=order['paket_id'],
-        user_id=order['user_id'],
-        user_name=order.get('user_name', 'User'),
-        paid_amount=order.get('harga_dibayar') or 0,
-        source_title="✅ <b>DIKONFIRMASI ADMIN DASHBOARD</b>"
-    )
-    return _json_resp({'ok': True, 'delivery_status': 'processed'})
-
-async def api_cancel_order(request: aio_web.Request) -> aio_web.Response:
-    if not await _api_auth(request): return _err('Unauthorized', 401)
-    order_id = request.match_info['order_id']
-    order = await get_order_by_id(order_id)
-    if not order:
-        return _err('Order tidak ditemukan', 404)
-    paket = await get_product(order['paket_id']) or {'harga': 0}
-    cancel_amount = order.get('harga_dibayar') or paket.get('harga', 0)
-    if cancel_amount:
-        await cancel_transaction(order_id, cancel_amount)
-    await update_order_status(order_id, 'cancelled')
-    await _stop_payment_task(order['user_id'])
-    if _current_bot:
-        try:
-            await _current_bot.send_message(
-                chat_id=order['user_id'],
-                text=(
-                    "<b>❌ PESANAN DIBATALKAN</b>\n========================\n\n"
-                    "Pesanan kamu dibatalkan oleh admin.\n"
-                    "Ketik /start untuk membuat pesanan baru."
-                ),
-                parse_mode='HTML'
-            )
-        except Exception as e:
-            logger.debug(f"Gagal kirim pembatalan via API ke buyer: {e}")
-    return _json_resp({'ok': True})
-
-@async_wrap
-def _get_all_testimonials_api():
-    with db_session_safe() as conn:
-        with conn.cursor() as c:
-            c.execute("SELECT * FROM testimonials ORDER BY created_at DESC")
-            return [dict(r) for r in c.fetchall()]
-
-_api_testimonials_cache = None
-_api_testimonials_cache_lock: asyncio.Lock = None
-
-
-async def _get_all_testimonials_api_cached():
-    global _api_testimonials_cache, _api_testimonials_cache_lock
-    now_mono = _time.monotonic()
-    if _api_testimonials_cache and now_mono < _api_testimonials_cache[0]:
-        return copy.deepcopy(_api_testimonials_cache[1])
-    if _api_testimonials_cache_lock is None:
-        _api_testimonials_cache_lock = asyncio.Lock()
-    async with _api_testimonials_cache_lock:
-        now_mono = _time.monotonic()
-        if _api_testimonials_cache and now_mono < _api_testimonials_cache[0]:
-            return copy.deepcopy(_api_testimonials_cache[1])
-        value = await _get_all_testimonials_api()
-        _api_testimonials_cache = (now_mono + 5.0, copy.deepcopy(value))
-        return value
-
-
-async def api_get_testimonials(request: aio_web.Request) -> aio_web.Response:
-    if not await _api_auth(request): return _err('Unauthorized', 401)
-    return _json_resp(await _get_all_testimonials_api_cached())
-
-async def api_testimonial_action(request: aio_web.Request) -> aio_web.Response:
-    if not await _api_auth(request): return _err('Unauthorized', 401)
-    order_id = request.match_info['order_id']
-    try:
-        data = await request.json()
-    except Exception:
-        return _err('Invalid JSON')
-    action = data.get('action')
-    if action not in ('approve', 'reject'):
-        return _err('action harus approve atau reject')
-    status = 'approved' if action == 'approve' else 'rejected'
-    await update_testimonial_status(order_id, status)
-    if action == 'approve' and _current_bot:
-        channel_id = await get_setting('testimoni_channel_id')
-        if channel_id:
-            testi = await get_testimonial_by_order(order_id)
-            if testi:
-                stars = '★' * (testi['rating'] or 0) + '☆' * (5 - (testi['rating'] or 0))
-                try:
-                    await _current_bot.send_message(
-                        chat_id=int(channel_id),
-                        text=(
-                            f"⭐ <b>Testimoni Pembeli</b>\n\n"
-                            f"👤 {esc(samarkan_nama(testi.get('user_name', 'Anonim')))}\n"
-                            f"📦 Paket: <code>{esc(testi.get('paket_id', '-'))}</code>\n"
-                            f"⭐ {stars}\n\n"
-                            f"💬 {esc(testi.get('review') or '-')}"
-                        ),
-                        parse_mode='HTML'
-                    )
-                except Exception as e:
-                    logger.error(f"[API TESTI] Gagal post ke channel: {e}")
-    return _json_resp({'ok': True})
-
-async def api_get_banned(request: aio_web.Request) -> aio_web.Response:
-    if not await _api_auth(request): return _err('Unauthorized', 401)
-    return _json_resp(await get_all_banned())
-
-async def api_post_ban(request: aio_web.Request) -> aio_web.Response:
-    if not await _api_auth(request): return _err('Unauthorized', 401)
-    try:
-        data = await request.json()
-    except Exception:
-        return _err('Invalid JSON')
-    user_id = data.get('user_id')
-    if not user_id:
-        return _err('user_id diperlukan')
-    await ban_user(int(user_id), data.get('reason', ''))
-    return _json_resp({'ok': True})
-
-async def api_delete_ban(request: aio_web.Request) -> aio_web.Response:
-    if not await _api_auth(request): return _err('Unauthorized', 401)
-    await unban_user(int(request.match_info['user_id']))
-    return _json_resp({'ok': True})
-
-async def api_get_admins(request: aio_web.Request) -> aio_web.Response:
-    if not await _api_auth(request): return _err('Unauthorized', 401)
-    return _json_resp(await get_all_admins())
-
-async def api_post_admin(request: aio_web.Request) -> aio_web.Response:
-    if not await _api_auth(request): return _err('Unauthorized', 401)
-    try:
-        data = await request.json()
-    except Exception:
-        return _err('Invalid JSON')
-    user_id = data.get('user_id')
-    if not user_id:
-        return _err('user_id diperlukan')
-    await add_admin(int(user_id), data.get('nama', str(user_id)), ADMIN_ID)
-    return _json_resp({'ok': True})
-
-async def api_delete_admin(request: aio_web.Request) -> aio_web.Response:
-    if not await _api_auth(request): return _err('Unauthorized', 401)
-    await remove_admin(int(request.match_info['user_id']))
-    return _json_resp({'ok': True})
-
-async def api_get_stats(request: aio_web.Request) -> aio_web.Response:
-    if not await _api_auth(request): return _err('Unauthorized', 401)
-    today = now_wib().replace(hour=0, minute=0, second=0, microsecond=0)
-    month = today.replace(day=1)
-    stats = await get_order_stats_cached(today, month)
-    if 'trend_7d' in stats:
-        formatted = []
-        for row in stats['trend_7d']:
-            d = row.get('hari')
-            formatted.append({
-                'date': d.strftime('%d/%m') if hasattr(d, 'strftime') else str(d),
-                'day': d.strftime('%d/%m') if hasattr(d, 'strftime') else str(d),
-                'rev': int(row.get('rev', 0)),
-                'cnt': int(row.get('cnt', 0)),
-            })
-        stats['trend_7d'] = formatted
-    return _json_resp(stats)
-
-async def api_get_groups(request: aio_web.Request) -> aio_web.Response:
-    if not await _api_auth(request): return _err('Unauthorized', 401)
-    return _json_resp(await get_managed_groups())
-
-async def api_kick_check(request: aio_web.Request) -> aio_web.Response:
-    if not await _api_auth(request): return _err('Unauthorized', 401)
-    user_id = int(request.match_info['user_id'])
-    groups = await get_managed_groups()
-    results = []
-    for grp in groups:
-        chat_id = grp.get('chat_id') or grp.get('id')
-        title = grp.get('title', str(chat_id))
-        is_member = False
-        if _current_bot and chat_id:
-            try:
-                member = await _current_bot.get_chat_member(chat_id=int(chat_id), user_id=user_id)
-                is_member = member.status not in ('left', 'kicked', 'banned')
-            except Exception as e:
-                logger.debug(f"Gagal verifikasi keanggotaan grup {chat_id}: {e}")
-        results.append({'chat_id': chat_id, 'title': title, 'is_member': is_member})
-    return _json_resp({'groups': results})
-
-async def api_kick_execute(request: aio_web.Request) -> aio_web.Response:
-    if not await _api_auth(request): return _err('Unauthorized', 401)
-    try:
-        data = await request.json()
-    except Exception:
-        return _err('Invalid JSON')
-    user_id = data.get('user_id')
-    chat_id = data.get('chat_id')
-    if not user_id or not chat_id:
-        return _err('user_id dan chat_id diperlukan')
-    if not _current_bot:
-        return _err('Bot tidak tersedia')
-    try:
-        await _current_bot.ban_chat_member(chat_id=int(chat_id), user_id=int(user_id))
-        await _current_bot.unban_chat_member(chat_id=int(chat_id), user_id=int(user_id))
-        return _json_resp({'ok': True})
-    except Exception as e:
-        return _err(f'Gagal kick: {str(e)}')
-
-async def api_broadcast(request: aio_web.Request) -> aio_web.Response:
-    if not await _api_auth(request): return _err('Unauthorized', 401)
-    try:
-        data = await request.json()
-    except Exception:
-        return _err('Invalid JSON')
-    text = data.get('text', '').strip()
-    if not text:
-        return _err('text diperlukan')
-    if not _current_bot:
-        return _err('Bot tidak tersedia')
-    buyers = await get_all_buyers()
-    sent = 0
-    failed = 0
-    for b in buyers:
-        try:
-            await _current_bot.send_message(chat_id=b['user_id'], text=text, parse_mode='HTML')
-            sent += 1
-            await asyncio.sleep(0.05)
-        except Exception as e:
-            logger.debug(f"Broadcast gagal terkirim ke buyer {b['user_id']}: {e}")
-            failed += 1
-    return _json_resp({'ok': True, 'sent': sent, 'failed': failed, 'total': len(buyers)})
-
-async def api_post_settings(request: aio_web.Request) -> aio_web.Response:
-    if not await _api_auth(request): return _err('Unauthorized', 401)
-    try:
-        data = await request.json()
-    except Exception:
-        return _err('Invalid JSON')
-    allowed_keys = {'maintenance', 'link_testimoni', 'link_admin', 'notif_channel_id',
-                    'testimoni_channel_id', 'webhook_secret'}
-    for key, value in data.items():
-        if key in allowed_keys:
-            await set_setting(key, value if value else None)
-    return _json_resp({'ok': True})
-
-@async_wrap
-def _get_backup_data():
-    with db_session_safe() as conn:
-        with conn.cursor() as c:
-            c.execute("SELECT * FROM products ORDER BY harga ASC")
-            products = [dict(r) for r in c.fetchall()]
-            c.execute("SELECT * FROM orders ORDER BY id DESC LIMIT 1000")
-            orders = [dict(r) for r in c.fetchall()]
-            c.execute("SELECT * FROM testimonials ORDER BY created_at DESC")
-            testimonials = [dict(r) for r in c.fetchall()]
-            c.execute("SELECT * FROM banned_users")
-            banned = [dict(r) for r in c.fetchall()]
-            c.execute("SELECT * FROM settings")
-            settings = [dict(r) for r in c.fetchall()]
-        return {'products': products, 'orders': orders, 'testimonials': testimonials,
-                'banned': banned, 'settings': settings}
-
-async def api_backup(request: aio_web.Request) -> aio_web.Response:
-    if not await _api_auth(request): return _err('Unauthorized', 401)
-    data = await _get_backup_data()
-    filename = f"backup_{now_wib().strftime('%Y%m%d_%H%M')}.json"
-    payload_text = await asyncio.to_thread(json.dumps, data, default=str)
-    return aio_web.Response(
-        status=200,
-        content_type='application/json',
-        headers={
-            'Access-Control-Allow-Origin': _allowed_cors_origin(request),
-            'Vary': 'Origin',
-            'Content-Disposition': f'attachment; filename="{filename}"',
-        },
-        text=payload_text
-    )
-
 # =================== WEB SERVER MANAGEMENT ===================
 
 async def _start_webhook_server():
     global _webhook_runner
-    webhook_app = aio_web.Application(middlewares=[_api_error_middleware])
+    webhook_app = aio_web.Application()
 
-    # Endpoints Webhook & Status
+    # Endpoint yang tetap diperlukan bot.
     webhook_app.router.add_post('/webhook/autogopay', autogopay_webhook_handler)
     webhook_app.router.add_get('/health', lambda r: aio_web.Response(text='ok'))
     webhook_app.router.add_get('/', lambda r: aio_web.Response(text='Hyper Family Store Bot - OK'))
-
-    # Dashboard Panel
-    webhook_app.router.add_get('/dashboard', api_serve_dashboard)
-
-    # CORS Preflight
-    webhook_app.router.add_options('/{path_info:.*}', _cors_handler)
-
-    # REST APIs
-    webhook_app.router.add_get('/api/products', api_get_products)
-    webhook_app.router.add_post('/api/products', api_post_product)
-    webhook_app.router.add_put('/api/products/{paket_id}', api_put_product)
-    webhook_app.router.add_delete('/api/products/{paket_id}', api_delete_product)
-
-    webhook_app.router.add_get('/api/orders', api_get_orders)
-    webhook_app.router.add_post('/api/orders/{order_id}/confirm', api_confirm_order)
-    webhook_app.router.add_post('/api/orders/{order_id}/cancel', api_cancel_order)
-
-    webhook_app.router.add_get('/api/testimonials', api_get_testimonials)
-    webhook_app.router.add_post('/api/testimonials/{order_id}/action', api_testimonial_action)
-
-    webhook_app.router.add_get('/api/banned', api_get_banned)
-    webhook_app.router.add_post('/api/banned', api_post_ban)
-    webhook_app.router.add_delete('/api/banned/{user_id}', api_delete_ban)
-
-    webhook_app.router.add_get('/api/admins', api_get_admins)
-    webhook_app.router.add_post('/api/admins', api_post_admin)
-    webhook_app.router.add_delete('/api/admins/{user_id}', api_delete_admin)
-
-    webhook_app.router.add_get('/api/stats', api_get_stats)
-    webhook_app.router.add_get('/api/groups', api_get_groups)
-    webhook_app.router.add_get('/api/kick/check/{user_id}', api_kick_check)
-    webhook_app.router.add_post('/api/kick/execute', api_kick_execute)
-
-    webhook_app.router.add_post('/api/broadcast', api_broadcast)
-    webhook_app.router.add_post('/api/settings', api_post_settings)
-    webhook_app.router.add_get('/api/backup', api_backup)
 
     runner = aio_web.AppRunner(webhook_app)
     await runner.setup()
@@ -2834,7 +2237,7 @@ async def _start_webhook_server():
     port = int(os.environ.get('PORT', 8080))
     site = aio_web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
-    logger.info(f"[WEBHOOK] Server API berhasil berjalan di port {port}")
+    logger.info(f"[WEBHOOK] Server webhook berjalan di port {port}")
 
 # =================== POST INIT ===================
 
@@ -3562,21 +2965,16 @@ async def cancel_order_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    user_id = query.from_user.id
 
-    try:
-        await query.message.delete()
-    except Exception as e:
-        logger.debug(f"Gagal menghapus pesan kembali ke menu: {e}")
-
-    msg = await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text=await build_main_menu_text(),
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(await build_main_menu_keyboard())
+    menu_text, menu_keyboard = await asyncio.gather(
+        build_main_menu_text(),
+        build_main_menu_keyboard(),
     )
-    simpan_msg_user(context, user_id, msg.message_id)
-    await hapus_msg_user_lama(context, user_id, keep_last=1)
+    await query.edit_message_text(
+        text=menu_text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(menu_keyboard)
+    )
 
 # =================== GANTI PAKET ===================
 
@@ -5785,7 +5183,7 @@ async def resend_group_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 # =================== BACKGROUND LOOPS ===================
-REMINDER_HARI = 3
+REMINDER_HARI = 7
 
 def _get_buyers_for_reminder_sync(hari: int):
     target_day_start = (now_wib() - timedelta(days=hari)).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -5805,16 +5203,23 @@ async def _send_buyer_reminders(bot):
     logger.info(f"[REMINDER] Mengirim reminder ke {len(buyers)} buyer...")
     for buyer in buyers:
         try:
+            buyer_name = esc(buyer.get('user_name') or 'Kak')
             await bot.send_message(
                 chat_id=buyer['user_id'],
                 text=(
-                    f"👋 Halo <b>{esc(buyer['user_name'])}</b>!\n\n"
-                    f"Sudah <b>{REMINDER_HARI} hari</b> sejak kamu belanja di <b>Hyper Family Store</b> 🛒\n\n"
-                    f"Puas dengan produknya? Mau belanja lagi?\n"
-                    f"Kami punya paket menarik yang siap dikirim langsung!\n\n"
-                    f"Ketik /start untuk lihat katalog kami 😊"
+                    f"👋 Halo, <b>{buyer_name}</b>!\n\n"
+                    f"Terima kasih sudah berbelanja di\n"
+                    f"<b>Hyper Family Store</b> 🛒✨\n\n"
+                    f"Semoga paket yang kamu beli sesuai\n"
+                    f"dan memuaskan, ya 😊\n\n"
+                    f"Mau lihat pilihan paket lainnya?\n\n"
+                    f"Tekan tombol di bawah untuk\n"
+                    f"membuka katalog 👇"
                 ),
-                parse_mode="HTML"
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🛍️ Lihat Katalog", callback_data="back_to_menu")]
+                ])
             )
             await asyncio.sleep(0.5)
         except Exception as e:
@@ -6729,8 +6134,6 @@ def build_admin_panel_keyboard(user_id: int = None):
     ]
     if user_id and is_super_admin(user_id):
         rows.append([InlineKeyboardButton("👥 Kelola Admin", callback_data="admpanel_admins")])
-    if DASHBOARD_URL:
-        rows.append([InlineKeyboardButton("🖥️ Dashboard Web", web_app=WebAppInfo(url=DASHBOARD_URL))])
     return InlineKeyboardMarkup(rows)
 
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):

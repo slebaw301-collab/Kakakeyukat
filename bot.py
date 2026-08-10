@@ -4277,14 +4277,14 @@ async def _send_produk_menu(context, chat_id, message=None, query=None):
     else:
         await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=markup)
 
-async def produk_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def produk_detail(update: Update, context: ContextTypes.DEFAULT_TYPE, paket_id: str = None):
     query = update.callback_query
     try:
         await query.answer()
     except Exception:
         pass
 
-    paket_id = query.data.replace("pd_detail_", "")
+    paket_id = paket_id or query.data.replace("pd_detail_", "")
     p = await get_product(paket_id)
     if not p:
         await query.edit_message_text("⚠️ Produk tidak ditemukan.")
@@ -4445,8 +4445,7 @@ async def pd_req_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
     new_val = ",".join(selected) if selected else None
     await update_product_field(paket_id, 'requires_paket_ids', new_val)
 
-    query.data = f"pd_detail_{paket_id}"
-    await produk_detail(update, context)
+    await produk_detail(update, context, paket_id=paket_id)
 
 async def produk_edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query

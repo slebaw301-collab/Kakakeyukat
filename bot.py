@@ -3412,52 +3412,49 @@ async def ganti_paket_batal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.debug(f"Gagal update tampilan pembatalan ganti paket: {e}")
 
-# =================== ASYNCIO MONITORING PAYMENT TASKS ===================
-
-_payment_tasks: dict = {}
+# =================== GLOBAL PAYMENT POLLER ===================
+"""
+Satu task global memantau SEMUA order waiting, bukan satu task per order.
+Ini mengurangi beban event loop dan database saat banyak invoice aktif.
+"""
+_payment_tasks: dict = {}  # legacy tracking metadata
 _payment_tasks_lock = asyncio.Lock()
 _current_bot = None
+_global_poller_wakeup = asyncio.Event()
+_GLOBAL_POLLER_INTERVAL = 30  # detik
+_GLOBAL_PROVIDER_CONCURRENCY = 5  # max concurrent cek ke AutoGoPay
+
 
 async def _stop_payment_task(user_id: int):
+    """Legacy no-op: global poller menangani semua order."""
     async with _payment_tasks_lock:
-        task = _payment_tasks.pop(user_id, None)
-        if task and not task.done():
-            task.cancel()
+        _payment_tasks.pop(user_id, None)
+
 
 def _start_payment_task(bot, order_id: str, paket_id: str, user_id: int,
                          user_name: str, amount: int, timeout_seconds: int = 1800):
+    """Legacy: cukup simpan metadata dan bangunkan global poller."""
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         loop = asyncio.get_event_loop()
-    spawn_background(
-        _start_payment_task_async(
-            bot, order_id, paket_id, user_id, user_name, amount, timeout_seconds
-        ),
-        name=f"payment-bootstrap-{order_id}"
-    )
-
-async def _start_payment_task_async(bot, order_id: str, paket_id: str, user_id: int,
-                                     user_name: str, amount: int, timeout_seconds: int = 1800):
-    await _stop_payment_task(user_id)
-    task = asyncio.create_task(
-        _payment_poll_loop(bot, order_id, paket_id, user_id, user_name, amount, timeout_seconds),
-        name=f"payment-poll-{order_id}"
-    )
     async with _payment_tasks_lock:
-        _payment_tasks[user_id] = task
+        _payment_tasks[user_id] = {
+            "order_id": order_id,
+            "paket_id": paket_id,
+            "user_name": user_name,
+            "amount": amount,
+            "timeout_seconds": timeout_seconds,
+            "started_at": _time.monotonic(),
+        }
+    _global_poller_wakeup.set()
 
 
 async def _ensure_payment_task_for_order(bot, order: dict, paket: dict, user_name: str):
-    """Pastikan monitoring aktif tanpa membuat request status duplikat saat /start ditekan."""
+    """Pastikan order ada di radar global poller."""
     user_id = order.get('user_id')
     if not user_id:
         return
-    async with _payment_tasks_lock:
-        existing = _payment_tasks.get(user_id)
-        if existing and not existing.done():
-            return
-
     expiry_dt = parse_provider_datetime(order.get('payment_expires_at'))
     if expiry_dt is not None:
         timeout_seconds = max(1, int((expiry_dt - now_wib()).total_seconds()))
@@ -3482,112 +3479,155 @@ def _check_order_status_sync(order_id):
             row = c.fetchone()
             return dict(row) if row else None
 
+
 async def _check_order_status(order_id):
     return await run_db(_check_order_status_sync, order_id)
 
-async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
-                              user_name: str, amount: int, timeout_seconds: int):
-    elapsed = 0
+
+async def _maybe_expire_order(bot, order: dict) -> bool:
+    """Cek apakah order sudah expired. Kalau ya, proses expiry. Return True kalau expired."""
+    order_id = order['order_id']
+    user_id = order['user_id']
+    user_name = order.get('user_name', 'User')
+    paket_id = order['paket_id']
+    amount = order.get('harga_dibayar') or 0
+
+    expiry_dt = parse_provider_datetime(order.get('payment_expires_at'))
+    if expiry_dt is None:
+        created = order.get('created_at')
+        if created:
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            expiry_dt = created.astimezone(WIB) + timedelta(seconds=AUTOGOPAY_DEFAULT_TIMEOUT_SECONDS)
+        else:
+            expiry_dt = now_wib() + timedelta(seconds=AUTOGOPAY_DEFAULT_TIMEOUT_SECONDS)
+
+    if now_wib() < expiry_dt:
+        return False
+
+    row = await _check_order_status(order_id)
+    if not row or row['status'] != 'waiting':
+        return True
+
+    if amount:
+        await cancel_transaction(order_id, amount)
+    await update_order_status(order_id, 'expired')
+    await hapus_qris_buyer_lama(bot, order_id, user_id)
+    await set_cooldown_db(user_id)
+    cooldown_sisa = await get_cooldown_sisa_db(user_id)
+
     try:
-        order = await get_order_by_id(order_id)
-        transaction_id = (order or {}).get("provider_transaction_id")
-        last_provider_status = str((order or {}).get("provider_status") or "").lower()
-        if not transaction_id:
-            logger.error(f"[PAYMENT] transaction_id AutoGoPay tidak ditemukan untuk {order_id}")
-            return
+        await bot.send_message(
+            chat_id=user_id,
+            text=(
+                "<b>⏰ SESI BERAKHIR</b>
+"
+                "========================
 
-        last_db_check_elapsed = -30
-        while elapsed < timeout_seconds:
-            if elapsed < 60:
-                interval = AUTOGOPAY_POLL_FAST_SECONDS
-            elif elapsed < 300:
-                interval = AUTOGOPAY_POLL_MEDIUM_SECONDS
-            else:
-                interval = AUTOGOPAY_POLL_SLOW_SECONDS
+"
+                "Pesanan telah dibatalkan otomatis.
 
-            sleep_for = min(interval, max(1, timeout_seconds - elapsed))
-            await asyncio.sleep(sleep_for)
-            elapsed += sleep_for
+"
+                f"Alasan: Pembayaran tidak diterima dalam waktu yang ditentukan.
 
-            # Status lokal umumnya dihentikan lewat task.cancel(). Cek DB periodik saja
-            # agar banyak invoice aktif tidak membanjiri PostgreSQL setiap 3 detik.
-            if elapsed - last_db_check_elapsed >= 30:
-                row = await _check_order_status(order_id)
-                last_db_check_elapsed = elapsed
-                if not row or row['status'] != 'waiting':
-                    return
+"
+                f"⏳ Kamu bisa membuat pesanan baru dalam <b>{cooldown_sisa} menit</b>.
 
-            trans = await _autogopay_get_status(transaction_id, amount)
-            if not trans:
-                continue
-            current_provider_status = str(trans.get("provider_status") or "").lower()
-            if current_provider_status and current_provider_status != last_provider_status:
-                await update_order_provider_status(order_id, current_provider_status)
-                last_provider_status = current_provider_status
+"
+                "Ketik /start untuk membuat pesanan baru."
+            ),
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.debug(f"Gagal kirim notif expired ke buyer: {e}")
 
-            if trans.get('status') == 'completed':
-                logger.info(f"[PAYMENT POLL] Settlement terdeteksi: {order_id}")
-                await _handle_payment_success(bot, order_id, paket_id, user_id, user_name, amount, trans)
-                return
+    await hapus_notif_lama(bot, order_id)
+    paket_exp = await get_product(paket_id) or {"emoji": "📦", "nama": paket_id}
+    msg_id = await kirim_notif(
+        bot,
+        _format_order_notif(
+            "⏰ <b>ORDER EXPIRED</b>",
+            user_name, user_id, paket_exp, order_id,
+            extra="ℹ️ Buyer tidak bayar sampai waktu habis"
+        )
+    )
+    if msg_id:
+        await set_admin_msg_id(order_id, msg_id)
 
-        row = await _check_order_status(order_id)
-        if not row or row['status'] != 'waiting':
-            return
+    async with _payment_tasks_lock:
+        _payment_tasks.pop(user_id, None)
+    return True
 
-        trans = await _autogopay_get_status(transaction_id, amount)
-        if trans:
-            current_provider_status = str(trans.get("provider_status") or "").lower()
-            if current_provider_status and current_provider_status != last_provider_status:
-                await update_order_provider_status(order_id, current_provider_status)
-                last_provider_status = current_provider_status
-        if trans and trans.get('status') == 'completed':
-            await _handle_payment_success(bot, order_id, paket_id, user_id, user_name, amount, trans)
-            return
 
-        if amount:
-            await cancel_transaction(order_id, amount)
-        await update_order_status(order_id, 'expired')
-        await hapus_qris_buyer_lama(bot, order_id, user_id)
-        await set_cooldown_db(user_id)
-        cooldown_sisa = await get_cooldown_sisa_db(user_id)
+async def _check_single_order_payment(bot, order: dict):
+    """Cek status provider untuk satu order dan proses jika completed."""
+    order_id = order['order_id']
+    user_id = order['user_id']
+    user_name = order.get('user_name', 'User')
+    paket_id = order['paket_id']
+    amount = order.get('harga_dibayar') or 0
+    transaction_id = order.get('provider_transaction_id')
+
+    if not transaction_id:
+        logger.error(f"[PAYMENT] transaction_id AutoGoPay tidak ditemukan untuk {order_id}")
+        return
+
+    trans = await _autogopay_get_status(transaction_id, amount)
+    if not trans:
+        return
+
+    current_provider_status = str(trans.get("provider_status") or "").lower()
+    if current_provider_status:
+        await update_order_provider_status(order_id, current_provider_status)
+
+    if trans.get('status') == 'completed':
+        logger.info(f"[GLOBAL POLLER] Settlement terdeteksi: {order_id}")
+        await _handle_payment_success(bot, order_id, paket_id, user_id, user_name, amount, trans)
+        async with _payment_tasks_lock:
+            _payment_tasks.pop(user_id, None)
+
+
+async def _global_payment_poller(bot):
+    """Satu task yang memantau semua order waiting secara berkala."""
+    logger.info("[GLOBAL POLLER] Payment poller global dimulai.")
+    provider_sem = asyncio.Semaphore(_GLOBAL_PROVIDER_CONCURRENCY)
+
+    while True:
+        try:
+            await asyncio.wait_for(_global_poller_wakeup.wait(), timeout=_GLOBAL_POLLER_INTERVAL)
+            _global_poller_wakeup.clear()
+        except asyncio.TimeoutError:
+            pass
+        except asyncio.CancelledError:
+            break
 
         try:
-            await bot.send_message(
-                chat_id=user_id,
-                text=(
-                    "<b>⏰ SESI BERAKHIR</b>\n"
-                    "========================\n\n"
-                    "Pesanan telah dibatalkan otomatis.\n\n"
-                    f"Alasan: Pembayaran tidak diterima dalam waktu yang ditentukan.\n\n"
-                    f"⏳ Kamu bisa membuat pesanan baru dalam <b>{cooldown_sisa} menit</b>.\n\n"
-                    "Ketik /start untuk membuat pesanan baru."
-                ),
-                parse_mode="HTML"
-            )
+            orders = await get_all_waiting()
+            if not orders:
+                continue
+
+            still_waiting = []
+            for order in orders:
+                expired = await _maybe_expire_order(bot, order)
+                if not expired:
+                    still_waiting.append(order)
+
+            if not still_waiting:
+                continue
+
+            async def _sem_check(order):
+                async with provider_sem:
+                    await _check_single_order_payment(bot, order)
+
+            await asyncio.gather(*[_sem_check(o) for o in still_waiting], return_exceptions=True)
+
+        except asyncio.CancelledError:
+            break
         except Exception as e:
-            logger.debug(f"Gagal kirim notif expired ke buyer: {e}")
+            logger.error(f"[GLOBAL POLLER] Error di loop: {e}", exc_info=True)
+            await asyncio.sleep(10)
 
-        await hapus_notif_lama(bot, order_id)
-
-        paket_exp = await get_product(paket_id) or {"emoji": "📦", "nama": paket_id}
-        msg_id = await kirim_notif(
-            bot,
-            _format_order_notif(
-                "⏰ <b>ORDER EXPIRED</b>",
-                user_name, user_id, paket_exp, order_id,
-                extra="ℹ️ Buyer tidak bayar sampai waktu habis"
-            )
-        )
-        if msg_id:
-            await set_admin_msg_id(order_id, msg_id)
-
-    except asyncio.CancelledError:
-        pass
-    finally:
-        current_task = asyncio.current_task()
-        async with _payment_tasks_lock:
-            if _payment_tasks.get(user_id) is current_task:
-                _payment_tasks.pop(user_id, None)
+    logger.info("[GLOBAL POLLER] Payment poller global berhenti.")
 
 def _split_required_ids(requires_str: str) -> list:
     return [pid.strip() for pid in (requires_str or '').split(',') if pid.strip()]

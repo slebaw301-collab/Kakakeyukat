@@ -213,14 +213,14 @@ BOT_CONCURRENT_UPDATES = _env_int("BOT_CONCURRENT_UPDATES", 24, 4, 128)
 TELEGRAM_CONNECTION_POOL_SIZE = _env_int("TELEGRAM_CONNECTION_POOL_SIZE", 64, 16, 256)
 TELEGRAM_POOL_TIMEOUT_SECONDS = _env_float("TELEGRAM_POOL_TIMEOUT_SECONDS", 15.0, 1.0, 60.0)
 DB_POOL_MIN = _env_int("DB_POOL_MIN", 2, 1, 10)
-DB_POOL_MAX = _env_int("DB_POOL_MAX", 20, DB_POOL_MIN, 50)
-DB_THREAD_WORKERS = _env_int("DB_THREAD_WORKERS", min(24, DB_POOL_MAX), 4, 50)
+DB_POOL_MAX = _env_int("DB_POOL_MAX", 40, DB_POOL_MIN, 100)
+DB_THREAD_WORKERS = _env_int("DB_THREAD_WORKERS", min(32, DB_POOL_MAX), 4, 80)
 CPU_THREAD_WORKERS = _env_int("CPU_THREAD_WORKERS", 4, 2, 12)
 DB_SLOW_SESSION_SECONDS = _env_float("DB_SLOW_SESSION_SECONDS", 1.0, 0.1, 30.0)
 SLOW_UPDATE_THRESHOLD_SECONDS = _env_float("SLOW_UPDATE_THRESHOLD_SECONDS", 1.5, 0.2, 30.0)
 PERF_TRACE_THRESHOLD_SECONDS = _env_float("PERF_TRACE_THRESHOLD_SECONDS", 1.0, 0.1, 30.0)
 EVENT_LOOP_LAG_WARNING_SECONDS = _env_float("EVENT_LOOP_LAG_WARNING_SECONDS", 0.75, 0.1, 10.0)
-STATS_CACHE_TTL_SECONDS = _env_float("STATS_CACHE_TTL_SECONDS", 10.0, 1.0, 120.0)
+STATS_CACHE_TTL_SECONDS = _env_float("STATS_CACHE_TTL_SECONDS", 300.0, 1.0, 3600.0)
 AUTOGOPAY_MAX_CONCURRENT_REQUESTS = _env_int("AUTOGOPAY_MAX_CONCURRENT_REQUESTS", 20, 2, 50)
 TELEGRAM_RETRY_ATTEMPTS = _env_int("TELEGRAM_RETRY_ATTEMPTS", 2, 1, 4)
 
@@ -232,10 +232,50 @@ AUTOGOPAY_HTTP_TIMEOUT = aiohttp.ClientTimeout(
     sock_read=8,
 )
 
+# =================== CIRCUIT BREAKER ===================
+class CircuitBreaker:
+    """Mencegah spam request ke provider yang sedang down."""
+    def __init__(self, failure_threshold: int = 5, recovery_timeout: float = 120.0):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.failures = 0
+        self.last_failure_time = 0.0
+        self.state = "closed"
+        self._lock = asyncio.Lock()
+
+    async def call(self, coro_factory, *args, **kwargs):
+        async with self._lock:
+            now_mono = _time.monotonic()
+            if self.state == "open":
+                if now_mono - self.last_failure_time >= self.recovery_timeout:
+                    self.state = "half-open"
+                    self.failures = 0
+                else:
+                    remaining = int(self.recovery_timeout - (now_mono - self.last_failure_time))
+                    raise Exception(f"CircuitBreaker OPEN: AutoGoPay sementara tidak tersedia. Coba lagi dalam {remaining} detik.")
+        try:
+            result = await coro_factory(*args, **kwargs)
+            async with self._lock:
+                if self.state == "half-open":
+                    self.state = "closed"
+                self.failures = 0
+            return result
+        except Exception as e:
+            async with self._lock:
+                self.failures += 1
+                self.last_failure_time = _time.monotonic()
+                if self.failures >= self.failure_threshold:
+                    self.state = "open"
+                    logger.error(f"[CIRCUIT BREAKER] AutoGoPay OPEN setelah {self.failures} kegagalan.")
+            raise
+
+_autogopay_circuit = CircuitBreaker(failure_threshold=5, recovery_timeout=120.0)
+
+
 # Polling adaptif menjadi fallback webhook: cepat di awal, lalu melambat agar tetap hemat request.
-AUTOGOPAY_POLL_FAST_SECONDS = 3
-AUTOGOPAY_POLL_MEDIUM_SECONDS = 5
-AUTOGOPAY_POLL_SLOW_SECONDS = 10
+AUTOGOPAY_POLL_FAST_SECONDS = 10
+AUTOGOPAY_POLL_MEDIUM_SECONDS = 20
+AUTOGOPAY_POLL_SLOW_SECONDS = 30
 
 DEFAULT_LINK = "https://t.me/Kikukkvd"
 
@@ -251,19 +291,29 @@ if not AUTOGOPAY_API_KEY:
 
 # =================== CONCURRENCY & BACKGROUND TASKS ===================
 _background_tasks: set = set()
-_invoice_creation_in_progress: set = set()
+_invoice_creation_in_progress: dict = {}
+_INVOICE_CLAIM_TTL_SECONDS = 120
 
 
 def claim_invoice_creation(user_id: int) -> bool:
     """Single-flight per buyer untuk mencegah invoice ganda akibat double-click."""
+    now_mono = _time.monotonic()
+    stale = [uid for uid, ts in _invoice_creation_in_progress.items() if now_mono - ts > _INVOICE_CLAIM_TTL_SECONDS]
+    for uid in stale:
+        _invoice_creation_in_progress.pop(uid, None)
     if user_id in _invoice_creation_in_progress:
         return False
-    _invoice_creation_in_progress.add(user_id)
+    _invoice_creation_in_progress[user_id] = now_mono
     return True
 
 
 def release_invoice_creation(user_id: int):
-    _invoice_creation_in_progress.discard(user_id)
+    _invoice_creation_in_progress.pop(user_id, None)
+
+
+# Batasi jumlah ID pesan yang disimpan di memory per user agar tidak membengkak.
+_MAX_STORED_MESSAGES = 15
+_MAX_STORED_ADMIN_MESSAGES = 30
 
 
 # Pisahkan antrean query database dari pekerjaan CPU/file (QR, ZIP, JSON).
@@ -581,7 +631,7 @@ async def _autogopay_create_transaction(amount: int):
     if not AUTOGOPAY_API_KEY:
         logger.error("[AUTOGOPAY] AUTOGOPAY_API_KEY tidak tersedia.")
         return None
-    try:
+    async def _do():
         semaphore = await _get_autogopay_semaphore()
         async with semaphore:
             session = await get_http_session()
@@ -601,6 +651,8 @@ async def _autogopay_create_transaction(amount: int):
                     logger.error(f"[AUTOGOPAY] Respons generate tidak lengkap: {result}")
                     return None
                 return normalized
+    try:
+        return await _autogopay_circuit.call(_do)
     except asyncio.TimeoutError:
         logger.error("[AUTOGOPAY] Timeout saat membuat transaksi QRIS.")
     except aiohttp.ClientError as e:
@@ -613,7 +665,7 @@ async def _autogopay_create_transaction(amount: int):
 async def _autogopay_get_status(transaction_id: str, fallback_amount: int = 0):
     if not AUTOGOPAY_API_KEY or not transaction_id:
         return None
-    try:
+    async def _do():
         semaphore = await _get_autogopay_semaphore()
         async with semaphore:
             session = await get_http_session()
@@ -631,6 +683,8 @@ async def _autogopay_get_status(transaction_id: str, fallback_amount: int = 0):
                 normalized = _normalize_autogopay_transaction(data, fallback_amount)
                 normalized["provider_transaction_id"] = normalized.get("provider_transaction_id") or transaction_id
                 return normalized
+    try:
+        return await _autogopay_circuit.call(_do)
     except asyncio.TimeoutError:
         logger.warning(f"[AUTOGOPAY] Timeout cek status transaksi {transaction_id}")
     except aiohttp.ClientError as e:
@@ -643,7 +697,7 @@ async def _autogopay_get_status(transaction_id: str, fallback_amount: int = 0):
 async def _autogopay_cancel_transaction(transaction_id: str):
     if not AUTOGOPAY_API_KEY or not transaction_id:
         return None
-    try:
+    async def _do():
         semaphore = await _get_autogopay_semaphore()
         async with semaphore:
             session = await get_http_session()
@@ -658,6 +712,8 @@ async def _autogopay_cancel_transaction(transaction_id: str):
                     logger.warning(f"[AUTOGOPAY] Gagal cancel HTTP {response.status}: {result}")
                     return None
                 return result
+    try:
+        return await _autogopay_circuit.call(_do)
     except asyncio.TimeoutError:
         logger.warning(f"[AUTOGOPAY] Timeout cancel transaksi {transaction_id}")
     except aiohttp.ClientError as e:
@@ -913,6 +969,13 @@ def init_db():
             """)
             c.execute("CREATE INDEX IF NOT EXISTS idx_testimonials_status ON testimonials(status)")
             c.execute("CREATE INDEX IF NOT EXISTS idx_cooldowns_user_id ON cooldowns(user_id)")
+
+            # Index trigram untuk pencarian nama buyer yang kencang
+            try:
+                c.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+                c.execute("CREATE INDEX IF NOT EXISTS idx_orders_user_name_trgm ON orders USING gin (lower(user_name) gin_trgm_ops)")
+            except Exception as e:
+                logger.warning(f"[DB] Gagal membuat trigram index (non-kritis): {e}")
 
             for key, val in [
                 ('link_testimoni', 'https://t.me/+7zsdSrwYIG8wOTg1'),
@@ -2103,7 +2166,10 @@ async def build_main_menu_keyboard():
 def simpan_admin_msg(context, user_id, message_id):
     context.bot_data.setdefault('admin_messages', {})
     context.bot_data['admin_messages'].setdefault(user_id, [])
-    context.bot_data['admin_messages'][user_id].append(message_id)
+    msgs = context.bot_data['admin_messages'][user_id]
+    msgs.append(message_id)
+    if len(msgs) > _MAX_STORED_ADMIN_MESSAGES:
+        context.bot_data['admin_messages'][user_id] = msgs[-_MAX_STORED_ADMIN_MESSAGES:]
 
 async def hapus_admin_msg(context, user_id):
     msg_ids = context.bot_data.get('admin_messages', {}).pop(user_id, [])
@@ -2121,7 +2187,10 @@ async def hapus_admin_msg(context, user_id):
 def simpan_msg_user(context, user_id, message_id):
     context.bot_data.setdefault('user_messages', {})
     context.bot_data['user_messages'].setdefault(user_id, [])
-    context.bot_data['user_messages'][user_id].append(message_id)
+    msgs = context.bot_data['user_messages'][user_id]
+    msgs.append(message_id)
+    if len(msgs) > _MAX_STORED_MESSAGES:
+        context.bot_data['user_messages'][user_id] = msgs[-_MAX_STORED_MESSAGES:]
 
 async def hapus_msg_user_lama(context, user_id, keep_last=1):
     msgs = context.bot_data.get('user_messages', {}).get(user_id, [])
@@ -2267,6 +2336,18 @@ async def autogopay_webhook_handler(request: aio_web.Request) -> aio_web.Respons
     if not received_signature or not hmac.compare_digest(received_signature, expected_signature):
         logger.warning("[AUTOGOPAY WEBHOOK] Signature tidak valid.")
         return aio_web.Response(status=401, text="invalid signature")
+
+    # Cek timestamp untuk mencegah replay attack (toleransi 5 menit)
+    ts_header = request.headers.get("X-Timestamp") or request.headers.get("X-Request-Timestamp")
+    if ts_header:
+        try:
+            ts_val = int(ts_header)
+            now_ts = int(_time.time())
+            if abs(now_ts - ts_val) > 300:
+                logger.warning("[AUTOGOPAY WEBHOOK] Timestamp terlalu tua, kemungkinan replay.")
+                return aio_web.Response(status=401, text="stale request")
+        except (ValueError, TypeError):
+            pass
 
     try:
         data = json.loads(body)
@@ -2424,13 +2505,15 @@ async def post_init(application: Application):
                 amount=recovery_amount,
                 timeout_seconds=recovery_timeout
             )
-            logger.info(f"[POST_INIT] Task monitoring diaktifkan kembali untuk Order ID: {order['order_id']}")
+            logger.info(f"[POST_INIT] Order masuk radar global poller: {order['order_id']}")
 
     spawn_background(_auto_backup_loop(), name="auto-backup-loop")
     spawn_background(_buyer_reminder_loop(_current_bot), name="buyer-reminder-loop")
     spawn_background(_cleanup_cooldowns_loop(), name="cooldown-cleanup-loop")
     spawn_background(_event_loop_lag_monitor(), name="event-loop-lag-monitor")
     spawn_background(_start_webhook_server(), name="webhook-server")
+    spawn_background(_global_payment_poller(_current_bot), name="global-payment-poller")
+    spawn_background(_memory_cache_cleanup_loop(), name="memory-cache-cleanup")
     logger.info("[POST_INIT] Background task aktif dan bot siap menerima update.")
 
 # =================== GRACEFUL SHUTDOWN ===================
@@ -5279,6 +5362,10 @@ async def handle_json_document(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("❌ File harus berformat <code>.json</code>. Coba lagi dengan /import_json.", parse_mode="HTML")
         return
 
+    if doc.file_size and doc.file_size > 5 * 1024 * 1024:
+        await update.message.reply_text("❌ File terlalu besar. Maksimal <b>5 MB</b>.", parse_mode="HTML")
+        return
+
     context.user_data.pop('awaiting_json_import', None)
     status_msg = await update.message.reply_text("⏳ Membaca file JSON...")
 
@@ -5465,6 +5552,32 @@ async def _cleanup_cooldowns_loop():
             break
         except Exception as e:
             logger.error(f"[CLEANUP] Error di cleanup cooldown loop: {e}")
+
+
+async def _cleanup_memory_caches():
+    """Bersihkan in-memory cache yang sudah tua agar tidak membengkak."""
+    global _banned_cache, _cooldown_memory_cache, _cancel_count_cache
+    now_mono = _time.monotonic()
+    stale_banned = [uid for uid, (val, exp) in _banned_cache.items() if now_mono > exp]
+    for uid in stale_banned:
+        _banned_cache.pop(uid, None)
+    stale_cool = [uid for uid, exp in _cooldown_memory_cache.items() if now_utc() >= exp]
+    for uid in stale_cool:
+        _cooldown_memory_cache.pop(uid, None)
+    if len(_cancel_count_cache) > 5000:
+        _cancel_count_cache.clear()
+    logger.info(f"[MEMORY CLEANUP] Banned cache: {len(_banned_cache)}, Cooldown mem: {len(_cooldown_memory_cache)}, Cancel count: {len(_cancel_count_cache)}")
+
+
+async def _memory_cache_cleanup_loop():
+    while True:
+        try:
+            await asyncio.sleep(21600)  # 6 jam
+            await _cleanup_memory_caches()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"[MEMORY CLEANUP] Error: {e}")
 
 # =================== ADMIN: BROADCAST ===================
 
@@ -7374,7 +7487,8 @@ def main():
 
     logger.info(
         f"Bot Hyper Family Store berjalan | concurrent={BOT_CONCURRENT_UPDATES} | "
-        f"telegram_pool={TELEGRAM_CONNECTION_POOL_SIZE} | db_pool={DB_POOL_MAX}"
+        f"telegram_pool={TELEGRAM_CONNECTION_POOL_SIZE} | db_pool={DB_POOL_MAX} | "
+        f"global_poller_interval={_GLOBAL_POLLER_INTERVAL}s | stats_cache_ttl={STATS_CACHE_TTL_SECONDS}s"
     )
     app.run_polling(allowed_updates=["message", "callback_query", "chat_join_request"])
 

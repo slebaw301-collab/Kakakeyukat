@@ -254,6 +254,10 @@ AUTOGOPAY_MAX_CONCURRENT_REQUESTS = _env_int("AUTOGOPAY_MAX_CONCURRENT_REQUESTS"
 AUTOGOPAY_CIRCUIT_FAILURES = _env_int("AUTOGOPAY_CIRCUIT_FAILURES", 5, 2, 20)
 AUTOGOPAY_CIRCUIT_COOLDOWN_SECONDS = _env_float("AUTOGOPAY_CIRCUIT_COOLDOWN_SECONDS", 15.0, 5.0, 120.0)
 TELEGRAM_RETRY_ATTEMPTS = _env_int("TELEGRAM_RETRY_ATTEMPTS", 2, 1, 4)
+# Panel admin sengaja memakai halaman kecil supaya satu klik tidak membangun payload Telegram besar.
+ADMIN_ORDER_PAGE_SIZE = _env_int("ADMIN_ORDER_PAGE_SIZE", 8, 5, 15)
+ADMIN_LIST_PAGE_SIZE = _env_int("ADMIN_LIST_PAGE_SIZE", 10, 5, 20)
+ADMIN_PANEL_CACHE_TTL_SECONDS = _env_float("ADMIN_PANEL_CACHE_TTL_SECONDS", 3.0, 0.5, 15.0)
 
 # Timeout dibuat lebih pendek agar gangguan provider tidak menahan update Telegram terlalu lama.
 AUTOGOPAY_HTTP_TIMEOUT = aiohttp.ClientTimeout(
@@ -296,6 +300,22 @@ def claim_invoice_creation(user_id: int) -> bool:
 
 def release_invoice_creation(user_id: int):
     _invoice_creation_in_progress.discard(user_id)
+
+
+async def _fast_callback_ack(query, text: str = None):
+    """Hentikan spinner callback Telegram sedini mungkin tanpa menggagalkan handler jika jaringan sedang fluktuatif."""
+    try:
+        await query.answer(text=text)
+    except Exception as exc:
+        logger.debug(f"[CALLBACK] ACK gagal/terlambat: {exc}")
+
+
+async def _callback_feedback(query, context, text: str):
+    """Feedback setelah callback sudah di-ACK. Dipakai hanya untuk jalur validasi/error yang jarang."""
+    try:
+        await query.message.reply_text(text)
+    except Exception:
+        await context.bot.send_message(chat_id=query.from_user.id, text=text)
 
 
 # Pisahkan antrean query database dari pekerjaan CPU/file (QR, ZIP, JSON).
@@ -1416,6 +1436,75 @@ def get_all_pending():
             """)
             return [dict(r) for r in c.fetchall()]
 
+_admin_order_page_cache: dict = {}
+_admin_order_page_cache_generation = 0
+
+def _invalidate_admin_order_page_cache():
+    global _admin_order_page_cache_generation
+    _admin_order_page_cache_generation += 1
+    _admin_order_page_cache.clear()
+
+def _get_admin_order_page_sync(status: str, limit: int, offset: int):
+    with db_session_safe() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                """
+                SELECT o.*, p.nama as paket_nama, p.emoji as paket_emoji, p.harga as paket_harga,
+                       p.deskripsi as paket_deskripsi, COUNT(*) OVER() AS total_count
+                FROM orders o
+                LEFT JOIN products p ON o.paket_id = p.paket_id
+                WHERE o.status=%s
+                ORDER BY o.id ASC
+                LIMIT %s OFFSET %s
+                """,
+                (status, limit, offset),
+            )
+            return [dict(r) for r in c.fetchall()]
+
+async def get_admin_order_page(status: str, page: int = 0, page_size: int = ADMIN_ORDER_PAGE_SIZE):
+    """Ambil hanya data yang benar-benar ditampilkan di panel, bukan seluruh tabel order."""
+    if status not in {"waiting", "pending"}:
+        raise ValueError("Status panel order tidak valid")
+    page = max(0, int(page))
+    page_size = max(1, min(20, int(page_size)))
+    generation = _admin_order_page_cache_generation
+    key = (status, page, page_size, generation)
+    now_mono = _time.monotonic()
+    cached = _admin_order_page_cache.get(key)
+    if cached and now_mono < cached[1]:
+        return copy.deepcopy(cached[0]), cached[2]
+
+    offset = page * page_size
+    rows, used_async = await _asyncpg_fetch(
+        """
+        SELECT o.*, p.nama as paket_nama, p.emoji as paket_emoji, p.harga as paket_harga,
+               p.deskripsi as paket_deskripsi, COUNT(*) OVER() AS total_count
+        FROM orders o
+        LEFT JOIN products p ON o.paket_id = p.paket_id
+        WHERE o.status=$1
+        ORDER BY o.id ASC
+        LIMIT $2 OFFSET $3
+        """,
+        status, page_size, offset,
+    )
+    if not used_async:
+        rows = await run_db_admin(_get_admin_order_page_sync, status, page_size, offset)
+
+    total = int(rows[0].get('total_count') or 0) if rows else 0
+    # Callback pagination hanya menghasilkan halaman valid. Fallback ini menangani data yang berubah tepat saat klik Next.
+    if not rows and page > 0:
+        return await get_admin_order_page(status, page - 1, page_size)
+    clean_rows = []
+    for row in rows:
+        row = dict(row)
+        row.pop('total_count', None)
+        clean_rows.append(row)
+    _admin_order_page_cache[key] = (copy.deepcopy(clean_rows), now_mono + ADMIN_PANEL_CACHE_TTL_SECONDS, total)
+    if len(_admin_order_page_cache) > 100:
+        _admin_order_page_cache.clear()
+        _admin_order_page_cache[key] = (copy.deepcopy(clean_rows), now_mono + ADMIN_PANEL_CACHE_TTL_SECONDS, total)
+    return clean_rows, total
+
 def _get_all_waiting_sync():
     with db_session_safe() as conn:
         with conn.cursor() as c:
@@ -1484,6 +1573,19 @@ def get_all_buyers():
                 ORDER BY max_id DESC
             """)
             return [dict(r) for r in c.fetchall()]
+
+@async_wrap_admin
+def get_buyer_count():
+    with db_session_safe() as conn:
+        with conn.cursor() as c:
+            c.execute("""
+                SELECT COUNT(DISTINCT o.user_id) AS total
+                FROM orders o
+                LEFT JOIN banned_users b ON o.user_id = b.user_id
+                WHERE b.user_id IS NULL AND o.user_id IS NOT NULL
+            """)
+            row = c.fetchone()
+            return int(row['total'] or 0) if row else 0
 
 @async_wrap_admin
 def search_buyers_sync(query: str) -> list:
@@ -1759,6 +1861,7 @@ def _invalidate_stats_cache():
 def _invalidate_order_caches(user_id=None):
     _invalidate_active_order_cache(user_id)
     _invalidate_waiting_orders_cache()
+    _invalidate_admin_order_page_cache()
     _invalidate_stats_cache()
 
 
@@ -2028,6 +2131,7 @@ async def save_order(user_id, user_name, paket_id, order_id, harga_dibayar=0, or
     )
     _invalidate_active_order_cache(user_id)
     _invalidate_waiting_orders_cache()
+    _invalidate_admin_order_page_cache()
     _invalidate_stats_cache()
     _active_order_cache_set(user_id, order)
     return order
@@ -2105,6 +2209,31 @@ def get_all_banned():
         with conn.cursor() as c:
             c.execute("SELECT * FROM banned_users ORDER BY banned_at DESC")
             return [dict(r) for r in c.fetchall()]
+
+def _get_banned_page_sync(limit: int, offset: int):
+    with db_session_safe() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                """SELECT *, COUNT(*) OVER() AS total_count
+                   FROM banned_users
+                   ORDER BY banned_at DESC
+                   LIMIT %s OFFSET %s""",
+                (limit, offset),
+            )
+            return [dict(r) for r in c.fetchall()]
+
+async def get_banned_page(page: int = 0, page_size: int = ADMIN_LIST_PAGE_SIZE):
+    page = max(0, int(page))
+    rows = await run_db_admin(_get_banned_page_sync, page_size, page * page_size)
+    total = int(rows[0].get('total_count') or 0) if rows else 0
+    clean = []
+    for row in rows:
+        row = dict(row)
+        row.pop('total_count', None)
+        clean.append(row)
+    if not clean and page > 0:
+        return await get_banned_page(page - 1, page_size)
+    return clean, total
 
 # =================== SETTINGS DB FUNCTIONS ===================
 
@@ -3233,8 +3362,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
+    await _fast_callback_ack(query)
 
-    # Jalankan semua pengecekan awal secara paralel
+    # Spinner Telegram sudah berhenti; validasi tetap paralel agar menu muncul secepat mungkin.
     is_admin_flag, maint, banned = await asyncio.gather(
         is_admin(user_id, context),
         is_maintenance(),
@@ -3242,14 +3372,12 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     if not is_admin_flag and maint:
-        await query.answer("⚙️ Bot sedang maintenance. Coba lagi nanti.", show_alert=True)
+        await _callback_feedback(query, context, "⚙️ Bot sedang maintenance. Coba lagi nanti.")
         return
 
     if banned:
-        await query.answer("🚫 Akun kamu diblokir. Hubungi admin.", show_alert=True)
+        await _callback_feedback(query, context, "🚫 Akun kamu diblokir. Hubungi admin.")
         return
-
-    await query.answer()
 
     products = await get_all_products()
     aktif = [p for p in products if p.get('aktif', True)]
@@ -3281,18 +3409,19 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def pilih_paket(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
-
-    if await is_banned(user_id):
-        await query.answer("🚫 Akun kamu diblokir. Hubungi admin.", show_alert=True)
-        return
+    await _fast_callback_ack(query)
 
     paket_id = query.data.replace("pilih_", "")
-    paket = await get_product(paket_id)
-    if not paket:
-        await query.answer("❌ Produk tidak ditemukan.", show_alert=True)
+    banned, paket = await asyncio.gather(
+        is_banned(user_id),
+        get_product(paket_id),
+    )
+    if banned:
+        await _callback_feedback(query, context, "🚫 Akun kamu diblokir. Hubungi admin.")
         return
-
-    await query.answer()
+    if not paket:
+        await _callback_feedback(query, context, "❌ Produk tidak ditemukan.")
+        return
 
     status_text = "Tersedia ✅" if paket.get('aktif', True) else "Tidak tersedia ❌"
     text = (
@@ -3322,10 +3451,13 @@ async def confirm_buy_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     user_name = query.from_user.full_name
     paket_id = query.data.replace("confirm_buy_", "")
     if not claim_invoice_creation(user_id):
-        await query.answer("⏳ Invoice sedang dibuat. Tunggu sebentar.")
+        await _fast_callback_ack(query, "⏳ Invoice sedang dibuat. Tunggu sebentar.")
         return
 
+    # Jangan biarkan spinner Telegram menunggu query DB/cooldown.
+    await _fast_callback_ack(query, "⏳ Memproses...")
     trace = PerfTrace("confirm-buy", user_id=user_id, paket_id=paket_id)
+    trace.mark("callback-answer")
 
     try:
         # Pengecekan yang tidak saling bergantung dijalankan bersamaan.
@@ -3338,14 +3470,14 @@ async def confirm_buy_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         trace.mark("buyer-checks")
 
         if banned:
-            await query.answer("🚫 Akun kamu diblokir. Hubungi admin.", show_alert=True)
+            await _callback_feedback(query, context, "🚫 Akun kamu diblokir. Hubungi admin.")
             return
 
         if not paket:
-            await query.answer("❌ Produk tidak ditemukan.", show_alert=True)
+            await _callback_feedback(query, context, "❌ Produk tidak ditemukan.")
             return
         if not paket.get('aktif', True):
-            await query.answer("❌ Paket ini sedang tidak tersedia.", show_alert=True)
+            await _callback_feedback(query, context, "❌ Paket ini sedang tidak tersedia.")
             return
 
         # Prioritas perilaku tetap sama: invoice aktif dicek sebelum cooldown.
@@ -3359,7 +3491,6 @@ async def confirm_buy_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                 paket_active,
                 active.get('user_name', user_name)
             )
-            await query.answer("⏳ Kamu sudah punya invoice aktif!", show_alert=True)
             total = active.get("harga_dibayar") or paket_active["harga"]
             caption = (
                 f"<b>⏳ ORDER AKTIF</b>\n"
@@ -3382,14 +3513,9 @@ async def confirm_buy_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
 
         if sisa > 0:
-            await query.answer(
-                f"⏳ Kamu baru saja membatalkan order. Coba lagi dalam {sisa} menit.",
-                show_alert=True
-            )
+            await _callback_feedback(query, context, f"⏳ Kamu baru saja membatalkan order. Coba lagi dalam {sisa} menit.")
             return
 
-        await query.answer("⏳ Membuat invoice QRIS...")
-        trace.mark("callback-answer")
         await _buat_order_baru(
             update, context, query, user_id, user_name, paket,
             order_changes=0, perf_trace=trace
@@ -3407,10 +3533,12 @@ async def prereq_buy_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     prereq_pid = parts[0].replace("prereq_buy_", "")
     parent_order_id = parts[1] if len(parts) > 1 else None
     if not claim_invoice_creation(user_id):
-        await query.answer("⏳ Invoice sedang dibuat. Tunggu sebentar.")
+        await _fast_callback_ack(query, "⏳ Invoice sedang dibuat. Tunggu sebentar.")
         return
 
+    await _fast_callback_ack(query, "⏳ Memproses...")
     trace = PerfTrace("prereq-buy", user_id=user_id, paket_id=prereq_pid)
+    trace.mark("callback-answer")
 
     try:
         banned, paket, active, sisa = await asyncio.gather(
@@ -3422,22 +3550,19 @@ async def prereq_buy_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         trace.mark("buyer-checks")
 
         if banned:
-            await query.answer("🚫 Akun kamu diblokir. Hubungi admin.", show_alert=True)
+            await _callback_feedback(query, context, "🚫 Akun kamu diblokir. Hubungi admin.")
             return
 
         if not paket:
-            await query.answer("❌ Produk tidak ditemukan.", show_alert=True)
+            await _callback_feedback(query, context, "❌ Produk tidak ditemukan.")
             return
 
         if active:
-            await query.answer("⏳ Kamu sudah punya invoice aktif! Batalkan dulu.", show_alert=True)
+            await _callback_feedback(query, context, "⏳ Kamu sudah punya invoice aktif! Batalkan dulu.")
             return
 
         if sisa > 0:
-            await query.answer(
-                f"⏳ Kamu baru saja membatalkan order. Coba lagi dalam {sisa} menit.",
-                show_alert=True
-            )
+            await _callback_feedback(query, context, f"⏳ Kamu baru saja membatalkan order. Coba lagi dalam {sisa} menit.")
             return
 
         if parent_order_id:
@@ -3449,8 +3574,6 @@ async def prereq_buy_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 }
         trace.mark("prereq-context")
 
-        await query.answer()
-        trace.mark("callback-answer")
         await _buat_order_baru(
             update, context, query, user_id, user_name, paket,
             order_changes=0, perf_trace=trace
@@ -3790,15 +3913,16 @@ async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def ganti_paket_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
+    await _fast_callback_ack(query)
 
     active = await get_active_order(user_id)
     if not active:
-        await query.answer("❌ Tidak ada pesanan aktif.", show_alert=True)
+        await _callback_feedback(query, context, "❌ Tidak ada pesanan aktif.")
         return
 
     changes_used = active.get('order_changes', 0)
     if changes_used >= 1:
-        await query.answer("⛔ Batas ganti paket sudah tercapai (1x).", show_alert=True)
+        await _callback_feedback(query, context, "⛔ Batas ganti paket sudah tercapai (1x).")
         return
 
     current_paket_id = active['paket_id']
@@ -3825,10 +3949,9 @@ async def ganti_paket_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard.append([InlineKeyboardButton("⬅️ Batal", callback_data="ganti_paket_batal")])
 
     if len(keyboard) == 1:
-        await query.answer("❌ Tidak ada paket lain yang tersedia.", show_alert=True)
+        await _callback_feedback(query, context, "❌ Tidak ada paket lain yang tersedia.")
         return
 
-    await query.answer()
     try:
         await query.message.edit_caption(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
     except Exception:
@@ -3837,16 +3960,17 @@ async def ganti_paket_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def ganti_paket_konfirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
+    await _fast_callback_ack(query)
 
     new_paket_id = query.data.split("|", 1)[1]
     new_paket = await get_product(new_paket_id)
     if not new_paket:
-        await query.answer("❌ Produk tidak ditemukan.", show_alert=True)
+        await _callback_feedback(query, context, "❌ Produk tidak ditemukan.")
         return
 
     active = await get_active_order(user_id)
     if not active:
-        await query.answer("❌ Pesanan aktif tidak ditemukan.", show_alert=True)
+        await _callback_feedback(query, context, "❌ Pesanan aktif tidak ditemukan.")
         return
 
     changes_used = active.get('order_changes', 0)
@@ -3869,7 +3993,6 @@ async def ganti_paket_konfirm(update: Update, context: ContextTypes.DEFAULT_TYPE
             InlineKeyboardButton("❌ Batal", callback_data="ganti_paket_batal"),
         ]
     ]
-    await query.answer()
     try:
         await query.message.edit_caption(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
     except Exception:
@@ -3879,24 +4002,23 @@ async def ganti_paket_exec(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
     user_name = query.from_user.full_name
+    await _fast_callback_ack(query, "⏳ Memproses pergantian paket...")
 
     active = await get_active_order(user_id)
     if not active:
-        await query.answer("❌ Pesanan aktif tidak ditemukan.", show_alert=True)
+        await _callback_feedback(query, context, "❌ Pesanan aktif tidak ditemukan.")
         return
 
     changes_used = active.get('order_changes', 0)
     if changes_used >= 1:
-        await query.answer("⛔ Batas ganti paket sudah tercapai (1x).", show_alert=True)
+        await _callback_feedback(query, context, "⛔ Batas ganti paket sudah tercapai (1x).")
         return
 
     new_paket_id = query.data.split("|", 1)[1]
     new_paket = await get_product(new_paket_id)
     if not new_paket:
-        await query.answer("❌ Produk tidak ditemukan.", show_alert=True)
+        await _callback_feedback(query, context, "❌ Produk tidak ditemukan.")
         return
-
-    await query.answer("⏳ Memproses pergantian paket...")
 
     old_order_id = active["order_id"]
     old_paket = await get_product(active["paket_id"])
@@ -3920,18 +4042,18 @@ async def ganti_paket_exec(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def ganti_paket_batal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
+    await _fast_callback_ack(query)
 
     active = await get_active_order(user_id)
     if not active:
-        await query.answer("❌ Pesanan tidak ditemukan.", show_alert=True)
+        await _callback_feedback(query, context, "❌ Pesanan tidak ditemukan.")
         return
 
     paket = await get_product(active['paket_id'])
     if not paket:
-        await query.answer("❌ Produk tidak ditemukan.", show_alert=True)
+        await _callback_feedback(query, context, "❌ Produk tidak ditemukan.")
         return
 
-    await query.answer()
     changes_used = active.get('order_changes', 0)
     sisa_ganti = 1 - changes_used
 
@@ -4528,12 +4650,12 @@ async def _auto_deliver_pending_prereq_orders(bot, user_id: int, user_name: str,
 
 async def admin_kirim_link_prereq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    await _fast_callback_ack(query)
 
     if not await is_admin(query.from_user.id, context):
-        await query.answer("⛔ Akses ditolak.", show_alert=True)
+        await _callback_feedback(query, context, "⛔ Akses ditolak.")
         return
 
-    await query.answer()
     order_id = query.data.split("|")[1]
     order = await get_order_by_id(order_id)
     if not order:
@@ -4833,12 +4955,12 @@ async def handle_rate_back_stars(update: Update, context: ContextTypes.DEFAULT_T
 
 async def admin_testi_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    await _fast_callback_ack(query)
 
     if not await is_admin(query.from_user.id, context):
-        await query.answer("⛔ Akses ditolak.", show_alert=True)
+        await _callback_feedback(query, context, "⛔ Akses ditolak.")
         return
 
-    await query.answer()
 
     order_id = query.data.split("|")[1]
     testi = await get_testimonial_by_order(order_id)
@@ -4897,12 +5019,12 @@ async def admin_testi_approve(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def admin_testi_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    await _fast_callback_ack(query)
 
     if not await is_admin(query.from_user.id, context):
-        await query.answer("⛔ Akses ditolak.", show_alert=True)
+        await _callback_feedback(query, context, "⛔ Akses ditolak.")
         return
 
-    await query.answer()
 
     order_id = query.data.split("|")[1]
     await update_testimonial_status(order_id, 'rejected')
@@ -5243,13 +5365,37 @@ async def pd_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # =================== ADMIN: ORDER AKTIF ===================
 
-async def _build_active_orders_text_and_keyboard():
-    """Fungsi bersama untuk membangun text dan keyboard order aktif."""
-    orders = await get_all_waiting()
+def _callback_page(data: str, prefix: str) -> int:
+    if not data or not data.startswith(prefix + "|"):
+        return 0
+    try:
+        return max(0, int(data.split("|", 1)[1]))
+    except (TypeError, ValueError, IndexError):
+        return 0
+
+
+def _pagination_row(prefix: str, page: int, total: int, page_size: int):
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    if total_pages <= 1:
+        return None
+    row = []
+    if page > 0:
+        row.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"{prefix}|{page - 1}"))
+    row.append(InlineKeyboardButton(f"📄 {page + 1}/{total_pages}", callback_data=f"{prefix}|{page}"))
+    if page + 1 < total_pages:
+        row.append(InlineKeyboardButton("Next ➡️", callback_data=f"{prefix}|{page + 1}"))
+    return row
+
+
+async def _build_active_orders_text_and_keyboard(page: int = 0):
+    """Panel order aktif memakai LIMIT/OFFSET agar payload dan query tetap kecil."""
+    orders, total = await get_admin_order_page("waiting", page, ADMIN_ORDER_PAGE_SIZE)
     if not orders:
         return None, None
 
-    text = f"<b>⏳ ORDER MENUNGGU BAYAR ({len(orders)})</b>\n========================\n\n"
+    total_pages = max(1, (total + ADMIN_ORDER_PAGE_SIZE - 1) // ADMIN_ORDER_PAGE_SIZE)
+    page = min(page, total_pages - 1)
+    text = f"<b>⏳ ORDER MENUNGGU BAYAR ({total})</b>\n========================\n📄 Halaman {page + 1}/{total_pages}\n\n"
     keyboard = []
     for o in orders:
         paket_nama = o.get('paket_nama') or o['paket_id']
@@ -5272,7 +5418,30 @@ async def _build_active_orders_text_and_keyboard():
                 callback_data=f"adm_cancel|{o['user_id']}|{o['order_id']}"
             )
         ])
+    nav = _pagination_row("admpanel_orders_aktif", page, total, ADMIN_ORDER_PAGE_SIZE)
+    if nav:
+        keyboard.append(nav)
+    return text, keyboard
 
+
+async def _build_pending_orders_text_and_keyboard(page: int = 0, back_callback: str = "admpanel_orders"):
+    orders, total = await get_admin_order_page("pending", page, ADMIN_ORDER_PAGE_SIZE)
+    if not orders:
+        return None, None
+    total_pages = max(1, (total + ADMIN_ORDER_PAGE_SIZE - 1) // ADMIN_ORDER_PAGE_SIZE)
+    page = min(page, total_pages - 1)
+    text = f"<b>📋 ORDER PENDING ({total})</b>\n========================\n📄 Halaman {page + 1}/{total_pages}\n\n"
+    keyboard = []
+    for o in orders:
+        paket_emoji = o.get('paket_emoji') or '📦'
+        paket_nama = o.get('paket_nama') or o['paket_id']
+        durasi = hitung_durasi(o["waktu"])
+        text += f"- {esc(paket_emoji)} {esc(o['user_name'])} - {esc(paket_nama)} - {durasi}\n"
+        keyboard.append([InlineKeyboardButton(f"👤 Proses: {o['user_name']}", callback_data=f"proses_{o['user_id']}")])
+    nav = _pagination_row("admpanel_orders_pending", page, total, ADMIN_ORDER_PAGE_SIZE)
+    if nav:
+        keyboard.append(nav)
+    keyboard.append([InlineKeyboardButton("⬅️ Kembali", callback_data=back_callback)])
     return text, keyboard
 
 async def cmd_aktif(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5300,17 +5469,17 @@ def _check_waiting_order_sync(order_id):
 
 async def admin_cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    await _fast_callback_ack(query)
 
     if not await is_admin(query.from_user.id, context):
-        await query.answer("⛔ Akses ditolak.", show_alert=True)
+        await _callback_feedback(query, context, "⛔ Akses ditolak.")
         return
 
     parts = query.data.split("|")
     if len(parts) != 3:
-        await query.answer("Format tidak valid.", show_alert=True)
+        await _callback_feedback(query, context, "Format tidak valid.")
         return
 
-    await query.answer()
     target_user_id = int(parts[1])
     order_id = parts[2]
 
@@ -6249,13 +6418,12 @@ async def cmd_blast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update.message.from_user.id, context):
         return
 
-    buyers = await get_all_buyers()
-    jumlah = len(buyers)
+    jumlah = await get_buyer_count()
     if jumlah == 0:
         await update.message.reply_text("❌ Belum ada buyer aktif terdaftar.")
         return
 
-    context.user_data['blast_state'] = {'step': 'typing', 'buyers': buyers}
+    context.user_data['blast_state'] = {'step': 'typing', 'buyer_count': jumlah}
     await update.message.reply_text(
         f"<b>📢 BROADCAST PESAN</b>\n"
         f"========================\n\n"
@@ -6288,9 +6456,12 @@ async def blast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("⚠️ Sesi blast tidak ditemukan. Mulai ulang dengan /blast.")
         return
 
-    buyers = blast_state.get('buyers', [])
     text_blast = blast_state.get('text', '')
     admin_id = query.from_user.id
+    buyers = await get_all_buyers()
+    if not buyers:
+        await query.edit_message_text("⚠️ Tidak ada buyer aktif saat broadcast akan dimulai.")
+        return
 
     await query.edit_message_text(
         f"📢 <b>Broadcast dimulai di background!</b>\n"
@@ -6381,11 +6552,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("❌ Pesan tidak boleh kosong.")
                 return
 
-            buyers = blast_state.get('buyers', [])
+            buyer_count = int(blast_state.get('buyer_count') or len(blast_state.get('buyers') or []))
             context.user_data['blast_state'] = {
                 'step': 'preview',
                 'text': text,
-                'buyers': buyers,
+                'buyer_count': buyer_count,
             }
 
             await update.message.reply_text(
@@ -6393,7 +6564,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"========================\n\n"
                 f"{text}\n\n"
                 f"========================\n"
-                f"Target: <b>{len(buyers)} buyer</b>\n\n"
+                f"Target: <b>{buyer_count} buyer</b>\n\n"
                 f"Apakah pesan ini sudah benar?",
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup([
@@ -6781,22 +6952,13 @@ async def admin_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update.message.from_user.id, context):
         return
 
-    orders = await get_all_pending()
-    if not orders:
+    text, keyboard = await _build_pending_orders_text_and_keyboard(0, back_callback="admpanel_orders")
+    if not text:
         await update.message.reply_text(
             "<b>✅ TIDAK ADA ORDER PENDING</b>\n========================",
             parse_mode="HTML"
         )
         return
-
-    text = f"<b>📋 ORDER PENDING ({len(orders)})</b>\n========================\n\n"
-    keyboard = []
-    for o in orders:
-        paket_emoji = o.get('paket_emoji') or '📦'
-        paket_nama = o.get('paket_nama') or o['paket_id']
-        durasi = hitung_durasi(o["waktu"])
-        text += f"- {esc(paket_emoji)} {esc(o['user_name'])} - {esc(paket_nama)} - {durasi}\n"
-        keyboard.append([InlineKeyboardButton(f"👤 Proses: {o['user_name']}", callback_data=f"proses_{o['user_id']}")])
 
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
@@ -6844,37 +7006,26 @@ async def admin_proses_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
         [InlineKeyboardButton("⬅️ Kembali", callback_data="back_orders")]
     ]
 
-    try:
-        await query.message.delete()
-    except Exception:
-        pass
-    await context.bot.send_message(
-        chat_id=query.from_user.id, text=caption, parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+    # Satu edit lebih cepat daripada delete + send (dua round-trip Telegram).
+    await telegram_retry(
+        lambda: query.edit_message_text(
+            caption, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard)
+        ),
+        label="admin detail pending",
     )
 
 async def back_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await _fast_callback_ack(query)
 
-    orders = await get_all_pending()
-    if not orders:
+    text, keyboard = await _build_pending_orders_text_and_keyboard(0, back_callback="admpanel_back")
+    if not text:
         await query.edit_message_text(
             "✅ Tidak ada order pending saat ini.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali ke Panel", callback_data="admpanel_back")]])
         )
         return
 
-    text = f"<b>📋 ORDER PENDING ({len(orders)})</b>\n========================\n\n"
-    keyboard = []
-    for o in orders:
-        paket_emoji = o.get('paket_emoji') or '📦'
-        paket_nama = o.get('paket_nama') or o['paket_id']
-        durasi = hitung_durasi(o["waktu"])
-        text += f"- {esc(paket_emoji)} {esc(o['user_name'])} - {esc(paket_nama)} - {durasi}\n"
-        keyboard.append([InlineKeyboardButton(f"👤 Proses: {o['user_name']}", callback_data=f"proses_{o['user_id']}")])
-
-    keyboard.append([InlineKeyboardButton("⬅️ Kembali ke Panel", callback_data="admpanel_back")])
     try:
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
     except Exception:
@@ -7055,9 +7206,10 @@ async def admpanel_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def admpanel_orders_aktif(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await _fast_callback_ack(query)
+    page = _callback_page(query.data, "admpanel_orders_aktif")
 
-    text, keyboard = await _build_active_orders_text_and_keyboard()
+    text, keyboard = await _build_active_orders_text_and_keyboard(page)
     if not text:
         await query.edit_message_text(
             "<b>✅ TIDAK ADA ORDER AKTIF</b>\n========================\n\nTidak ada buyer yang sedang menunggu membayar.",
@@ -7071,10 +7223,11 @@ async def admpanel_orders_aktif(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def admpanel_orders_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await _fast_callback_ack(query)
+    page = _callback_page(query.data, "admpanel_orders_pending")
 
-    orders = await get_all_pending()
-    if not orders:
+    text, keyboard = await _build_pending_orders_text_and_keyboard(page, back_callback="admpanel_orders")
+    if not text:
         await query.edit_message_text(
             "<b>✅ TIDAK ADA ORDER PENDING</b>\n========================",
             parse_mode="HTML",
@@ -7082,15 +7235,6 @@ async def admpanel_orders_pending(update: Update, context: ContextTypes.DEFAULT_
         )
         return
 
-    text = f"<b>📋 ORDER PENDING ({len(orders)})</b>\n========================\n\n"
-    keyboard = []
-    for o in orders:
-        paket_emoji = o.get('paket_emoji') or '📦'
-        paket_nama = o.get('paket_nama') or o['paket_id']
-        durasi = hitung_durasi(o["waktu"])
-        text += f"- {esc(paket_emoji)} {esc(o['user_name'])} - {esc(paket_nama)} - {durasi}\n"
-        keyboard.append([InlineKeyboardButton(f"👤 Proses: {o['user_name']}", callback_data=f"proses_{o['user_id']}")])
-    keyboard.append([InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_orders")])
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def admpanel_orders_cari(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7124,10 +7268,9 @@ async def admpanel_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def admpanel_blast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await _fast_callback_ack(query)
 
-    buyers = await get_all_buyers()
-    jumlah = len(buyers)
+    jumlah = await get_buyer_count()
     if jumlah == 0:
         await query.edit_message_text(
             "❌ Belum ada buyer aktif terdaftar.",
@@ -7135,7 +7278,7 @@ async def admpanel_blast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    context.user_data['blast_state'] = {'step': 'typing', 'buyers': buyers}
+    context.user_data['blast_state'] = {'step': 'typing', 'buyer_count': jumlah}
     await query.edit_message_text(
         f"<b>📢 BROADCAST PESAN</b>\n"
         f"========================\n\n"
@@ -7152,8 +7295,8 @@ async def blast_retype(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     blast_state = context.user_data.get('blast_state', {})
-    buyers = blast_state.get('buyers', [])
-    context.user_data['blast_state'] = {'step': 'typing', 'buyers': buyers}
+    buyer_count = int(blast_state.get('buyer_count') or len(blast_state.get('buyers') or []))
+    context.user_data['blast_state'] = {'step': 'typing', 'buyer_count': buyer_count}
 
     await query.edit_message_text(
         f"<b>📢 BROADCAST - UBAH PESAN</b>\n"
@@ -7301,8 +7444,9 @@ async def admpanel_user_unban(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def admpanel_user_daftar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
-    banned = await get_all_banned()
+    await _fast_callback_ack(query)
+    page = _callback_page(query.data, "admpanel_user_daftar")
+    banned, total = await get_banned_page(page, ADMIN_LIST_PAGE_SIZE)
     if not banned:
         await query.edit_message_text(
             "<b>🚫 DAFTAR BAN</b>\n========================\n\nBelum ada user yang dibanned.",
@@ -7310,17 +7454,20 @@ async def admpanel_user_daftar(update: Update, context: ContextTypes.DEFAULT_TYP
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_user")]])
         )
         return
-    text = f"<b>🚫 DAFTAR BAN ({len(banned)} user)</b>\n========================\n\n"
+    total_pages = max(1, (total + ADMIN_LIST_PAGE_SIZE - 1) // ADMIN_LIST_PAGE_SIZE)
+    text = f"<b>🚫 DAFTAR BAN ({total} user)</b>\n========================\n📄 Halaman {page + 1}/{total_pages}\n\n"
     for b in banned:
         text += (
             f"👤 ID: <code>{b['user_id']}</code>\n"
             f"📝 Alasan: {esc(b['reason'] or '-')}\n"
             f"🕒 Dibanned: {b['banned_at']}\n\n"
         )
-    await query.edit_message_text(
-        text, parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_user")]])
-    )
+    keyboard = []
+    nav = _pagination_row("admpanel_user_daftar", page, total, ADMIN_LIST_PAGE_SIZE)
+    if nav:
+        keyboard.append(nav)
+    keyboard.append([InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_user")])
+    await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
 # =================== ADMIN: CEK & KICK USER DI GRUP ===================
 
@@ -7335,14 +7482,18 @@ async def admpanel_kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     group_lines = ""
     if managed_groups:
-        for i, gid in enumerate(managed_groups, 1):
+        async def _resolve_group_line(index, gid):
             try:
                 chat = await context.bot.get_chat(int(gid))
                 nama_grup = esc(chat.title or str(gid))
             except Exception as e:
                 logger.debug(f"Gagal mengambil judul chat {gid}: {e}")
                 nama_grup = "⚠️ Tidak dapat diakses"
-            group_lines += f"  {i}. <b>{nama_grup}</b>\n     <code>{gid}</code>\n"
+            return f"  {index}. <b>{nama_grup}</b>\n     <code>{gid}</code>\n"
+
+        group_lines = "".join(await asyncio.gather(*(
+            _resolve_group_line(i, gid) for i, gid in enumerate(managed_groups, 1)
+        )))
     else:
         group_lines = "  <i>Belum ada grup terdaftar.</i>\n"
 
@@ -7438,8 +7589,9 @@ async def kick_select_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def kick_one(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    await _fast_callback_ack(query, "⏳ Memproses kick...")
     if not await is_admin(query.from_user.id, context):
-        await query.answer("⛔ Akses ditolak.", show_alert=True)
+        await _callback_feedback(query, context, "⛔ Akses ditolak.")
         return
     parts = query.data.split("|")
     target_id = int(parts[1])
@@ -7453,9 +7605,8 @@ async def kick_one(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.debug(f"Gagal mengambil detail chat {gid}: {e}")
             nama_grup = str(gid)
-        await query.answer(f"✅ Berhasil kick dari {nama_grup}", show_alert=True)
     except Exception as e:
-        await query.answer(f"❌ Gagal: {str(e)[:80]}", show_alert=True)
+        await _callback_feedback(query, context, f"❌ Gagal: {str(e)[:80]}")
     query.data = f"kick_select|{target_id}"
     await kick_select_user(update, context)
 
@@ -7566,18 +7717,19 @@ async def admpanel_setting(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    channel_id = await get_setting('notif_channel_id')
+    channel_id, testi_channel_id, maint_on, link_testi, link_admin = await asyncio.gather(
+        get_setting('notif_channel_id'),
+        get_setting('testimoni_channel_id'),
+        is_maintenance(),
+        get_setting('link_testimoni'),
+        get_setting('link_admin'),
+    )
     ch_status = f"✅ ID: <code>{esc(channel_id)}</code>" if channel_id else "🔕 Nonaktif"
-
-    testi_channel_id = await get_setting('testimoni_channel_id')
     testi_ch_status = f"✅ ID: <code>{esc(testi_channel_id)}</code>" if testi_channel_id else "🔕 Nonaktif"
-
-    maint_on = await is_maintenance()
     maint_status = "⚙️ ON - bot maintenance" if maint_on else "✅ OFF - bot normal"
     maint_btn_label = "🟢 Matikan Maintenance" if maint_on else "⚙️ Aktifkan Maintenance"
-
-    link_testi = await get_setting('link_testimoni') or '-'
-    link_admin = await get_setting('link_admin')     or '-'
+    link_testi = link_testi or '-'
+    link_admin = link_admin or '-'
 
     text = (
         "<b>⚙️ PENGATURAN</b>\n"
@@ -8026,8 +8178,8 @@ def main():
     app.add_handler(CallbackQueryHandler(admpanel_back,            pattern="^admpanel_back$"))
     app.add_handler(CallbackQueryHandler(admpanel_produk,          pattern="^admpanel_produk$"))
     app.add_handler(CallbackQueryHandler(admpanel_orders,          pattern="^admpanel_orders$"))
-    app.add_handler(CallbackQueryHandler(admpanel_orders_aktif,    pattern="^admpanel_orders_aktif$"))
-    app.add_handler(CallbackQueryHandler(admpanel_orders_pending,  pattern="^admpanel_orders_pending$"))
+    app.add_handler(CallbackQueryHandler(admpanel_orders_aktif,    pattern=r"^admpanel_orders_aktif(?:\|\d+)?$"))
+    app.add_handler(CallbackQueryHandler(admpanel_orders_pending,  pattern=r"^admpanel_orders_pending(?:\|\d+)?$"))
     app.add_handler(CallbackQueryHandler(admpanel_orders_cari,     pattern="^admpanel_orders_cari$"))
     app.add_handler(CallbackQueryHandler(admpanel_stats,           pattern="^admpanel_stats$"))
     app.add_handler(CallbackQueryHandler(admpanel_blast,           pattern="^admpanel_blast$"))
@@ -8039,7 +8191,7 @@ def main():
     app.add_handler(CallbackQueryHandler(admpanel_user,            pattern="^admpanel_user$"))
     app.add_handler(CallbackQueryHandler(admpanel_user_ban,        pattern="^admpanel_user_ban$"))
     app.add_handler(CallbackQueryHandler(admpanel_user_unban,      pattern="^admpanel_user_unban$"))
-    app.add_handler(CallbackQueryHandler(admpanel_user_daftar,     pattern="^admpanel_user_daftar$"))
+    app.add_handler(CallbackQueryHandler(admpanel_user_daftar,     pattern=r"^admpanel_user_daftar(?:\|\d+)?$"))
 
     # Admin Group Kick Feature Flow
     app.add_handler(CallbackQueryHandler(admpanel_kick,    pattern="^admpanel_kick$"))

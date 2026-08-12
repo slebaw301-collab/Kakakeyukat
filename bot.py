@@ -16,10 +16,21 @@ import urllib.parse
 import time as _time
 import copy
 from concurrent.futures import ThreadPoolExecutor
+from collections import deque
 from aiohttp import web as aio_web
 import aiohttp
 import qrcode
 import psycopg2
+
+try:
+    import asyncpg
+except ImportError:
+    asyncpg = None
+
+try:
+    import uvloop
+except ImportError:
+    uvloop = None
 from psycopg2.extras import RealDictCursor
 from psycopg2.pool import ThreadedConnectionPool
 from io import BytesIO
@@ -36,17 +47,28 @@ from telegram.ext import (
 )
 
 try:
+    from telegram.ext import AIORateLimiter
+except Exception:
+    AIORateLimiter = None
+
+try:
     # Tersedia mulai python-telegram-bot 20.4.
     from telegram.ext import BaseUpdateProcessor
 except ImportError:  # Fallback aman untuk PTB 20.0-20.3.
     BaseUpdateProcessor = None
 
 # =================== LOGGING SETUP ===================
+_LOG_LEVEL_NAME = (os.environ.get("LOG_LEVEL") or "INFO").strip().upper()
+_LOG_LEVEL = getattr(logging, _LOG_LEVEL_NAME, logging.INFO)
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=_LOG_LEVEL
 )
 logger = logging.getLogger("HyperFamilyBot")
+# Library jaringan cukup WARNING agar I/O log rutin tidak memenuhi stdout.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext.ExtBot").setLevel(logging.WARNING)
 
 # =================== HELPERS TEKS ===================
 
@@ -213,15 +235,24 @@ BOT_CONCURRENT_UPDATES = _env_int("BOT_CONCURRENT_UPDATES", 24, 4, 128)
 TELEGRAM_CONNECTION_POOL_SIZE = _env_int("TELEGRAM_CONNECTION_POOL_SIZE", 64, 16, 256)
 TELEGRAM_POOL_TIMEOUT_SECONDS = _env_float("TELEGRAM_POOL_TIMEOUT_SECONDS", 15.0, 1.0, 60.0)
 DB_POOL_MIN = _env_int("DB_POOL_MIN", 2, 1, 10)
-DB_POOL_MAX = _env_int("DB_POOL_MAX", 40, DB_POOL_MIN, 100)
-DB_THREAD_WORKERS = _env_int("DB_THREAD_WORKERS", min(32, DB_POOL_MAX), 4, 80)
+DB_POOL_MAX = _env_int("DB_POOL_MAX", 20, DB_POOL_MIN, 50)
+DB_THREAD_WORKERS = _env_int("DB_THREAD_WORKERS", min(24, DB_POOL_MAX), 4, 50)
+# Jalur DB admin/background dibatasi agar query berat tidak menghabiskan semua worker buyer.
+DB_ADMIN_THREAD_WORKERS = _env_int("DB_ADMIN_THREAD_WORKERS", 2, 1, 6)
 CPU_THREAD_WORKERS = _env_int("CPU_THREAD_WORKERS", 4, 2, 12)
+ASYNCPG_POOL_MAX = _env_int("ASYNCPG_POOL_MAX", 4, 1, 12)
+ACTIVE_ORDER_CACHE_TTL_SECONDS = _env_float("ACTIVE_ORDER_CACHE_TTL_SECONDS", 2.5, 0.5, 10.0)
+WAITING_ORDERS_CACHE_TTL_SECONDS = _env_float("WAITING_ORDERS_CACHE_TTL_SECONDS", 3.0, 0.5, 15.0)
+ADMIN_CACHE_TTL_SECONDS = _env_float("ADMIN_CACHE_TTL_SECONDS", 30.0, 5.0, 300.0)
+LATENCY_REPORT_INTERVAL_SECONDS = _env_float("LATENCY_REPORT_INTERVAL_SECONDS", 300.0, 30.0, 1800.0)
 DB_SLOW_SESSION_SECONDS = _env_float("DB_SLOW_SESSION_SECONDS", 1.0, 0.1, 30.0)
 SLOW_UPDATE_THRESHOLD_SECONDS = _env_float("SLOW_UPDATE_THRESHOLD_SECONDS", 1.5, 0.2, 30.0)
 PERF_TRACE_THRESHOLD_SECONDS = _env_float("PERF_TRACE_THRESHOLD_SECONDS", 1.0, 0.1, 30.0)
 EVENT_LOOP_LAG_WARNING_SECONDS = _env_float("EVENT_LOOP_LAG_WARNING_SECONDS", 0.75, 0.1, 10.0)
-STATS_CACHE_TTL_SECONDS = _env_float("STATS_CACHE_TTL_SECONDS", 300.0, 1.0, 3600.0)
+STATS_CACHE_TTL_SECONDS = _env_float("STATS_CACHE_TTL_SECONDS", 10.0, 1.0, 120.0)
 AUTOGOPAY_MAX_CONCURRENT_REQUESTS = _env_int("AUTOGOPAY_MAX_CONCURRENT_REQUESTS", 20, 2, 50)
+AUTOGOPAY_CIRCUIT_FAILURES = _env_int("AUTOGOPAY_CIRCUIT_FAILURES", 5, 2, 20)
+AUTOGOPAY_CIRCUIT_COOLDOWN_SECONDS = _env_float("AUTOGOPAY_CIRCUIT_COOLDOWN_SECONDS", 15.0, 5.0, 120.0)
 TELEGRAM_RETRY_ATTEMPTS = _env_int("TELEGRAM_RETRY_ATTEMPTS", 2, 1, 4)
 
 # Timeout dibuat lebih pendek agar gangguan provider tidak menahan update Telegram terlalu lama.
@@ -232,50 +263,11 @@ AUTOGOPAY_HTTP_TIMEOUT = aiohttp.ClientTimeout(
     sock_read=8,
 )
 
-# =================== CIRCUIT BREAKER ===================
-class CircuitBreaker:
-    """Mencegah spam request ke provider yang sedang down."""
-    def __init__(self, failure_threshold: int = 5, recovery_timeout: float = 120.0):
-        self.failure_threshold = failure_threshold
-        self.recovery_timeout = recovery_timeout
-        self.failures = 0
-        self.last_failure_time = 0.0
-        self.state = "closed"
-        self._lock = asyncio.Lock()
-
-    async def call(self, coro_factory, *args, **kwargs):
-        async with self._lock:
-            now_mono = _time.monotonic()
-            if self.state == "open":
-                if now_mono - self.last_failure_time >= self.recovery_timeout:
-                    self.state = "half-open"
-                    self.failures = 0
-                else:
-                    remaining = int(self.recovery_timeout - (now_mono - self.last_failure_time))
-                    raise Exception(f"CircuitBreaker OPEN: AutoGoPay sementara tidak tersedia. Coba lagi dalam {remaining} detik.")
-        try:
-            result = await coro_factory(*args, **kwargs)
-            async with self._lock:
-                if self.state == "half-open":
-                    self.state = "closed"
-                self.failures = 0
-            return result
-        except Exception as e:
-            async with self._lock:
-                self.failures += 1
-                self.last_failure_time = _time.monotonic()
-                if self.failures >= self.failure_threshold:
-                    self.state = "open"
-                    logger.error(f"[CIRCUIT BREAKER] AutoGoPay OPEN setelah {self.failures} kegagalan.")
-            raise
-
-_autogopay_circuit = CircuitBreaker(failure_threshold=5, recovery_timeout=120.0)
-
-
-# Polling adaptif menjadi fallback webhook: cepat di awal, lalu melambat agar tetap hemat request.
-AUTOGOPAY_POLL_FAST_SECONDS = 10
-AUTOGOPAY_POLL_MEDIUM_SECONDS = 20
-AUTOGOPAY_POLL_SLOW_SECONDS = 30
+# Webhook adalah jalur utama. Polling hanya safety-net dan dibuat makin jarang.
+AUTOGOPAY_POLL_FAST_SECONDS = _env_int("AUTOGOPAY_POLL_FAST_SECONDS", 5, 3, 30)
+AUTOGOPAY_POLL_MEDIUM_SECONDS = _env_int("AUTOGOPAY_POLL_MEDIUM_SECONDS", 10, 5, 60)
+AUTOGOPAY_POLL_SLOW_SECONDS = _env_int("AUTOGOPAY_POLL_SLOW_SECONDS", 20, 10, 120)
+AUTOGOPAY_POLL_VERY_SLOW_SECONDS = _env_int("AUTOGOPAY_POLL_VERY_SLOW_SECONDS", 30, 15, 180)
 
 DEFAULT_LINK = "https://t.me/Kikukkvd"
 
@@ -291,29 +283,19 @@ if not AUTOGOPAY_API_KEY:
 
 # =================== CONCURRENCY & BACKGROUND TASKS ===================
 _background_tasks: set = set()
-_invoice_creation_in_progress: dict = {}
-_INVOICE_CLAIM_TTL_SECONDS = 120
+_invoice_creation_in_progress: set = set()
 
 
 def claim_invoice_creation(user_id: int) -> bool:
     """Single-flight per buyer untuk mencegah invoice ganda akibat double-click."""
-    now_mono = _time.monotonic()
-    stale = [uid for uid, ts in _invoice_creation_in_progress.items() if now_mono - ts > _INVOICE_CLAIM_TTL_SECONDS]
-    for uid in stale:
-        _invoice_creation_in_progress.pop(uid, None)
     if user_id in _invoice_creation_in_progress:
         return False
-    _invoice_creation_in_progress[user_id] = now_mono
+    _invoice_creation_in_progress.add(user_id)
     return True
 
 
 def release_invoice_creation(user_id: int):
-    _invoice_creation_in_progress.pop(user_id, None)
-
-
-# Batasi jumlah ID pesan yang disimpan di memory per user agar tidak membengkak.
-_MAX_STORED_MESSAGES = 15
-_MAX_STORED_ADMIN_MESSAGES = 30
+    _invoice_creation_in_progress.discard(user_id)
 
 
 # Pisahkan antrean query database dari pekerjaan CPU/file (QR, ZIP, JSON).
@@ -321,6 +303,10 @@ _MAX_STORED_ADMIN_MESSAGES = 30
 _db_executor = ThreadPoolExecutor(
     max_workers=DB_THREAD_WORKERS,
     thread_name_prefix="hyperfamily-db",
+)
+_db_admin_executor = ThreadPoolExecutor(
+    max_workers=DB_ADMIN_THREAD_WORKERS,
+    thread_name_prefix="hyperfamily-db-admin",
 )
 _cpu_executor = ThreadPoolExecutor(
     max_workers=CPU_THREAD_WORKERS,
@@ -335,14 +321,49 @@ async def _run_executor(executor, func, *args, **kwargs):
 
 
 async def run_db(func, *args, **kwargs):
-    """Jalankan operasi database pada executor khusus database."""
+    """Jalankan operasi database buyer/kritis pada executor utama."""
     return await _run_executor(_db_executor, func, *args, **kwargs)
+
+
+async def run_db_admin(func, *args, **kwargs):
+    """Jalankan query admin/background pada executor kecil agar buyer tetap prioritas."""
+    return await _run_executor(_db_admin_executor, func, *args, **kwargs)
 
 
 async def run_cpu(func, *args, **kwargs):
     """Jalankan proses CPU/file pada executor terpisah dari query database."""
     return await _run_executor(_cpu_executor, func, *args, **kwargs)
 
+
+_latency_samples: dict = {}
+
+def _record_latency(label: str, seconds: float):
+    samples = _latency_samples.get(label)
+    if samples is None:
+        samples = deque(maxlen=500)
+        _latency_samples[label] = samples
+    samples.append(max(0.0, float(seconds)))
+
+def _percentile(values, pct: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, math.ceil((pct / 100.0) * len(ordered)) - 1))
+    return ordered[index]
+
+async def _latency_reporter_loop():
+    while True:
+        await asyncio.sleep(LATENCY_REPORT_INTERVAL_SECONDS)
+        for label, samples in list(_latency_samples.items()):
+            if not samples:
+                continue
+            values = list(samples)
+            logger.info(
+                f"[LATENCY] {label} n={len(values)} "
+                f"p50={_percentile(values, 50):.3f}s "
+                f"p95={_percentile(values, 95):.3f}s "
+                f"p99={_percentile(values, 99):.3f}s"
+            )
 
 class PerfTrace:
     """Profiling ringan per alur; hanya menulis log saat proses terasa lambat."""
@@ -361,6 +382,7 @@ class PerfTrace:
 
     def finish(self):
         total = _time.monotonic() - self.started
+        _record_latency(f"flow:{self.label}", total)
         if total < PERF_TRACE_THRESHOLD_SECONDS:
             return
         stage_text = ", ".join(f"{name}={duration:.2f}s" for name, duration in self.stages)
@@ -405,6 +427,22 @@ async def telegram_retry(operation, *, label: str, attempts: int = None):
             await asyncio.sleep(delay)
 
 
+async def telegram_send_rate_retry(operation, *, label: str, attempts: int = None):
+    """Retry send hanya saat Telegram memastikan rate-limit; timeout tidak diulang agar tidak dobel kirim."""
+    max_attempts = attempts or TELEGRAM_RETRY_ATTEMPTS
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return await operation()
+        except telegram.error.RetryAfter as exc:
+            if attempt >= max_attempts:
+                raise
+            retry_after = exc.retry_after
+            delay = retry_after.total_seconds() if hasattr(retry_after, "total_seconds") else float(retry_after)
+            delay = max(0.1, delay)
+            logger.warning(f"[TELEGRAM RATE] {label}; retry {delay:.2f}s")
+            await asyncio.sleep(delay)
+
+
 def spawn_background(coro, *, name: str = None):
     """Jalankan coroutine tanpa menahan handler dan tetap laporkan exception-nya."""
     task = asyncio.create_task(coro, name=name)
@@ -429,8 +467,14 @@ def spawn_background(coro, *, name: str = None):
 
 
 if BaseUpdateProcessor is not None:
+    class _PerChatLockEntry:
+        __slots__ = ("lock", "users")
+        def __init__(self):
+            self.lock = asyncio.Lock()
+            self.users = 0
+
     class PerChatUpdateProcessor(BaseUpdateProcessor):
-        """Paralel antar-chat, serial di chat yang sama agar state/order tidak race."""
+        """Paralel antar-chat, serial di chat yang sama tanpa menyimpan lock selamanya."""
 
         def __init__(self, max_concurrent_updates: int):
             super().__init__(max_concurrent_updates)
@@ -443,15 +487,24 @@ if BaseUpdateProcessor is not None:
         async def shutdown(self):
             self._chat_locks.clear()
 
-        async def _get_lock(self, key):
+        async def _get_entry(self, key):
             if self._locks_guard is None:
                 self._locks_guard = asyncio.Lock()
             async with self._locks_guard:
-                lock = self._chat_locks.get(key)
-                if lock is None:
-                    lock = asyncio.Lock()
-                    self._chat_locks[key] = lock
-                return lock
+                entry = self._chat_locks.get(key)
+                if entry is None:
+                    entry = _PerChatLockEntry()
+                    self._chat_locks[key] = entry
+                entry.users += 1
+                return entry
+
+        async def _release_entry(self, key, entry):
+            if self._locks_guard is None:
+                return
+            async with self._locks_guard:
+                entry.users = max(0, entry.users - 1)
+                if entry.users == 0 and self._chat_locks.get(key) is entry:
+                    self._chat_locks.pop(key, None)
 
         async def do_process_update(self, update, coroutine):
             chat = getattr(update, "effective_chat", None)
@@ -461,13 +514,15 @@ if BaseUpdateProcessor is not None:
                 else ("user", user.id) if user is not None
                 else ("update", getattr(update, "update_id", id(update)))
             )
-            lock = await self._get_lock(key)
+            entry = await self._get_entry(key)
             started = _time.monotonic()
             try:
-                async with lock:
+                async with entry.lock:
                     await coroutine
             finally:
                 elapsed = _time.monotonic() - started
+                _record_latency("telegram-update", elapsed)
+                await self._release_entry(key, entry)
                 if elapsed >= SLOW_UPDATE_THRESHOLD_SECONDS:
                     logger.warning(
                         f"[SLOW UPDATE] key={key} update_id={getattr(update, 'update_id', '-')} "
@@ -627,11 +682,48 @@ def _normalize_autogopay_transaction(data: dict, fallback_amount: int = 0) -> di
     }
 
 
+_autogopay_circuit_failures = 0
+_autogopay_circuit_open_until = 0.0
+_autogopay_circuit_last_log = 0.0
+
+def _autogopay_circuit_is_open() -> bool:
+    global _autogopay_circuit_last_log
+    now_mono = _time.monotonic()
+    if now_mono >= _autogopay_circuit_open_until:
+        return False
+    if now_mono - _autogopay_circuit_last_log >= 5.0:
+        _autogopay_circuit_last_log = now_mono
+        logger.warning(
+            f"[AUTOGOPAY] Circuit breaker aktif; skip request selama "
+            f"{max(0.0, _autogopay_circuit_open_until - now_mono):.1f}s"
+        )
+    return True
+
+def _autogopay_record_success():
+    global _autogopay_circuit_failures, _autogopay_circuit_open_until
+    _autogopay_circuit_failures = 0
+    _autogopay_circuit_open_until = 0.0
+
+def _autogopay_record_failure():
+    global _autogopay_circuit_failures, _autogopay_circuit_open_until
+    _autogopay_circuit_failures += 1
+    if _autogopay_circuit_failures >= AUTOGOPAY_CIRCUIT_FAILURES:
+        _autogopay_circuit_open_until = _time.monotonic() + AUTOGOPAY_CIRCUIT_COOLDOWN_SECONDS
+        _autogopay_circuit_failures = 0
+        logger.warning(
+            f"[AUTOGOPAY] Circuit breaker dibuka {AUTOGOPAY_CIRCUIT_COOLDOWN_SECONDS:.0f}s "
+            f"setelah kegagalan berulang."
+        )
+
+
 async def _autogopay_create_transaction(amount: int):
     if not AUTOGOPAY_API_KEY:
         logger.error("[AUTOGOPAY] AUTOGOPAY_API_KEY tidak tersedia.")
         return None
-    async def _do():
+    if _autogopay_circuit_is_open():
+        return None
+    started = _time.monotonic()
+    try:
         semaphore = await _get_autogopay_semaphore()
         async with semaphore:
             session = await get_http_session()
@@ -643,6 +735,8 @@ async def _autogopay_create_transaction(amount: int):
             ) as response:
                 result = await _read_json_response(response)
                 if response.status < 200 or response.status >= 300 or result.get("success") is False:
+                    if response.status == 429 or response.status >= 500:
+                        _autogopay_record_failure()
                     logger.error(f"[AUTOGOPAY] Gagal generate QRIS HTTP {response.status}: {result}")
                     return None
                 data = _extract_autogopay_data(result)
@@ -650,22 +744,28 @@ async def _autogopay_create_transaction(amount: int):
                 if not normalized.get("provider_transaction_id") or not normalized.get("qr_string"):
                     logger.error(f"[AUTOGOPAY] Respons generate tidak lengkap: {result}")
                     return None
+                _autogopay_record_success()
                 return normalized
-    try:
-        return await _autogopay_circuit.call(_do)
     except asyncio.TimeoutError:
+        _autogopay_record_failure()
         logger.error("[AUTOGOPAY] Timeout saat membuat transaksi QRIS.")
     except aiohttp.ClientError as e:
+        _autogopay_record_failure()
         logger.error(f"[AUTOGOPAY] Gangguan koneksi saat membuat QRIS: {e}")
     except Exception as e:
         logger.error(f"[AUTOGOPAY] Error saat membuat QRIS: {e}", exc_info=True)
+    finally:
+        _record_latency("autogopay-create", _time.monotonic() - started)
     return None
 
 
 async def _autogopay_get_status(transaction_id: str, fallback_amount: int = 0):
     if not AUTOGOPAY_API_KEY or not transaction_id:
         return None
-    async def _do():
+    if _autogopay_circuit_is_open():
+        return None
+    started = _time.monotonic()
+    try:
         semaphore = await _get_autogopay_semaphore()
         async with semaphore:
             session = await get_http_session()
@@ -677,27 +777,34 @@ async def _autogopay_get_status(transaction_id: str, fallback_amount: int = 0):
             ) as response:
                 result = await _read_json_response(response)
                 if response.status < 200 or response.status >= 300 or result.get("success") is False:
+                    if response.status == 429 or response.status >= 500:
+                        _autogopay_record_failure()
                     logger.warning(f"[AUTOGOPAY] Gagal cek status HTTP {response.status}: {result}")
                     return None
                 data = _extract_autogopay_data(result)
                 normalized = _normalize_autogopay_transaction(data, fallback_amount)
                 normalized["provider_transaction_id"] = normalized.get("provider_transaction_id") or transaction_id
+                _autogopay_record_success()
                 return normalized
-    try:
-        return await _autogopay_circuit.call(_do)
     except asyncio.TimeoutError:
+        _autogopay_record_failure()
         logger.warning(f"[AUTOGOPAY] Timeout cek status transaksi {transaction_id}")
     except aiohttp.ClientError as e:
+        _autogopay_record_failure()
         logger.warning(f"[AUTOGOPAY] Gangguan koneksi cek status {transaction_id}: {e}")
     except Exception as e:
         logger.error(f"[AUTOGOPAY] Error cek status {transaction_id}: {e}", exc_info=True)
+    finally:
+        _record_latency("autogopay-status", _time.monotonic() - started)
     return None
 
 
 async def _autogopay_cancel_transaction(transaction_id: str):
     if not AUTOGOPAY_API_KEY or not transaction_id:
         return None
-    async def _do():
+    # Cancel tetap dicoba saat circuit open karena ini operasi kompensasi penting.
+    started = _time.monotonic()
+    try:
         semaphore = await _get_autogopay_semaphore()
         async with semaphore:
             session = await get_http_session()
@@ -709,17 +816,22 @@ async def _autogopay_cancel_transaction(transaction_id: str):
             ) as response:
                 result = await _read_json_response(response)
                 if response.status < 200 or response.status >= 300 or result.get("success") is False:
+                    if response.status == 429 or response.status >= 500:
+                        _autogopay_record_failure()
                     logger.warning(f"[AUTOGOPAY] Gagal cancel HTTP {response.status}: {result}")
                     return None
+                _autogopay_record_success()
                 return result
-    try:
-        return await _autogopay_circuit.call(_do)
     except asyncio.TimeoutError:
+        _autogopay_record_failure()
         logger.warning(f"[AUTOGOPAY] Timeout cancel transaksi {transaction_id}")
     except aiohttp.ClientError as e:
+        _autogopay_record_failure()
         logger.warning(f"[AUTOGOPAY] Gangguan koneksi cancel {transaction_id}: {e}")
     except Exception as e:
         logger.error(f"[AUTOGOPAY] Error cancel {transaction_id}: {e}", exc_info=True)
+    finally:
+        _record_latency("autogopay-cancel", _time.monotonic() - started)
     return None
 
 
@@ -773,6 +885,50 @@ def generate_qr_image(qris_string):
 # =================== DATABASE POOL & CONTEXT MANAGER ===================
 
 _pool: ThreadedConnectionPool = None
+_async_db_pool = None
+
+
+async def init_async_db_pool():
+    """Aktifkan native async PostgreSQL untuk hot read jika asyncpg tersedia; fallback aman jika tidak."""
+    global _async_db_pool
+    if asyncpg is None:
+        logger.info("[DB ASYNC] asyncpg tidak terpasang; memakai executor psycopg2 yang stabil.")
+        return False
+    try:
+        _async_db_pool = await asyncpg.create_pool(
+            dsn=DATABASE_URL,
+            min_size=1,
+            max_size=ASYNCPG_POOL_MAX,
+            command_timeout=8,
+        )
+        logger.info(f"[DB ASYNC] Native async pool aktif (max={ASYNCPG_POOL_MAX}).")
+        return True
+    except Exception as exc:
+        _async_db_pool = None
+        logger.warning(f"[DB ASYNC] Gagal aktifkan asyncpg; fallback psycopg2: {exc}")
+        return False
+
+
+async def _asyncpg_fetchrow(query: str, *args):
+    if _async_db_pool is None:
+        return None, False
+    try:
+        row = await _async_db_pool.fetchrow(query, *args)
+        return (dict(row) if row else None), True
+    except Exception as exc:
+        logger.debug(f"[DB ASYNC] fetchrow fallback ke psycopg2: {exc}")
+        return None, False
+
+
+async def _asyncpg_fetch(query: str, *args):
+    if _async_db_pool is None:
+        return None, False
+    try:
+        rows = await _async_db_pool.fetch(query, *args)
+        return [dict(row) for row in rows], True
+    except Exception as exc:
+        logger.debug(f"[DB ASYNC] fetch fallback ke psycopg2: {exc}")
+        return None, False
 
 
 def init_pool():
@@ -844,6 +1000,12 @@ def async_wrap(func):
     @functools.wraps(func)
     async def run(*args, **kwargs):
         return await run_db(func, *args, **kwargs)
+    return run
+
+def async_wrap_admin(func):
+    @functools.wraps(func)
+    async def run(*args, **kwargs):
+        return await run_db_admin(func, *args, **kwargs)
     return run
 
 def init_db():
@@ -959,6 +1121,11 @@ def init_db():
             c.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)")
             c.execute("CREATE INDEX IF NOT EXISTS idx_orders_created_at ON orders(created_at)")
             c.execute("CREATE INDEX IF NOT EXISTS idx_orders_user_status ON orders(user_id, status)")
+            c.execute("""
+                CREATE INDEX IF NOT EXISTS idx_orders_active_user_latest
+                ON orders(user_id, id DESC)
+                WHERE status IN ('waiting','pending')
+            """)
             c.execute("CREATE INDEX IF NOT EXISTS idx_orders_status_created ON orders(status, created_at)")
             c.execute("CREATE INDEX IF NOT EXISTS idx_orders_delivery_status ON orders(delivery_status)")
             c.execute("CREATE INDEX IF NOT EXISTS idx_orders_payment_provider ON orders(payment_provider)")
@@ -969,13 +1136,6 @@ def init_db():
             """)
             c.execute("CREATE INDEX IF NOT EXISTS idx_testimonials_status ON testimonials(status)")
             c.execute("CREATE INDEX IF NOT EXISTS idx_cooldowns_user_id ON cooldowns(user_id)")
-
-            # Index trigram untuk pencarian nama buyer yang kencang
-            try:
-                c.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
-                c.execute("CREATE INDEX IF NOT EXISTS idx_orders_user_name_trgm ON orders USING gin (lower(user_name) gin_trgm_ops)")
-            except Exception as e:
-                logger.warning(f"[DB] Gagal membuat trigram index (non-kritis): {e}")
 
             for key, val in [
                 ('link_testimoni', 'https://t.me/+7zsdSrwYIG8wOTg1'),
@@ -1028,64 +1188,82 @@ def get_testimonial_by_order(order_id):
 
 # =================== PRODUCT DB FUNCTIONS ===================
 
-# In-memory TTL Cache
+# In-memory TTL cache: cache hit dibaca langsung dari event loop tanpa antre executor DB.
 _settings_cache: dict = {}
-_SETTINGS_TTL = 60  # detik
+_SETTINGS_TTL = 60
+_settings_cache_lock: asyncio.Lock = None
 _products_cache: tuple = None
-_PRODUCTS_TTL = 30  # detik
+_PRODUCTS_TTL = 30
+_products_cache_lock: asyncio.Lock = None
+_products_cache_generation = 0
+_settings_cache_versions: dict = {}
 
 def _settings_cache_get(key):
     entry = _settings_cache.get(key)
     if entry and _time.monotonic() < entry[1]:
         return True, entry[0]
+    if entry:
+        _settings_cache.pop(key, None)
     return False, None
 
 def _settings_cache_set(key, value):
-    _settings_cache[key] = (value, _time.monotonic() + _SETTINGS_TTL)
+    # Settings jumlahnya kecil; hapus entry kedaluwarsa agar cache tidak tumbuh tanpa batas.
+    now_mono = _time.monotonic()
+    if len(_settings_cache) > 256:
+        for old_key, old_entry in list(_settings_cache.items()):
+            if now_mono >= old_entry[1]:
+                _settings_cache.pop(old_key, None)
+    _settings_cache[key] = (value, now_mono + _SETTINGS_TTL)
 
 def _settings_cache_del(key):
+    _settings_cache_versions[key] = _settings_cache_versions.get(key, 0) + 1
     _settings_cache.pop(key, None)
 
-def _get_all_products_sync():
-    global _products_cache
-    cached = _products_cache
-    if cached and _time.monotonic() < cached[1]:
-        return cached[0]
+def _load_all_products_sync():
     with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("SELECT * FROM products ORDER BY harga ASC")
-            data = [dict(r) for r in c.fetchall()]
-            _products_cache = (data, _time.monotonic() + _PRODUCTS_TTL)
-            return data
+            return [dict(r) for r in c.fetchall()]
 
-@async_wrap
-def get_all_products():
-    return _get_all_products_sync()
+async def get_all_products():
+    global _products_cache, _products_cache_lock
+    now_mono = _time.monotonic()
+    cached = _products_cache
+    if cached and now_mono < cached[1]:
+        return copy.deepcopy(cached[0])
+
+    if _products_cache_lock is None:
+        _products_cache_lock = asyncio.Lock()
+    async with _products_cache_lock:
+        now_mono = _time.monotonic()
+        cached = _products_cache
+        if cached and now_mono < cached[1]:
+            return copy.deepcopy(cached[0])
+
+        while True:
+            generation = _products_cache_generation
+            data, used_async = await _asyncpg_fetch("SELECT * FROM products ORDER BY harga ASC")
+            if not used_async:
+                data = await run_db(_load_all_products_sync)
+            # Jika admin mengubah produk saat query berjalan, ulangi agar cache tidak berisi snapshot lama.
+            if generation == _products_cache_generation:
+                _products_cache = (data, _time.monotonic() + _PRODUCTS_TTL)
+                return copy.deepcopy(data)
 
 def _invalidate_products_cache():
-    global _products_cache
+    global _products_cache, _products_cache_generation
+    _products_cache_generation += 1
     _products_cache = None
 
-def _get_product_sync(paket_id):
-    # Pakai cache all-products jika masih valid agar callback/payment flow lebih smooth.
-    global _products_cache
-    cached = _products_cache
-    if cached and _time.monotonic() < cached[1]:
-        for item in cached[0]:
-            if item.get('paket_id') == paket_id:
-                return dict(item)
-    with db_session_safe() as conn:
-        with conn.cursor() as c:
-            c.execute("SELECT * FROM products WHERE paket_id=%s", (paket_id,))
-            row = c.fetchone()
-            return dict(row) if row else None
+async def get_product(paket_id):
+    # Single-flight get_all_products memastikan banyak callback saat TTL habis hanya memicu satu query.
+    products = await get_all_products()
+    for item in products:
+        if item.get('paket_id') == paket_id:
+            return item
+    return None
 
-@async_wrap
-def get_product(paket_id):
-    return _get_product_sync(paket_id)
-
-@async_wrap
-def add_product(paket_id, nama, emoji, deskripsi, harga, link=None, group_chat_id=None):
+def _add_product_sync(paket_id, nama, emoji, deskripsi, harga, link=None, group_chat_id=None):
     with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute(
@@ -1097,29 +1275,39 @@ def add_product(paket_id, nama, emoji, deskripsi, harga, link=None, group_chat_i
                        link=EXCLUDED.link, group_chat_id=EXCLUDED.group_chat_id""",
                 (paket_id, nama, emoji, deskripsi, harga, link or DEFAULT_LINK, group_chat_id)
             )
+
+async def add_product(paket_id, nama, emoji, deskripsi, harga, link=None, group_chat_id=None):
+    await run_db_admin(_add_product_sync, paket_id, nama, emoji, deskripsi, harga, link, group_chat_id)
     _invalidate_products_cache()
 
-@async_wrap
-def update_product_field(paket_id, field, value):
-    _FIELD_MAP = {
+def _update_product_field_sync(paket_id, field, value):
+    field_map = {
         "nama": "nama", "emoji": "emoji", "deskripsi": "deskripsi",
         "harga": "harga", "link": "link", "group_chat_id": "group_chat_id",
         "aktif": "aktif", "requires_paket_ids": "requires_paket_ids"
     }
-    safe_field = _FIELD_MAP.get(field)
+    safe_field = field_map.get(field)
     if not safe_field:
         logger.warning(f"[SECURITY WARNING] Field SQL tidak diizinkan: {field}")
-        return
+        return False
     with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute(f"UPDATE products SET {safe_field}=%s WHERE paket_id=%s", (value, paket_id))
-    _invalidate_products_cache()
+    return True
 
-@async_wrap
-def delete_product(paket_id):
+async def update_product_field(paket_id, field, value):
+    updated = await run_db_admin(_update_product_field_sync, paket_id, field, value)
+    if updated:
+        _invalidate_products_cache()
+    return updated
+
+def _delete_product_sync(paket_id):
     with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("DELETE FROM products WHERE paket_id=%s", (paket_id,))
+
+async def delete_product(paket_id):
+    await run_db_admin(_delete_product_sync, paket_id)
     _invalidate_products_cache()
 
 def make_paket_id(nama):
@@ -1128,8 +1316,61 @@ def make_paket_id(nama):
 
 # =================== ORDER DB FUNCTIONS ===================
 
-@async_wrap
-def get_active_order(user_id):
+_active_order_cache: dict = {}
+_active_order_cache_locks = None
+_active_order_cache_versions = [0] * 64
+_active_order_cache_epoch = 0
+_waiting_orders_cache = None
+_waiting_orders_cache_lock: asyncio.Lock = None
+_waiting_orders_cache_generation = 0
+
+def _get_active_cache_lock(user_id: int) -> asyncio.Lock:
+    global _active_order_cache_locks
+    if _active_order_cache_locks is None:
+        _active_order_cache_locks = [asyncio.Lock() for _ in range(64)]
+    return _active_order_cache_locks[int(user_id) % len(_active_order_cache_locks)]
+
+def _active_order_cache_get(user_id: int):
+    entry = _active_order_cache.get(int(user_id))
+    if entry and _time.monotonic() < entry[1]:
+        return True, copy.deepcopy(entry[0])
+    if entry:
+        _active_order_cache.pop(int(user_id), None)
+    return False, None
+
+def _active_order_cache_set(user_id: int, order):
+    now_mono = _time.monotonic()
+    if len(_active_order_cache) > 10000:
+        for uid, entry in list(_active_order_cache.items()):
+            if now_mono >= entry[1]:
+                _active_order_cache.pop(uid, None)
+    _active_order_cache[int(user_id)] = (copy.deepcopy(order), now_mono + ACTIVE_ORDER_CACHE_TTL_SECONDS)
+
+def _active_order_version_slot(user_id: int) -> int:
+    return int(user_id) % len(_active_order_cache_versions)
+
+def _active_order_cache_version(user_id: int):
+    return (_active_order_cache_epoch, _active_order_cache_versions[_active_order_version_slot(user_id)])
+
+def _invalidate_active_order_cache(user_id=None):
+    global _active_order_cache_epoch
+    if user_id is None:
+        _active_order_cache_epoch += 1
+        _active_order_cache.clear()
+        for idx in range(len(_active_order_cache_versions)):
+            _active_order_cache_versions[idx] += 1
+    else:
+        uid = int(user_id)
+        slot = _active_order_version_slot(uid)
+        _active_order_cache_versions[slot] += 1
+        _active_order_cache.pop(uid, None)
+
+def _invalidate_waiting_orders_cache():
+    global _waiting_orders_cache, _waiting_orders_cache_generation
+    _waiting_orders_cache_generation += 1
+    _waiting_orders_cache = None
+
+def _get_active_order_sync(user_id):
     with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute(
@@ -1139,7 +1380,29 @@ def get_active_order(user_id):
             row = c.fetchone()
             return dict(row) if row else None
 
-@async_wrap
+async def get_active_order(user_id):
+    hit, value = _active_order_cache_get(user_id)
+    if hit:
+        return value
+
+    lock = _get_active_cache_lock(user_id)
+    async with lock:
+        hit, value = _active_order_cache_get(user_id)
+        if hit:
+            return value
+        while True:
+            version = _active_order_cache_version(user_id)
+            value, used_async = await _asyncpg_fetchrow(
+                "SELECT * FROM orders WHERE user_id=$1 AND status IN ('waiting','pending') ORDER BY id DESC LIMIT 1",
+                int(user_id),
+            )
+            if not used_async:
+                value = await run_db(_get_active_order_sync, user_id)
+            if version == _active_order_cache_version(user_id):
+                _active_order_cache_set(user_id, value)
+                return copy.deepcopy(value)
+
+@async_wrap_admin
 def get_all_pending():
     with db_session_safe() as conn:
         with conn.cursor() as c:
@@ -1153,8 +1416,7 @@ def get_all_pending():
             """)
             return [dict(r) for r in c.fetchall()]
 
-@async_wrap
-def get_all_waiting():
+def _get_all_waiting_sync():
     with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("""
@@ -1165,6 +1427,35 @@ def get_all_waiting():
                 ORDER BY o.id ASC
             """)
             return [dict(r) for r in c.fetchall()]
+
+async def get_all_waiting(force: bool = False):
+    global _waiting_orders_cache, _waiting_orders_cache_lock
+    now_mono = _time.monotonic()
+    if not force and _waiting_orders_cache and now_mono < _waiting_orders_cache[1]:
+        return copy.deepcopy(_waiting_orders_cache[0])
+    if _waiting_orders_cache_lock is None:
+        _waiting_orders_cache_lock = asyncio.Lock()
+    async with _waiting_orders_cache_lock:
+        now_mono = _time.monotonic()
+        if not force and _waiting_orders_cache and now_mono < _waiting_orders_cache[1]:
+            return copy.deepcopy(_waiting_orders_cache[0])
+        data = []
+        for _attempt in range(2):
+            generation = _waiting_orders_cache_generation
+            data, used_async = await _asyncpg_fetch("""
+                SELECT o.*, p.nama as paket_nama, p.emoji as paket_emoji, p.harga as paket_harga
+                FROM orders o
+                LEFT JOIN products p ON o.paket_id = p.paket_id
+                WHERE o.status='waiting'
+                ORDER BY o.id ASC
+            """)
+            if not used_async:
+                data = await run_db_admin(_get_all_waiting_sync)
+            if generation == _waiting_orders_cache_generation:
+                _waiting_orders_cache = (data, _time.monotonic() + WAITING_ORDERS_CACHE_TTL_SECONDS)
+                return copy.deepcopy(data)
+        # Trafik order sangat tinggi: kembalikan snapshot terbaru tanpa menyimpan cache stale.
+        return copy.deepcopy(data)
 
 @async_wrap
 def get_buyer_history_with_products(user_id, limit=10):
@@ -1180,7 +1471,7 @@ def get_buyer_history_with_products(user_id, limit=10):
             """, (user_id, limit))
             return [dict(r) for r in c.fetchall()]
 
-@async_wrap
+@async_wrap_admin
 def get_all_buyers():
     with db_session_safe() as conn:
         with conn.cursor() as c:
@@ -1194,7 +1485,7 @@ def get_all_buyers():
             """)
             return [dict(r) for r in c.fetchall()]
 
-@async_wrap
+@async_wrap_admin
 def search_buyers_sync(query: str) -> list:
     """Mencari pembeli menggunakan parameterized query aman."""
     with db_session_safe() as conn:
@@ -1241,7 +1532,7 @@ async def get_managed_groups() -> list:
 async def set_managed_groups(groups: list):
     return await run_db(_set_managed_groups_sync, groups)
 
-@async_wrap
+@async_wrap_admin
 def get_order_stats(today_start: datetime, month_start: datetime):
     with db_session_safe() as conn:
         with conn.cursor() as c:
@@ -1309,11 +1600,11 @@ def get_order_stats(today_start: datetime, month_start: datetime):
             repeat_buyers = c.fetchone()['cnt']
 
             c.execute("""
-                SELECT COUNT(DISTINCT user_id) as cnt FROM orders
-                WHERE status='completed' AND created_at >= %s
-                AND user_id NOT IN (
-                    SELECT DISTINCT user_id FROM orders
-                    WHERE status='completed' AND created_at < %s
+                SELECT COUNT(DISTINCT o.user_id) as cnt FROM orders o
+                WHERE o.status='completed' AND o.created_at >= %s AND o.user_id IS NOT NULL
+                AND NOT EXISTS (
+                    SELECT 1 FROM orders old
+                    WHERE old.status='completed' AND old.created_at < %s AND old.user_id=o.user_id
                 )
             """, (month_start, month_start))
             new_buyers_month = c.fetchone()['cnt']
@@ -1461,6 +1752,15 @@ def get_order_stats(today_start: datetime, month_start: datetime):
 _stats_cache = None
 _stats_cache_lock: asyncio.Lock = None
 
+def _invalidate_stats_cache():
+    global _stats_cache
+    _stats_cache = None
+
+def _invalidate_order_caches(user_id=None):
+    _invalidate_active_order_cache(user_id)
+    _invalidate_waiting_orders_cache()
+    _invalidate_stats_cache()
+
 
 async def get_order_stats_cached(today_start: datetime, month_start: datetime, force: bool = False):
     """Cache singkat agar permintaan statistik berulang tidak membebani DB."""
@@ -1485,36 +1785,53 @@ async def get_order_stats_cached(today_start: datetime, month_start: datetime, f
         return copy.deepcopy(value)
 
 
-@async_wrap
-def update_order_status(order_id, status):
-    with db_session_safe() as conn:
-        with conn.cursor() as c:
-            c.execute("UPDATE orders SET status=%s WHERE order_id=%s", (status, order_id))
-
-def _mark_order_completed_sync(order_id) -> bool:
-    """Atomic: mengubah status menjadi completed hanya jika masih 'waiting'."""
+def _update_order_status_sync(order_id, status):
     with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute(
-                "UPDATE orders SET status='completed' WHERE order_id=%s AND status='waiting' RETURNING id",
+                "UPDATE orders SET status=%s WHERE order_id=%s RETURNING user_id",
+                (status, order_id),
+            )
+            row = c.fetchone()
+            return row.get('user_id') if row else None
+
+async def update_order_status(order_id, status):
+    user_id = await run_db(_update_order_status_sync, order_id, status)
+    _invalidate_order_caches(user_id)
+    return user_id
+
+def _mark_order_completed_sync(order_id):
+    """Atomic: completed hanya jika masih waiting; None berarti tidak ada row yang berubah."""
+    with db_session_safe() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                "UPDATE orders SET status='completed' WHERE order_id=%s AND status='waiting' RETURNING id, user_id",
                 (order_id,)
             )
-            updated = c.fetchone()
-            return updated is not None
+            row = c.fetchone()
+            return dict(row) if row else None
 
 async def mark_order_completed(order_id) -> bool:
-    return await run_db(_mark_order_completed_sync, order_id)
+    updated = await run_db(_mark_order_completed_sync, order_id)
+    if not updated:
+        return False
+    _invalidate_order_caches(updated.get('user_id'))
+    return True
 
-@async_wrap
-def get_order_by_id(order_id):
+def _get_order_by_id_sync(order_id):
     with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("SELECT * FROM orders WHERE order_id=%s", (order_id,))
             row = c.fetchone()
             return dict(row) if row else None
 
-@async_wrap
-def get_order_by_provider_transaction_id(provider_transaction_id: str):
+async def get_order_by_id(order_id):
+    row, used_async = await _asyncpg_fetchrow("SELECT * FROM orders WHERE order_id=$1", str(order_id))
+    if used_async:
+        return row
+    return await run_db(_get_order_by_id_sync, order_id)
+
+def _get_order_by_provider_transaction_id_sync(provider_transaction_id: str):
     with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute(
@@ -1523,6 +1840,14 @@ def get_order_by_provider_transaction_id(provider_transaction_id: str):
             )
             row = c.fetchone()
             return dict(row) if row else None
+
+async def get_order_by_provider_transaction_id(provider_transaction_id: str):
+    row, used_async = await _asyncpg_fetchrow(
+        "SELECT * FROM orders WHERE provider_transaction_id=$1 LIMIT 1", str(provider_transaction_id)
+    )
+    if used_async:
+        return row
+    return await run_db(_get_order_by_provider_transaction_id_sync, provider_transaction_id)
 
 @async_wrap
 def update_order_provider_status(order_id: str, provider_status: str):
@@ -1663,11 +1988,10 @@ def atomic_claim_for_delivery(order_id: str) -> bool:
             )
             return c.rowcount > 0
 
-@async_wrap
-def save_order(user_id, user_name, paket_id, order_id, harga_dibayar=0, order_changes=0,
-               payment_provider="autogopay", provider_transaction_id=None,
-               provider_order_id=None, provider_status=None,
-               payment_expires_at=None, checkout_url=None, qr_url=None):
+def _save_order_sync(user_id, user_name, paket_id, order_id, harga_dibayar=0, order_changes=0,
+                     payment_provider="autogopay", provider_transaction_id=None,
+                     provider_order_id=None, provider_status=None,
+                     payment_expires_at=None, checkout_url=None, qr_url=None):
     with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute(
@@ -1681,7 +2005,7 @@ def save_order(user_id, user_name, paket_id, order_id, harga_dibayar=0, order_ch
                        %s, %s, %s,
                        %s, %s, %s,
                        %s, %s, %s
-                   )""",
+                   ) RETURNING *""",
                 (
                     user_id, user_name, paket_id, order_id,
                     now_wib().strftime("%H:%M - %d/%m/%Y"),
@@ -1690,28 +2014,65 @@ def save_order(user_id, user_name, paket_id, order_id, harga_dibayar=0, order_ch
                     payment_expires_at, checkout_url, qr_url,
                 )
             )
+            row = c.fetchone()
+            return dict(row) if row else None
+
+async def save_order(user_id, user_name, paket_id, order_id, harga_dibayar=0, order_changes=0,
+                     payment_provider="autogopay", provider_transaction_id=None,
+                     provider_order_id=None, provider_status=None,
+                     payment_expires_at=None, checkout_url=None, qr_url=None):
+    order = await run_db(
+        _save_order_sync, user_id, user_name, paket_id, order_id, harga_dibayar, order_changes,
+        payment_provider, provider_transaction_id, provider_order_id, provider_status,
+        payment_expires_at, checkout_url, qr_url,
+    )
+    _invalidate_active_order_cache(user_id)
+    _invalidate_waiting_orders_cache()
+    _invalidate_stats_cache()
+    _active_order_cache_set(user_id, order)
+    return order
 
 # =================== BAN DB FUNCTIONS ===================
 
 _banned_cache: dict = {}
 _BANNED_CACHE_TTL = 30
+_banned_cache_locks = None
 
+def _get_banned_lock(user_id: int) -> asyncio.Lock:
+    global _banned_cache_locks
+    if _banned_cache_locks is None:
+        _banned_cache_locks = [asyncio.Lock() for _ in range(32)]
+    return _banned_cache_locks[int(user_id) % len(_banned_cache_locks)]
 
-@async_wrap
-def is_banned(user_id):
-    now_mono = _time.monotonic()
-    cached = _banned_cache.get(user_id)
-    if cached and now_mono < cached[1]:
-        return cached[0]
+def _is_banned_sync(user_id):
     with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("SELECT 1 FROM banned_users WHERE user_id=%s", (user_id,))
-            result = c.fetchone() is not None
-    _banned_cache[user_id] = (result, now_mono + _BANNED_CACHE_TTL)
-    return result
+            return c.fetchone() is not None
 
-@async_wrap
-def ban_user(user_id, reason=""):
+async def is_banned(user_id):
+    uid = int(user_id)
+    now_mono = _time.monotonic()
+    cached = _banned_cache.get(uid)
+    if cached and now_mono < cached[1]:
+        return cached[0]
+    if cached:
+        _banned_cache.pop(uid, None)
+    async with _get_banned_lock(uid):
+        now_mono = _time.monotonic()
+        cached = _banned_cache.get(uid)
+        if cached and now_mono < cached[1]:
+            return cached[0]
+        row, used_async = await _asyncpg_fetchrow("SELECT 1 AS banned FROM banned_users WHERE user_id=$1", uid)
+        result = bool(row) if used_async else await run_db(_is_banned_sync, uid)
+        if len(_banned_cache) > 10000:
+            for old_uid, entry in list(_banned_cache.items()):
+                if now_mono >= entry[1]:
+                    _banned_cache.pop(old_uid, None)
+        _banned_cache[uid] = (result, now_mono + _BANNED_CACHE_TTL)
+        return result
+
+def _ban_user_sync(user_id, reason=""):
     with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute(
@@ -1720,16 +2081,25 @@ def ban_user(user_id, reason=""):
                    ON CONFLICT (user_id) DO UPDATE SET reason=EXCLUDED.reason, banned_at=EXCLUDED.banned_at""",
                 (user_id, reason, now_wib().strftime("%H:%M - %d/%m/%Y"))
             )
-    _banned_cache[user_id] = (True, _time.monotonic() + _BANNED_CACHE_TTL)
 
-@async_wrap
-def unban_user(user_id):
+async def ban_user(user_id, reason=""):
+    uid = int(user_id)
+    async with _get_banned_lock(uid):
+        await run_db_admin(_ban_user_sync, uid, reason)
+        _banned_cache[uid] = (True, _time.monotonic() + _BANNED_CACHE_TTL)
+
+def _unban_user_sync(user_id):
     with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("DELETE FROM banned_users WHERE user_id=%s", (user_id,))
-    _banned_cache[user_id] = (False, _time.monotonic() + _BANNED_CACHE_TTL)
 
-@async_wrap
+async def unban_user(user_id):
+    uid = int(user_id)
+    async with _get_banned_lock(uid):
+        await run_db_admin(_unban_user_sync, uid)
+        _banned_cache[uid] = (False, _time.monotonic() + _BANNED_CACHE_TTL)
+
+@async_wrap_admin
 def get_all_banned():
     with db_session_safe() as conn:
         with conn.cursor() as c:
@@ -1738,21 +2108,36 @@ def get_all_banned():
 
 # =================== SETTINGS DB FUNCTIONS ===================
 
-@async_wrap
-def get_setting(key, default=None):
-    hit, cached_val = _settings_cache_get(key)
-    if hit:
-        return cached_val if cached_val is not None else default
+def _get_setting_sync(key):
     with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("SELECT value FROM settings WHERE key=%s", (key,))
             row = c.fetchone()
-            val = row['value'] if row else None
-            _settings_cache_set(key, val)
-            return val if val is not None else default
+            return row['value'] if row else None
 
-@async_wrap
-def set_setting(key, value):
+async def get_setting(key, default=None):
+    global _settings_cache_lock
+    hit, cached_val = _settings_cache_get(key)
+    if hit:
+        return cached_val if cached_val is not None else default
+    if _settings_cache_lock is None:
+        _settings_cache_lock = asyncio.Lock()
+    async with _settings_cache_lock:
+        hit, cached_val = _settings_cache_get(key)
+        if hit:
+            return cached_val if cached_val is not None else default
+        while True:
+            version = _settings_cache_versions.get(key, 0)
+            row, used_async = await _asyncpg_fetchrow("SELECT value FROM settings WHERE key=$1", str(key))
+            if used_async:
+                val = row.get('value') if row else None
+            else:
+                val = await run_db(_get_setting_sync, key)
+            if version == _settings_cache_versions.get(key, 0):
+                _settings_cache_set(key, val)
+                return val if val is not None else default
+
+def _set_setting_sync(key, value):
     with db_session_safe() as conn:
         with conn.cursor() as c:
             if value is None:
@@ -1763,48 +2148,84 @@ def set_setting(key, value):
                        ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value""",
                     (key, str(value))
                 )
-    _settings_cache_del(key)
+
+async def set_setting(key, value):
+    global _settings_cache_lock
+    if _settings_cache_lock is None:
+        _settings_cache_lock = asyncio.Lock()
+    async with _settings_cache_lock:
+        await run_db_admin(_set_setting_sync, key, value)
+        _settings_cache_del(key)
 
 # =================== COOLDOWN DB + IN-MEMORY CACHE ===================
 COOLDOWN_MENIT = 5
 COOLDOWN_MENIT_MAX = 60
 _cooldown_memory_cache: dict = {}
+# Cancel escalation disimpan 24 jam saja agar memory tidak tumbuh selamanya.
 _cancel_count_cache: dict = {}
+_CANCEL_COUNT_TTL_SECONDS = 24 * 60 * 60
+_cooldown_cache_locks = None
+
+def _get_cooldown_lock(user_id: int) -> asyncio.Lock:
+    global _cooldown_cache_locks
+    if _cooldown_cache_locks is None:
+        _cooldown_cache_locks = [asyncio.Lock() for _ in range(32)]
+    return _cooldown_cache_locks[int(user_id) % len(_cooldown_cache_locks)]
+
+def _get_cancel_count(user_id: int) -> int:
+    uid = int(user_id)
+    entry = _cancel_count_cache.get(uid)
+    if not entry:
+        return 0
+    count, expires_at = entry
+    if _time.monotonic() >= expires_at:
+        _cancel_count_cache.pop(uid, None)
+        return 0
+    return count
 
 def _get_dynamic_cooldown_minutes(user_id: int) -> int:
-    """Hitung cooldown dinamis berdasarkan jumlah cancel user."""
-    cancel_count = _cancel_count_cache.get(user_id, 0)
+    cancel_count = _get_cancel_count(user_id)
     if cancel_count >= 5:
         return COOLDOWN_MENIT_MAX
-    elif cancel_count >= 3:
+    if cancel_count >= 3:
         return 30
-    elif cancel_count >= 2:
+    if cancel_count >= 2:
         return 15
     return COOLDOWN_MENIT
 
 def _increment_cancel_count(user_id: int):
-    """Increment cancel counter untuk user."""
-    _cancel_count_cache[user_id] = _cancel_count_cache.get(user_id, 0) + 1
+    uid = int(user_id)
+    count = _get_cancel_count(uid) + 1
+    _cancel_count_cache[uid] = (count, _time.monotonic() + _CANCEL_COUNT_TTL_SECONDS)
+    if len(_cancel_count_cache) > 10000:
+        now_mono = _time.monotonic()
+        for old_uid, entry in list(_cancel_count_cache.items()):
+            if now_mono >= entry[1]:
+                _cancel_count_cache.pop(old_uid, None)
 
-def _get_cooldown_memory(user_id: int) -> datetime:
-    expires = _cooldown_memory_cache.get(user_id)
+def _get_cooldown_memory(user_id: int):
+    uid = int(user_id)
+    expires = _cooldown_memory_cache.get(uid)
     if expires is None:
         return None
     if now_utc() >= expires:
-        _cooldown_memory_cache.pop(user_id, None)
+        _cooldown_memory_cache.pop(uid, None)
         return None
     return expires
 
 def _set_cooldown_memory(user_id: int, expires_at: datetime):
-    _cooldown_memory_cache[user_id] = expires_at
+    uid = int(user_id)
+    _cooldown_memory_cache[uid] = expires_at
+    if len(_cooldown_memory_cache) > 10000:
+        now = now_utc()
+        for old_uid, expires in list(_cooldown_memory_cache.items()):
+            if now >= expires:
+                _cooldown_memory_cache.pop(old_uid, None)
 
 def _clear_cooldown_memory(user_id: int):
-    _cooldown_memory_cache.pop(user_id, None)
+    _cooldown_memory_cache.pop(int(user_id), None)
 
-@async_wrap
-def set_cooldown_db(user_id):
-    cooldown_minutes = _get_dynamic_cooldown_minutes(user_id)
-    expires_at = now_utc() + timedelta(minutes=cooldown_minutes)
+def _set_cooldown_sync(user_id, expires_at):
     with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute(
@@ -1812,46 +2233,65 @@ def set_cooldown_db(user_id):
                    ON CONFLICT (user_id) DO UPDATE SET expires_at=EXCLUDED.expires_at""",
                 (user_id, expires_at)
             )
-    _set_cooldown_memory(user_id, expires_at)
-    _increment_cancel_count(user_id)
 
-@async_wrap
-def get_cooldown_sisa_db(user_id):
-    mem_expires = _get_cooldown_memory(user_id)
-    if mem_expires is not None:
-        sisa = (mem_expires - now_utc()).total_seconds()
-        return math.ceil(sisa / 60) if sisa > 0 else 0
-    
+async def set_cooldown_db(user_id):
+    uid = int(user_id)
+    async with _get_cooldown_lock(uid):
+        cooldown_minutes = _get_dynamic_cooldown_minutes(uid)
+        expires_at = now_utc() + timedelta(minutes=cooldown_minutes)
+        await run_db(_set_cooldown_sync, uid, expires_at)
+        _set_cooldown_memory(uid, expires_at)
+        _increment_cancel_count(uid)
+
+def _get_cooldown_sync(user_id):
     with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("SELECT expires_at FROM cooldowns WHERE user_id=%s", (user_id,))
             row = c.fetchone()
-            if not row:
-                return 0
-            try:
-                until = row['expires_at']
-                if until.tzinfo is None:
-                    until = until.replace(tzinfo=timezone.utc)
-                
-                until_utc = until.astimezone(timezone.utc)
-                sisa = (until_utc - now_utc()).total_seconds()
-                
-                if sisa > 0:
-                    _set_cooldown_memory(user_id, until_utc)
-                
-                return math.ceil(sisa / 60) if sisa > 0 else 0
-            except Exception as e:
-                logger.error(f"[COOLDOWN] Gagal menghitung cooldown: {e}")
-                return 0
+            return row['expires_at'] if row else None
 
-@async_wrap
-def clear_cooldown_db(user_id):
+async def get_cooldown_sisa_db(user_id):
+    mem_expires = _get_cooldown_memory(user_id)
+    if mem_expires is not None:
+        sisa = (mem_expires - now_utc()).total_seconds()
+        return math.ceil(sisa / 60) if sisa > 0 else 0
+
+    uid = int(user_id)
+    async with _get_cooldown_lock(uid):
+        mem_expires = _get_cooldown_memory(uid)
+        if mem_expires is not None:
+            sisa = (mem_expires - now_utc()).total_seconds()
+            return math.ceil(sisa / 60) if sisa > 0 else 0
+        row, used_async = await _asyncpg_fetchrow("SELECT expires_at FROM cooldowns WHERE user_id=$1", uid)
+        until = row.get('expires_at') if (used_async and row) else None
+        if not used_async:
+            until = await run_db(_get_cooldown_sync, uid)
+        if until is None:
+            return 0
+        try:
+            if until.tzinfo is None:
+                until = until.replace(tzinfo=timezone.utc)
+            until_utc = until.astimezone(timezone.utc)
+            sisa = (until_utc - now_utc()).total_seconds()
+            if sisa > 0:
+                _set_cooldown_memory(uid, until_utc)
+            return math.ceil(sisa / 60) if sisa > 0 else 0
+        except Exception as exc:
+            logger.error(f"[COOLDOWN] Gagal menghitung cooldown: {exc}")
+            return 0
+
+def _clear_cooldown_sync(user_id):
     with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("DELETE FROM cooldowns WHERE user_id=%s", (user_id,))
-    _clear_cooldown_memory(user_id)
 
-@async_wrap
+async def clear_cooldown_db(user_id):
+    uid = int(user_id)
+    async with _get_cooldown_lock(uid):
+        await run_db(_clear_cooldown_sync, uid)
+        _clear_cooldown_memory(uid)
+
+@async_wrap_admin
 def cleanup_expired_cooldowns():
     with db_session_safe() as conn:
         with conn.cursor() as c:
@@ -1859,15 +2299,51 @@ def cleanup_expired_cooldowns():
 
 # =================== ADMIN DB FUNCTIONS ===================
 
-@async_wrap
+_admin_ids_cache = None
+_admin_ids_cache_lock = None
+_admin_ids_cache_generation = 0
+
+def _invalidate_admin_ids_cache():
+    global _admin_ids_cache, _admin_ids_cache_generation
+    _admin_ids_cache_generation += 1
+    _admin_ids_cache = None
+
+def _load_admin_ids_sync():
+    with db_session_safe() as conn:
+        with conn.cursor() as c:
+            c.execute("SELECT user_id FROM admins")
+            return {int(r['user_id']) for r in c.fetchall()}
+
+async def _get_admin_ids_cached():
+    global _admin_ids_cache, _admin_ids_cache_lock
+    now_mono = _time.monotonic()
+    if _admin_ids_cache and now_mono < _admin_ids_cache[1]:
+        return _admin_ids_cache[0]
+    if _admin_ids_cache_lock is None:
+        _admin_ids_cache_lock = asyncio.Lock()
+    async with _admin_ids_cache_lock:
+        now_mono = _time.monotonic()
+        if _admin_ids_cache and now_mono < _admin_ids_cache[1]:
+            return _admin_ids_cache[0]
+        while True:
+            generation = _admin_ids_cache_generation
+            rows, used_async = await _asyncpg_fetch("SELECT user_id FROM admins")
+            if used_async:
+                ids = {int(r['user_id']) for r in rows}
+            else:
+                ids = await run_db_admin(_load_admin_ids_sync)
+            if generation == _admin_ids_cache_generation:
+                _admin_ids_cache = (frozenset(ids), _time.monotonic() + ADMIN_CACHE_TTL_SECONDS)
+                return _admin_ids_cache[0]
+
+@async_wrap_admin
 def get_all_admins():
     with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("SELECT * FROM admins ORDER BY added_at ASC")
             return [dict(r) for r in c.fetchall()]
 
-@async_wrap
-def add_admin(user_id, nama, added_by):
+def _add_admin_sync(user_id, nama, added_by):
     with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute(
@@ -1877,32 +2353,28 @@ def add_admin(user_id, nama, added_by):
                 (user_id, str(nama), added_by, now_wib().strftime("%H:%M - %d/%m/%Y"))
             )
 
-@async_wrap
-def remove_admin(user_id):
+async def add_admin(user_id, nama, added_by):
+    await run_db_admin(_add_admin_sync, user_id, nama, added_by)
+    _invalidate_admin_ids_cache()
+
+def _remove_admin_sync(user_id):
     with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("DELETE FROM admins WHERE user_id=%s", (user_id,))
 
-@async_wrap
-def is_admin_in_db(user_id):
-    with db_session_safe() as conn:
-        with conn.cursor() as c:
-            c.execute("SELECT 1 FROM admins WHERE user_id=%s", (user_id,))
-            return c.fetchone() is not None
+async def remove_admin(user_id):
+    await run_db_admin(_remove_admin_sync, user_id)
+    _invalidate_admin_ids_cache()
 
-# =================== ADMIN CHECK WITH SESSION CACHE ===================
+async def is_admin_in_db(user_id):
+    return int(user_id) in await _get_admin_ids_cached()
+
+# =================== ADMIN CHECK WITH SHARED TTL CACHE ===================
 
 async def is_admin(user_id: int, context=None) -> bool:
-    if user_id == ADMIN_ID:
+    if int(user_id) == ADMIN_ID:
         return True
-    if context is not None:
-        cache = context.bot_data.get('_admin_cache', {})
-        if user_id in cache:
-            return cache[user_id]
-    result = await is_admin_in_db(user_id)
-    if context is not None:
-        context.bot_data.setdefault('_admin_cache', {})[user_id] = result
-    return result
+    return int(user_id) in await _get_admin_ids_cached()
 
 def invalidate_admin_cache(context, user_id: int = None):
     if user_id is not None:
@@ -2091,13 +2563,19 @@ async def kirim_notif(bot, text: str, reply_markup=None):
     channel_id = await get_setting('notif_channel_id')
     target = int(channel_id) if channel_id else ADMIN_ID
     try:
-        msg = await bot.send_message(chat_id=target, text=text, parse_mode="HTML", reply_markup=reply_markup)
+        msg = await telegram_send_rate_retry(
+            lambda: bot.send_message(chat_id=target, text=text, parse_mode="HTML", reply_markup=reply_markup),
+            label=f"notif admin {target}",
+        )
         return msg.message_id
     except Exception as e:
         logger.error(f"[NOTIF] Gagal kirim ke {target}: {e}")
         if target != ADMIN_ID:
             try:
-                msg = await bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="HTML", reply_markup=reply_markup)
+                msg = await telegram_send_rate_retry(
+                    lambda: bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="HTML", reply_markup=reply_markup),
+                    label="notif admin fallback",
+                )
                 return msg.message_id
             except Exception as ex:
                 logger.error(f"[NOTIF] Gagal kirim ke admin utama: {ex}")
@@ -2166,10 +2644,10 @@ async def build_main_menu_keyboard():
 def simpan_admin_msg(context, user_id, message_id):
     context.bot_data.setdefault('admin_messages', {})
     context.bot_data['admin_messages'].setdefault(user_id, [])
-    msgs = context.bot_data['admin_messages'][user_id]
-    msgs.append(message_id)
-    if len(msgs) > _MAX_STORED_ADMIN_MESSAGES:
-        context.bot_data['admin_messages'][user_id] = msgs[-_MAX_STORED_ADMIN_MESSAGES:]
+    bucket = context.bot_data['admin_messages'][user_id]
+    bucket.append(message_id)
+    if len(bucket) > 50:
+        del bucket[:-50]
 
 async def hapus_admin_msg(context, user_id):
     msg_ids = context.bot_data.get('admin_messages', {}).pop(user_id, [])
@@ -2186,18 +2664,24 @@ async def hapus_admin_msg(context, user_id):
 
 def simpan_msg_user(context, user_id, message_id):
     context.bot_data.setdefault('user_messages', {})
-    context.bot_data['user_messages'].setdefault(user_id, [])
-    msgs = context.bot_data['user_messages'][user_id]
-    msgs.append(message_id)
-    if len(msgs) > _MAX_STORED_MESSAGES:
-        context.bot_data['user_messages'][user_id] = msgs[-_MAX_STORED_MESSAGES:]
+    store = context.bot_data['user_messages']
+    if user_id not in store and len(store) >= 20000:
+        store.pop(next(iter(store)), None)
+    store.setdefault(user_id, [])
+    bucket = store[user_id]
+    bucket.append(message_id)
+    if len(bucket) > 50:
+        del bucket[:-50]
 
 async def hapus_msg_user_lama(context, user_id, keep_last=1):
     msgs = context.bot_data.get('user_messages', {}).get(user_id, [])
     if len(msgs) <= keep_last:
         return
     to_delete = msgs[:-keep_last] if keep_last else list(msgs)
-    context.bot_data['user_messages'][user_id] = msgs[-keep_last:] if keep_last else []
+    if keep_last:
+        context.bot_data['user_messages'][user_id] = msgs[-keep_last:]
+    else:
+        context.bot_data.get('user_messages', {}).pop(user_id, None)
 
     async def _cleanup():
         await asyncio.gather(*[
@@ -2291,6 +2775,7 @@ async def _process_autogopay_settlement(order: dict, paid_amount: int):
     """Proses delivery di luar response webhook agar callback dibalas cepat."""
     try:
         await _stop_payment_task(order["user_id"])
+        paket = await get_product(order["paket_id"])
         await _handle_payment_success(
             _current_bot,
             order["order_id"],
@@ -2303,6 +2788,7 @@ async def _process_autogopay_settlement(order: dict, paid_amount: int):
                 "status": "completed",
                 "provider_status": "settlement",
             },
+            paket=paket,
         )
         logger.info(f"[AUTOGOPAY WEBHOOK] Settlement diproses: {order['order_id']}")
     except asyncio.CancelledError:
@@ -2336,18 +2822,6 @@ async def autogopay_webhook_handler(request: aio_web.Request) -> aio_web.Respons
     if not received_signature or not hmac.compare_digest(received_signature, expected_signature):
         logger.warning("[AUTOGOPAY WEBHOOK] Signature tidak valid.")
         return aio_web.Response(status=401, text="invalid signature")
-
-    # Cek timestamp untuk mencegah replay attack (toleransi 5 menit)
-    ts_header = request.headers.get("X-Timestamp") or request.headers.get("X-Request-Timestamp")
-    if ts_header:
-        try:
-            ts_val = int(ts_header)
-            now_ts = int(_time.time())
-            if abs(now_ts - ts_val) > 300:
-                logger.warning("[AUTOGOPAY WEBHOOK] Timestamp terlalu tua, kemungkinan replay.")
-                return aio_web.Response(status=401, text="stale request")
-        except (ValueError, TypeError):
-            pass
 
     try:
         data = json.loads(body)
@@ -2408,13 +2882,40 @@ _webhook_runner = None
 
 # =================== WEB SERVER MANAGEMENT ===================
 
+def _db_ping_sync():
+    with db_session_safe() as conn:
+        with conn.cursor() as c:
+            c.execute("SELECT 1 AS ok")
+            row = c.fetchone()
+            return bool(row and row.get('ok') == 1)
+
+async def _readiness_handler(request):
+    try:
+        if _async_db_pool is not None:
+            value = await _async_db_pool.fetchval("SELECT 1")
+            db_ok = value == 1
+        else:
+            db_ok = await run_db(_db_ping_sync)
+    except Exception:
+        db_ok = False
+    payload = {
+        "ok": bool(db_ok and _current_bot is not None),
+        "db": db_ok,
+        "bot_ready": _current_bot is not None,
+        "async_db": _async_db_pool is not None,
+        "payment_tasks": sum(1 for t in _payment_tasks.values() if not t.done()) if '_payment_tasks' in globals() else 0,
+        "provider_circuit_open": _autogopay_circuit_is_open(),
+    }
+    return aio_web.json_response(payload, status=200 if payload["ok"] else 503)
+
 async def _start_webhook_server():
     global _webhook_runner
     webhook_app = aio_web.Application()
 
-    # Endpoint yang tetap diperlukan bot.
+    # /health tetap sederhana untuk platform; /ready memberi readiness internal lebih lengkap.
     webhook_app.router.add_post('/webhook/autogopay', autogopay_webhook_handler)
     webhook_app.router.add_get('/health', lambda r: aio_web.Response(text='ok'))
+    webhook_app.router.add_get('/ready', _readiness_handler)
     webhook_app.router.add_get('/', lambda r: aio_web.Response(text='Hyper Family Store Bot - OK'))
 
     runner = aio_web.AppRunner(webhook_app)
@@ -2441,16 +2942,32 @@ async def _event_loop_lag_monitor():
             logger.warning(f"[EVENT LOOP LAG] Event loop tertahan {lag:.2f}s")
 
 
+async def _prewarm_hot_settings():
+    await asyncio.gather(
+        get_setting('link_testimoni', 'https://t.me/+7zsdSrwYIG8wOTg1'),
+        get_setting('link_admin', 'https://t.me/Kikukkvd'),
+        get_setting('notif_channel_id', ''),
+        get_setting('maintenance', 'off'),
+        get_setting('testimoni_channel_id', ''),
+    )
+
 async def post_init(application: Application):
     global _current_bot
     _current_bot = application.bot
 
-    # Executor DB dan CPU/file sudah dipisah agar pekerjaan admin tidak menahan buyer.
     logger.info(
-        f"[PERFORMANCE] Executor aktif: db_workers={DB_THREAD_WORKERS}, "
-        f"cpu_workers={CPU_THREAD_WORKERS}"
+        f"[PERFORMANCE] Executor aktif: buyer_db={DB_THREAD_WORKERS}, "
+        f"admin_db={DB_ADMIN_THREAD_WORKERS}, cpu={CPU_THREAD_WORKERS}"
     )
-    await get_http_session()
+    await asyncio.gather(get_http_session(), init_async_db_pool())
+
+    # Preload cache yang langsung dipakai buyer pertama setelah deploy/restart.
+    waiting_orders, all_products, _, _ = await asyncio.gather(
+        get_all_waiting(force=True),
+        get_all_products(),
+        _prewarm_hot_settings(),
+        _get_admin_ids_cached(),
+    )
 
     await asyncio.gather(
         application.bot.set_my_commands(
@@ -2471,10 +2988,9 @@ async def post_init(application: Application):
         ),
     )
 
-    waiting_orders, all_products = await asyncio.gather(get_all_waiting(), get_all_products())
     products_by_id = {p['paket_id']: p for p in all_products}
     if waiting_orders:
-        logger.info(f"[POST_INIT] Menemukan {len(waiting_orders)} order aktif, memulihkan background task pembayaran...")
+        logger.info(f"[POST_INIT] Menemukan {len(waiting_orders)} order aktif, memulihkan monitoring pembayaran...")
         for order in waiting_orders:
             paket = products_by_id.get(order['paket_id'])
             if not paket:
@@ -2503,47 +3019,71 @@ async def post_init(application: Application):
                 user_id=order['user_id'],
                 user_name=order.get('user_name', 'User'),
                 amount=recovery_amount,
-                timeout_seconds=recovery_timeout
+                timeout_seconds=recovery_timeout,
+                paket=paket,
             )
-            logger.info(f"[POST_INIT] Order masuk radar global poller: {order['order_id']}")
+            logger.debug(f"[POST_INIT] Monitoring dipulihkan: {order['order_id']}")
 
     spawn_background(_auto_backup_loop(), name="auto-backup-loop")
     spawn_background(_buyer_reminder_loop(_current_bot), name="buyer-reminder-loop")
     spawn_background(_cleanup_cooldowns_loop(), name="cooldown-cleanup-loop")
     spawn_background(_event_loop_lag_monitor(), name="event-loop-lag-monitor")
+    spawn_background(_latency_reporter_loop(), name="latency-reporter-loop")
     spawn_background(_start_webhook_server(), name="webhook-server")
-    spawn_background(_global_payment_poller(_current_bot), name="global-payment-poller")
-    spawn_background(_memory_cache_cleanup_loop(), name="memory-cache-cleanup")
     logger.info("[POST_INIT] Background task aktif dan bot siap menerima update.")
 
 # =================== GRACEFUL SHUTDOWN ===================
 
 async def post_shutdown(application: Application):
-    global _http_session, _pool, _webhook_runner
-    logger.info("[SHUTDOWN] Memulai siklus anggun mematikan sistem (Graceful Shutdown)...")
+    global _http_session, _pool, _webhook_runner, _async_db_pool
+    logger.info("[SHUTDOWN] Memulai graceful shutdown...")
+
+    # Hentikan task yang memakai HTTP/DB sebelum resource ditutup.
+    payment_tasks = [task for task in list(_payment_tasks.values()) if task and not task.done()]
+    for task in payment_tasks:
+        task.cancel()
+    if payment_tasks:
+        await asyncio.gather(*payment_tasks, return_exceptions=True)
+    _payment_tasks.clear()
+
+    blast_map = globals().get('_blast_tasks', {})
+    blast_tasks = [task for task in list(blast_map.values()) if task and not task.done()]
+    for task in blast_tasks:
+        task.cancel()
+    if blast_tasks:
+        await asyncio.gather(*blast_tasks, return_exceptions=True)
+    blast_map.clear()
+
     pending_background = [task for task in list(_background_tasks) if not task.done()]
     for task in pending_background:
         task.cancel()
     if pending_background:
         await asyncio.gather(*pending_background, return_exceptions=True)
-    if _http_session and not _http_session.closed:
-        await _http_session.close()
-        logger.info("[SHUTDOWN] Sesi client HTTP asinkron ditutup.")
+
     if _webhook_runner:
         await _webhook_runner.cleanup()
-        logger.info("[SHUTDOWN] Web Server API berhasil dibersihkan.")
-    # Tunggu pekerjaan executor selesai sebelum menutup pool database.
-    # Ini hanya berjalan saat shutdown, jadi tidak memengaruhi respons bot.
+        _webhook_runner = None
+        logger.info("[SHUTDOWN] Web server dibersihkan.")
+    if _http_session and not _http_session.closed:
+        await _http_session.close()
+        logger.info("[SHUTDOWN] HTTP session ditutup.")
+    if _async_db_pool is not None:
+        await _async_db_pool.close()
+        _async_db_pool = None
+        logger.info("[SHUTDOWN] Async PostgreSQL pool ditutup.")
+
     try:
         _db_executor.shutdown(wait=True, cancel_futures=True)
+        _db_admin_executor.shutdown(wait=True, cancel_futures=True)
         _cpu_executor.shutdown(wait=True, cancel_futures=True)
-    except TypeError:  # Kompatibilitas Python lama yang belum punya cancel_futures.
+    except TypeError:
         _db_executor.shutdown(wait=True)
+        _db_admin_executor.shutdown(wait=True)
         _cpu_executor.shutdown(wait=True)
-    logger.info("[SHUTDOWN] Executor database dan CPU/file dihentikan.")
+    logger.info("[SHUTDOWN] Executor dihentikan.")
     if _pool:
         _pool.closeall()
-        logger.info("[SHUTDOWN] Seluruh koneksi ke DB PostgreSQL ditutup dengan aman.")
+        logger.info("[SHUTDOWN] Psycopg2 pool ditutup.")
     logger.info("[SHUTDOWN] Shutdown selesai.")
 
 # =================== USER HANDLERS ===================
@@ -2568,7 +3108,8 @@ async def _refresh_active_order_status(bot, active: dict, paket: dict, user_name
             user_id=active["user_id"],
             user_name=user_name,
             paid_amount=trans.get("amount", amount),
-            source_title="✅ <b>ORDER BERHASIL</b>"
+            source_title="✅ <b>ORDER BERHASIL</b>",
+            paket=paket,
         )
     except asyncio.CancelledError:
         raise
@@ -3119,7 +3660,7 @@ async def _buat_order_baru(update, context, query, user_id, user_name, paket, or
     # Polling dimulai segera setelah QR diterima buyer. Notifikasi admin berjalan di background.
     _start_payment_task(
         context.bot, order_id, paket['paket_id'], user_id, user_name,
-        total_payment, timeout_seconds=timeout_secs
+        total_payment, timeout_seconds=timeout_secs, paket=paket
     )
     spawn_background(
         _post_invoice_created_tasks(
@@ -3328,6 +3869,7 @@ async def ganti_paket_konfirm(update: Update, context: ContextTypes.DEFAULT_TYPE
             InlineKeyboardButton("❌ Batal", callback_data="ganti_paket_batal"),
         ]
     ]
+    await query.answer()
     try:
         await query.message.edit_caption(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
     except Exception:
@@ -3412,49 +3954,67 @@ async def ganti_paket_batal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.debug(f"Gagal update tampilan pembatalan ganti paket: {e}")
 
-# =================== GLOBAL PAYMENT POLLER ===================
-"""
-Satu task global memantau SEMUA order waiting, bukan satu task per order.
-Ini mengurangi beban event loop dan database saat banyak invoice aktif.
-"""
-_payment_tasks: dict = {}  # legacy tracking metadata
-_payment_tasks_lock = asyncio.Lock()
-_current_bot = None
-_global_poller_wakeup = asyncio.Event()
-_GLOBAL_POLLER_INTERVAL = 30  # detik
-_GLOBAL_PROVIDER_CONCURRENCY = 5  # max concurrent cek ke AutoGoPay
+# =================== ASYNCIO MONITORING PAYMENT TASKS ===================
 
+_payment_tasks: dict = {}
+_payment_tasks_lock = None
+_current_bot = None
+
+def _get_payment_tasks_lock() -> asyncio.Lock:
+    global _payment_tasks_lock
+    if _payment_tasks_lock is None:
+        _payment_tasks_lock = asyncio.Lock()
+    return _payment_tasks_lock
 
 async def _stop_payment_task(user_id: int):
-    """Legacy no-op: global poller menangani semua order."""
-    async with _payment_tasks_lock:
-        _payment_tasks.pop(user_id, None)
-
+    task = None
+    async with _get_payment_tasks_lock():
+        task = _payment_tasks.pop(user_id, None)
+        if task and not task.done():
+            task.cancel()
+    if task and task is not asyncio.current_task() and not task.done():
+        await asyncio.gather(task, return_exceptions=True)
 
 def _start_payment_task(bot, order_id: str, paket_id: str, user_id: int,
-                         user_name: str, amount: int, timeout_seconds: int = 1800):
-    """Legacy: cukup simpan metadata dan bangunkan global poller."""
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = asyncio.get_event_loop()
-    async with _payment_tasks_lock:
-        _payment_tasks[user_id] = {
-            "order_id": order_id,
-            "paket_id": paket_id,
-            "user_name": user_name,
-            "amount": amount,
-            "timeout_seconds": timeout_seconds,
-            "started_at": _time.monotonic(),
-        }
-    _global_poller_wakeup.set()
+                        user_name: str, amount: int, timeout_seconds: int = 1800,
+                        paket: dict = None):
+    spawn_background(
+        _start_payment_task_async(
+            bot, order_id, paket_id, user_id, user_name, amount, timeout_seconds, paket
+        ),
+        name=f"payment-bootstrap-{order_id}"
+    )
+
+async def _start_payment_task_async(bot, order_id: str, paket_id: str, user_id: int,
+                                    user_name: str, amount: int, timeout_seconds: int = 1800,
+                                    paket: dict = None):
+    old_task = None
+    async with _get_payment_tasks_lock():
+        old_task = _payment_tasks.pop(user_id, None)
+        if old_task and not old_task.done():
+            old_task.cancel()
+        # Replace/create/store dilakukan dalam satu lock agar bootstrap ganda tidak membuat task yatim.
+        task = asyncio.create_task(
+            _payment_poll_loop(
+                bot, order_id, paket_id, user_id, user_name, amount, timeout_seconds, paket
+            ),
+            name=f"payment-poll-{order_id}"
+        )
+        _payment_tasks[user_id] = task
+    if old_task and old_task is not asyncio.current_task() and not old_task.done():
+        await asyncio.gather(old_task, return_exceptions=True)
 
 
 async def _ensure_payment_task_for_order(bot, order: dict, paket: dict, user_name: str):
-    """Pastikan order ada di radar global poller."""
+    """Pastikan monitoring aktif tanpa membuat request status duplikat saat /start ditekan."""
     user_id = order.get('user_id')
     if not user_id:
         return
+    async with _get_payment_tasks_lock():
+        existing = _payment_tasks.get(user_id)
+        if existing and not existing.done():
+            return
+
     expiry_dt = parse_provider_datetime(order.get('payment_expires_at'))
     if expiry_dt is not None:
         timeout_seconds = max(1, int((expiry_dt - now_wib()).total_seconds()))
@@ -3469,6 +4029,7 @@ async def _ensure_payment_task_for_order(bot, order: dict, paket: dict, user_nam
         user_name=user_name,
         amount=amount,
         timeout_seconds=timeout_seconds,
+        paket=paket,
     )
 
 
@@ -3479,155 +4040,126 @@ def _check_order_status_sync(order_id):
             row = c.fetchone()
             return dict(row) if row else None
 
-
 async def _check_order_status(order_id):
+    row, used_async = await _asyncpg_fetchrow("SELECT status FROM orders WHERE order_id=$1", str(order_id))
+    if used_async:
+        return row
     return await run_db(_check_order_status_sync, order_id)
 
-
-async def _maybe_expire_order(bot, order: dict) -> bool:
-    """Cek apakah order sudah expired. Kalau ya, proses expiry. Return True kalau expired."""
-    order_id = order['order_id']
-    user_id = order['user_id']
-    user_name = order.get('user_name', 'User')
-    paket_id = order['paket_id']
-    amount = order.get('harga_dibayar') or 0
-
-    expiry_dt = parse_provider_datetime(order.get('payment_expires_at'))
-    if expiry_dt is None:
-        created = order.get('created_at')
-        if created:
-            if created.tzinfo is None:
-                created = created.replace(tzinfo=timezone.utc)
-            expiry_dt = created.astimezone(WIB) + timedelta(seconds=AUTOGOPAY_DEFAULT_TIMEOUT_SECONDS)
-        else:
-            expiry_dt = now_wib() + timedelta(seconds=AUTOGOPAY_DEFAULT_TIMEOUT_SECONDS)
-
-    if now_wib() < expiry_dt:
-        return False
-
-    row = await _check_order_status(order_id)
-    if not row or row['status'] != 'waiting':
-        return True
-
-    if amount:
-        await cancel_transaction(order_id, amount)
-    await update_order_status(order_id, 'expired')
-    await hapus_qris_buyer_lama(bot, order_id, user_id)
-    await set_cooldown_db(user_id)
-    cooldown_sisa = await get_cooldown_sisa_db(user_id)
-
+async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
+                             user_name: str, amount: int, timeout_seconds: int,
+                             paket: dict = None):
+    elapsed = 0
     try:
-        await bot.send_message(
-            chat_id=user_id,
-            text=(
-                "<b>⏰ SESI BERAKHIR</b>
-"
-                "========================
+        order = await get_order_by_id(order_id)
+        transaction_id = (order or {}).get("provider_transaction_id")
+        last_provider_status = str((order or {}).get("provider_status") or "").lower()
+        if not transaction_id:
+            logger.error(f"[PAYMENT] transaction_id AutoGoPay tidak ditemukan untuk {order_id}")
+            return
 
-"
-                "Pesanan telah dibatalkan otomatis.
+        last_db_check_elapsed = -30
+        while elapsed < timeout_seconds:
+            # Webhook-first: polling cepat hanya 30 detik pertama, lalu makin jarang.
+            if elapsed < 30:
+                interval = AUTOGOPAY_POLL_FAST_SECONDS
+            elif elapsed < 120:
+                interval = AUTOGOPAY_POLL_MEDIUM_SECONDS
+            elif elapsed < 300:
+                interval = AUTOGOPAY_POLL_SLOW_SECONDS
+            else:
+                interval = AUTOGOPAY_POLL_VERY_SLOW_SECONDS
 
-"
-                f"Alasan: Pembayaran tidak diterima dalam waktu yang ditentukan.
+            sleep_for = min(interval, max(1, timeout_seconds - elapsed))
+            await asyncio.sleep(sleep_for)
+            elapsed += sleep_for
 
-"
-                f"⏳ Kamu bisa membuat pesanan baru dalam <b>{cooldown_sisa} menit</b>.
+            # Cek status lokal periodik agar task berhenti jika order diubah dari jalur lain.
+            if elapsed - last_db_check_elapsed >= 30:
+                row = await _check_order_status(order_id)
+                last_db_check_elapsed = elapsed
+                if not row or row['status'] != 'waiting':
+                    return
 
-"
-                "Ketik /start untuk membuat pesanan baru."
-            ),
-            parse_mode="HTML"
+            trans = await _autogopay_get_status(transaction_id, amount)
+            if not trans:
+                continue
+            current_provider_status = str(trans.get("provider_status") or "").lower()
+            if current_provider_status and current_provider_status != last_provider_status:
+                await update_order_provider_status(order_id, current_provider_status)
+                last_provider_status = current_provider_status
+
+            if trans.get('status') == 'completed':
+                logger.info(f"[PAYMENT POLL] Settlement terdeteksi: {order_id}")
+                await _handle_payment_success(
+                    bot, order_id, paket_id, user_id, user_name, amount, trans, paket=paket
+                )
+                return
+
+        row = await _check_order_status(order_id)
+        if not row or row['status'] != 'waiting':
+            return
+
+        trans = await _autogopay_get_status(transaction_id, amount)
+        if trans:
+            current_provider_status = str(trans.get("provider_status") or "").lower()
+            if current_provider_status and current_provider_status != last_provider_status:
+                await update_order_provider_status(order_id, current_provider_status)
+        if trans and trans.get('status') == 'completed':
+            await _handle_payment_success(
+                bot, order_id, paket_id, user_id, user_name, amount, trans, paket=paket
+            )
+            return
+
+        if amount:
+            await cancel_transaction(order_id, amount)
+        await update_order_status(order_id, 'expired')
+        spawn_background(
+            hapus_qris_buyer_lama(bot, order_id, user_id),
+            name=f"cleanup-expired-qr-{order_id}"
         )
-    except Exception as e:
-        logger.debug(f"Gagal kirim notif expired ke buyer: {e}")
-
-    await hapus_notif_lama(bot, order_id)
-    paket_exp = await get_product(paket_id) or {"emoji": "📦", "nama": paket_id}
-    msg_id = await kirim_notif(
-        bot,
-        _format_order_notif(
-            "⏰ <b>ORDER EXPIRED</b>",
-            user_name, user_id, paket_exp, order_id,
-            extra="ℹ️ Buyer tidak bayar sampai waktu habis"
-        )
-    )
-    if msg_id:
-        await set_admin_msg_id(order_id, msg_id)
-
-    async with _payment_tasks_lock:
-        _payment_tasks.pop(user_id, None)
-    return True
-
-
-async def _check_single_order_payment(bot, order: dict):
-    """Cek status provider untuk satu order dan proses jika completed."""
-    order_id = order['order_id']
-    user_id = order['user_id']
-    user_name = order.get('user_name', 'User')
-    paket_id = order['paket_id']
-    amount = order.get('harga_dibayar') or 0
-    transaction_id = order.get('provider_transaction_id')
-
-    if not transaction_id:
-        logger.error(f"[PAYMENT] transaction_id AutoGoPay tidak ditemukan untuk {order_id}")
-        return
-
-    trans = await _autogopay_get_status(transaction_id, amount)
-    if not trans:
-        return
-
-    current_provider_status = str(trans.get("provider_status") or "").lower()
-    if current_provider_status:
-        await update_order_provider_status(order_id, current_provider_status)
-
-    if trans.get('status') == 'completed':
-        logger.info(f"[GLOBAL POLLER] Settlement terdeteksi: {order_id}")
-        await _handle_payment_success(bot, order_id, paket_id, user_id, user_name, amount, trans)
-        async with _payment_tasks_lock:
-            _payment_tasks.pop(user_id, None)
-
-
-async def _global_payment_poller(bot):
-    """Satu task yang memantau semua order waiting secara berkala."""
-    logger.info("[GLOBAL POLLER] Payment poller global dimulai.")
-    provider_sem = asyncio.Semaphore(_GLOBAL_PROVIDER_CONCURRENCY)
-
-    while True:
-        try:
-            await asyncio.wait_for(_global_poller_wakeup.wait(), timeout=_GLOBAL_POLLER_INTERVAL)
-            _global_poller_wakeup.clear()
-        except asyncio.TimeoutError:
-            pass
-        except asyncio.CancelledError:
-            break
+        await set_cooldown_db(user_id)
+        cooldown_sisa = await get_cooldown_sisa_db(user_id)
 
         try:
-            orders = await get_all_waiting()
-            if not orders:
-                continue
-
-            still_waiting = []
-            for order in orders:
-                expired = await _maybe_expire_order(bot, order)
-                if not expired:
-                    still_waiting.append(order)
-
-            if not still_waiting:
-                continue
-
-            async def _sem_check(order):
-                async with provider_sem:
-                    await _check_single_order_payment(bot, order)
-
-            await asyncio.gather(*[_sem_check(o) for o in still_waiting], return_exceptions=True)
-
-        except asyncio.CancelledError:
-            break
+            await bot.send_message(
+                chat_id=user_id,
+                text=(
+                    "<b>⏰ SESI BERAKHIR</b>\n"
+                    "========================\n\n"
+                    "Pesanan telah dibatalkan otomatis.\n\n"
+                    f"Alasan: Pembayaran tidak diterima dalam waktu yang ditentukan.\n\n"
+                    f"⏳ Kamu bisa membuat pesanan baru dalam <b>{cooldown_sisa} menit</b>.\n\n"
+                    "Ketik /start untuk membuat pesanan baru."
+                ),
+                parse_mode="HTML"
+            )
         except Exception as e:
-            logger.error(f"[GLOBAL POLLER] Error di loop: {e}", exc_info=True)
-            await asyncio.sleep(10)
+            logger.debug(f"Gagal kirim notif expired ke buyer: {e}")
 
-    logger.info("[GLOBAL POLLER] Payment poller global berhenti.")
+        async def _expired_admin_finalize():
+            await hapus_notif_lama(bot, order_id)
+            paket_exp = paket or await get_product(paket_id) or {"emoji": "📦", "nama": paket_id}
+            msg_id = await kirim_notif(
+                bot,
+                _format_order_notif(
+                    "⏰ <b>ORDER EXPIRED</b>",
+                    user_name, user_id, paket_exp, order_id,
+                    extra="ℹ️ Buyer tidak bayar sampai waktu habis"
+                )
+            )
+            if msg_id:
+                await set_admin_msg_id(order_id, msg_id)
+
+        spawn_background(_expired_admin_finalize(), name=f"expired-admin-{order_id}")
+
+    except asyncio.CancelledError:
+        pass
+    finally:
+        current_task = asyncio.current_task()
+        async with _get_payment_tasks_lock():
+            if _payment_tasks.get(user_id) is current_task:
+                _payment_tasks.pop(user_id, None)
 
 def _split_required_ids(requires_str: str) -> list:
     return [pid.strip() for pid in (requires_str or '').split(',') if pid.strip()]
@@ -3639,8 +4171,9 @@ async def _build_prereq_progress(user_id: int, requires_str: str, parent_order_i
 
     lines = []
     buttons = []
+    products_by_id = {p['paket_id']: p for p in await get_all_products()}
     for pid in all_req_ids:
-        p_obj = await get_product(pid)
+        p_obj = products_by_id.get(pid)
         label = f"{p_obj['emoji']} {p_obj['nama']}" if p_obj else pid
         if pid in missing_set:
             lines.append(f"❌ {esc(label)}")
@@ -3685,7 +4218,6 @@ async def _replace_admin_order_status(bot, order_id: str, text: str, reply_marku
     return msg_id
 
 async def _send_delivery_failed_alert(bot, order_id: str, user_id: int, user_name: str, paket: dict, error: Exception):
-    await reset_delivery_claim(order_id, str(error)[:500])
     try:
         await bot.send_message(
             chat_id=ADMIN_ID,
@@ -3708,10 +4240,11 @@ async def _send_buyer_product_link(bot, user_id: int, order_id: str, paket: dict
     link = group_link or (paket.get("link") or DEFAULT_LINK)
     link_section = _build_link_section(group_link, link)
 
-    await bot.send_message(
-        chat_id=user_id,
-        text=(
-            f"{title}\n"
+    await telegram_send_rate_retry(
+        lambda: bot.send_message(
+            chat_id=user_id,
+            text=(
+                f"{title}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n\n"
             f"📦 <b>Produk</b>\n"
             f"Paket : {esc(paket.get('emoji','📦'))} {esc(paket.get('nama','Produk'))}\n"
@@ -3723,9 +4256,11 @@ async def _send_buyer_product_link(bot, user_id: int, order_id: str, paket: dict
             f"Bantu kami berkembang dengan memberikan ulasan di bawah ini:"
         ),
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⭐ Beri Ulasan / Testimoni", callback_data=f"rate_start|{order_id}")]
-        ])
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⭐ Beri Ulasan / Testimoni", callback_data=f"rate_start|{order_id}")]
+            ])
+        ),
+        label=f"kirim link buyer {order_id}",
     )
     return link, bool(group_link)
 
@@ -3820,9 +4355,15 @@ async def _notify_parent_prereq_progress(bot, user_id: int, user_name: str, pare
 
 async def _process_completed_order_delivery(bot, order_id: str, paket_id: str, user_id: int,
                                             user_name: str, paid_amount: int,
-                                            source_title: str = "✅ <b>PEMBAYARAN BERHASIL</b>"):
-    await hapus_qris_buyer_lama(bot, order_id, user_id)
-    paket = await get_product(paket_id) or {
+                                            source_title: str = "✅ <b>PEMBAYARAN BERHASIL</b>",
+                                            paket: dict = None):
+    # Cleanup QR tidak boleh menahan pengiriman akses buyer.
+    spawn_background(
+        hapus_qris_buyer_lama(bot, order_id, user_id),
+        name=f"cleanup-paid-qr-{order_id}"
+    )
+    paket = copy.deepcopy(paket) if paket else await get_product(paket_id)
+    paket = paket or {
         "emoji": "📦", "nama": "Produk", "harga": paid_amount, "link": DEFAULT_LINK,
         "requires_paket_ids": ""
     }
@@ -3843,72 +4384,74 @@ async def _process_completed_order_delivery(bot, order_id: str, paket_id: str, u
                 f"📋 Syarat  : {progress['fulfilled_count']}/{progress['total_count']} terpenuhi\n\n"
                 f"{progress['text']}"
             )
-            await _replace_admin_order_status(
-                bot,
-                order_id,
-                _format_order_notif(
-                    source_title,
-                    user_name, user_id, paket, order_id,
-                    amount=paid_amount,
-                    extra=extra_prereq
+            spawn_background(
+                _replace_admin_order_status(
+                    bot,
+                    order_id,
+                    _format_order_notif(
+                        source_title, user_name, user_id, paket, order_id,
+                        amount=paid_amount, extra=extra_prereq
+                    ),
+                    reply_markup=_admin_prereq_action_keyboard(order_id)
                 ),
-                reply_markup=_admin_prereq_action_keyboard(order_id)
+                name=f"paid-prereq-admin-{order_id}"
             )
             return
 
     claimed = await atomic_claim_for_delivery(order_id)
     if not claimed:
-        logger.info(f"[DELIVERY] Order {order_id} sudah diklaim/terkirim, skip delivery duplikat.")
+        logger.debug(f"[DELIVERY] Order {order_id} sudah diklaim/terkirim, skip delivery duplikat.")
         return
 
-    kirim_berhasil = False
     link = None
     try:
+        # Ini critical path: akses buyer dikirim sebelum cleanup/notif admin.
         link, _ = await _send_buyer_product_link(bot, user_id, order_id, paket, paid_amount, source_title)
+        await set_sent_link(order_id, link)
         kirim_berhasil = True
     except Exception as e:
+        kirim_berhasil = False
         logger.error(f"[PAYMENT] Gagal kirim link ke buyer {user_id}: {e}")
-        await _send_delivery_failed_alert(bot, order_id, user_id, user_name, paket, e)
-
-    await hapus_notif_lama(bot, order_id)
-
-    if kirim_berhasil:
-        await set_sent_link(order_id, link)
-        extra_paid = "🔗 Link produk berhasil dikirim ✅"
-    else:
-        extra_paid = "⚠️ Link gagal dikirim — cek manual"
-
-    msg_id = await kirim_notif(
-        bot,
-        _format_order_notif(
-            source_title,
-            user_name, user_id, paket, order_id,
-            amount=paid_amount,
-            extra=extra_paid
+        await reset_delivery_claim(order_id, str(e)[:500])
+        spawn_background(
+            _send_delivery_failed_alert(bot, order_id, user_id, user_name, paket, e),
+            name=f"delivery-failed-alert-{order_id}"
         )
-    )
-    if msg_id:
-        await set_admin_msg_id(order_id, msg_id)
 
-    if kirim_berhasil:
-        await _auto_deliver_pending_prereq_orders(
-            bot, user_id, user_name,
-            purchased_paket_id=paket_id,
-            exclude_order_id=order_id
+    async def _finalize_after_buyer():
+        await hapus_notif_lama(bot, order_id)
+        extra_paid = "🔗 Link produk berhasil dikirim ✅" if kirim_berhasil else "⚠️ Link gagal dikirim — cek manual"
+        msg_id = await kirim_notif(
+            bot,
+            _format_order_notif(
+                source_title, user_name, user_id, paket, order_id,
+                amount=paid_amount, extra=extra_paid
+            )
         )
+        if msg_id:
+            await set_admin_msg_id(order_id, msg_id)
+        if kirim_berhasil:
+            await _auto_deliver_pending_prereq_orders(
+                bot, user_id, user_name,
+                purchased_paket_id=paket_id,
+                exclude_order_id=order_id
+            )
+
+    # Semua pekerjaan admin/prerequisite lanjutan tidak menahan critical path buyer.
+    spawn_background(_finalize_after_buyer(), name=f"paid-finalize-{order_id}")
 
 async def _handle_payment_success(bot, order_id: str, paket_id: str, user_id: int,
-                                   user_name: str, amount: int, trans: dict):
-    # Proteksi atomik ganda guna mengunci state transaksi selesai
+                                  user_name: str, amount: int, trans: dict, paket: dict = None):
     success = await mark_order_completed(order_id)
     if not success:
-        logger.info(f"[PAYMENT] Order ID {order_id} sudah diproses sebelumnya, membatalkan duplikasi.")
+        logger.debug(f"[PAYMENT] Order ID {order_id} sudah diproses sebelumnya, skip duplikasi.")
         return
 
     paid_amount = _safe_int(trans.get('amount', amount), amount)
     await _process_completed_order_delivery(
         bot, order_id, paket_id, user_id, user_name, paid_amount,
-        source_title="✅ <b>PEMBAYARAN BERHASIL</b>"
+        source_title="✅ <b>PEMBAYARAN BERHASIL</b>",
+        paket=paket,
     )
 
 # =================== AUTO-DELIVER PENDING PREREQ ORDERS ===================
@@ -3956,22 +4499,30 @@ async def _auto_deliver_pending_prereq_orders(bot, user_id: int, user_name: str,
             )
         except Exception as e:
             logger.error(f"[AUTO-PREREQ] Gagal kirim link ke buyer {user_id}: {e}")
-            await _send_delivery_failed_alert(bot, oid, user_id, user_name, paket, e)
+            await reset_delivery_claim(oid, str(e)[:500])
+            spawn_background(
+                _send_delivery_failed_alert(bot, oid, user_id, user_name, paket, e),
+                name=f"auto-prereq-failed-{oid}",
+            )
             continue
 
         await set_sent_link(oid, link)
-        await hapus_notif_lama(bot, oid)
-        msg_id = await kirim_notif(
-            bot,
-            _format_order_notif(
-                "✅ <b>LINK AUTO-TERKIRIM</b>",
-                user_name, user_id, paket, oid,
-                amount=order.get('harga_dibayar', 0),
-                extra="🔓 Link otomatis dikirim karena semua syarat terpenuhi ✅"
+
+        async def _finalize_auto_prereq(order_id=oid, order_data=order, paket_data=paket):
+            await hapus_notif_lama(bot, order_id)
+            msg_id = await kirim_notif(
+                bot,
+                _format_order_notif(
+                    "✅ <b>LINK AUTO-TERKIRIM</b>",
+                    user_name, user_id, paket_data, order_id,
+                    amount=order_data.get('harga_dibayar', 0),
+                    extra="🔓 Link otomatis dikirim karena semua syarat terpenuhi ✅"
+                )
             )
-        )
-        if msg_id:
-            await set_admin_msg_id(oid, msg_id)
+            if msg_id:
+                await set_admin_msg_id(order_id, msg_id)
+
+        spawn_background(_finalize_auto_prereq(), name=f"auto-prereq-finalize-{oid}")
 
 # =================== ADMIN: KIRIM LINK PREREQ MANUAL ===================
 
@@ -4854,7 +5405,8 @@ async def admin_manual_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
         user_id=target_user_id,
         user_name=order.get('user_name', '-'),
         paid_amount=order.get('harga_dibayar') or paket.get('harga', 0),
-        source_title="✅ <b>DIKONFIRMASI MANUAL</b>"
+        source_title="✅ <b>DIKONFIRMASI MANUAL</b>",
+        paket=paket,
     )
 
     refreshed = await get_order_by_id(order_id)
@@ -5112,7 +5664,7 @@ def _generate_full_export_sync():
     return products, orders, banned, testimonials, settings, admins
 
 async def _generate_json_export():
-    products, orders, banned, testimonials, settings, admins = await run_db(_generate_full_export_sync)
+    products, orders, banned, testimonials, settings, admins = await run_db_admin(_generate_full_export_sync)
     payload = {
         "meta": {
             "app": "Hyper Family Store",
@@ -5143,7 +5695,7 @@ async def _kirim_backup(bot):
     ts = now_wib().strftime('%Y%m%d_%H%M%S')
     zip_name = f"backup_{ts}.zip"
     try:
-        products, orders, banned, testimonials, settings, admins = await run_db(_generate_full_export_sync)
+        products, orders, banned, testimonials, settings, admins = await run_db_admin(_generate_full_export_sync)
 
         def _build_backup_zip():
             payload = {
@@ -5402,10 +5954,6 @@ async def handle_json_document(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("❌ File harus berformat <code>.json</code>. Coba lagi dengan /import_json.", parse_mode="HTML")
         return
 
-    if doc.file_size and doc.file_size > 5 * 1024 * 1024:
-        await update.message.reply_text("❌ File terlalu besar. Maksimal <b>5 MB</b>.", parse_mode="HTML")
-        return
-
     context.user_data.pop('awaiting_json_import', None)
     status_msg = await update.message.reply_text("⏳ Membaca file JSON...")
 
@@ -5422,7 +5970,11 @@ async def handle_json_document(update: Update, context: ContextTypes.DEFAULT_TYP
         await status_msg.edit_text("❌ Format JSON tidak valid. Pastikan file berasal dari /export.")
         return
 
-    result = await run_db(_import_json_data_sync, data)
+    result = await run_db_admin(_import_json_data_sync, data)
+    _invalidate_products_cache()
+    _settings_cache.clear()
+    _banned_cache.clear()
+    _invalidate_order_caches(None)
     ok_p, fail_p, ok_o, fail_o, ok_b, fail_b, ok_t, fail_t, ok_s, fail_s, ok_a, fail_a = result
 
     await status_msg.edit_text(
@@ -5508,7 +6060,7 @@ def _get_buyers_for_reminder_sync(hari: int):
             return [dict(r) for r in c.fetchall()]
 
 async def _send_buyer_reminders(bot):
-    buyers = await run_db(_get_buyers_for_reminder_sync, REMINDER_HARI)
+    buyers = await run_db_admin(_get_buyers_for_reminder_sync, REMINDER_HARI)
     if not buyers:
         return
     logger.info(f"[REMINDER] Mengirim reminder ke {len(buyers)} buyer...")
@@ -5593,36 +6145,16 @@ async def _cleanup_cooldowns_loop():
         except Exception as e:
             logger.error(f"[CLEANUP] Error di cleanup cooldown loop: {e}")
 
-
-async def _cleanup_memory_caches():
-    """Bersihkan in-memory cache yang sudah tua agar tidak membengkak."""
-    global _banned_cache, _cooldown_memory_cache, _cancel_count_cache
-    now_mono = _time.monotonic()
-    stale_banned = [uid for uid, (val, exp) in _banned_cache.items() if now_mono > exp]
-    for uid in stale_banned:
-        _banned_cache.pop(uid, None)
-    stale_cool = [uid for uid, exp in _cooldown_memory_cache.items() if now_utc() >= exp]
-    for uid in stale_cool:
-        _cooldown_memory_cache.pop(uid, None)
-    if len(_cancel_count_cache) > 5000:
-        _cancel_count_cache.clear()
-    logger.info(f"[MEMORY CLEANUP] Banned cache: {len(_banned_cache)}, Cooldown mem: {len(_cooldown_memory_cache)}, Cancel count: {len(_cancel_count_cache)}")
-
-
-async def _memory_cache_cleanup_loop():
-    while True:
-        try:
-            await asyncio.sleep(21600)  # 6 jam
-            await _cleanup_memory_caches()
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            logger.error(f"[MEMORY CLEANUP] Error: {e}")
-
 # =================== ADMIN: BROADCAST ===================
 
 _blast_tasks: dict = {}
-_blast_tasks_lock = asyncio.Lock()
+_blast_tasks_lock = None
+
+def _get_blast_tasks_lock() -> asyncio.Lock:
+    global _blast_tasks_lock
+    if _blast_tasks_lock is None:
+        _blast_tasks_lock = asyncio.Lock()
+    return _blast_tasks_lock
 
 async def _run_broadcast(bot, admin_id: int, buyers: list, text_blast: str):
     total = len(buyers)
@@ -5693,7 +6225,7 @@ async def _run_broadcast(bot, admin_id: int, buyers: list, text_blast: str):
         logger.info(f"[BLAST] Broadcast dibatalkan oleh admin {admin_id}.")
 
     finally:
-        async with _blast_tasks_lock:
+        async with _get_blast_tasks_lock():
             _blast_tasks.pop(admin_id, None)
         is_cancelled = sent + failed + skipped < total
         try:
@@ -5768,7 +6300,7 @@ async def blast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     task = asyncio.create_task(_run_broadcast(context.bot, admin_id, buyers, text_blast))
-    async with _blast_tasks_lock:
+    async with _get_blast_tasks_lock():
         _blast_tasks[admin_id] = task
 
 async def blast_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5776,7 +6308,7 @@ async def blast_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer("⛔ Menghentikan broadcast...")
 
     admin_id = query.from_user.id
-    async with _blast_tasks_lock:
+    async with _get_blast_tasks_lock():
         task = _blast_tasks.pop(admin_id, None)
     if task and not task.done():
         task.cancel()
@@ -6380,7 +6912,8 @@ async def admin_konfirmasi(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_id=user_id,
             user_name=order.get('user_name', '-'),
             paid_amount=order.get('harga_dibayar') or paket.get('harga', 0),
-            source_title="✅ <b>ORDER SELESAI (KONFIRMASI MANUAL)</b>"
+            source_title="✅ <b>ORDER SELESAI (KONFIRMASI MANUAL)</b>",
+            paket=paket,
         )
 
         refreshed = await get_order_by_id(order["order_id"])
@@ -7365,6 +7898,31 @@ async def admpanel_admin_del(update: Update, context: ContextTypes.DEFAULT_TYPE)
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_admins")]])
     )
 
+# =================== GLOBAL ERROR HANDLER ===================
+
+async def global_error_handler(update, context: ContextTypes.DEFAULT_TYPE):
+    error = context.error
+    user = getattr(update, 'effective_user', None) if update is not None else None
+    chat = getattr(update, 'effective_chat', None) if update is not None else None
+    update_id = getattr(update, 'update_id', '-') if update is not None else '-'
+    logger.error(
+        f"[UNHANDLED] update_id={update_id} user_id={getattr(user, 'id', '-')} "
+        f"chat_id={getattr(chat, 'id', '-')} error={error}",
+        exc_info=(type(error), error, error.__traceback__) if error else True,
+    )
+
+def _install_uvloop_if_available():
+    if uvloop is None or os.name == 'nt' or os.environ.get('DISABLE_UVLOOP', '').strip() == '1':
+        return False
+    try:
+        # PTB menjalankan event loop sendiri; install policy sebelum main() membuat run_polling memakai uvloop.
+        uvloop.install()
+        logger.info("[PERFORMANCE] uvloop aktif.")
+        return True
+    except Exception as exc:
+        logger.warning(f"[PERFORMANCE] uvloop tidak dapat diaktifkan, fallback asyncio: {exc}")
+        return False
+
 # =================== MAIN ENTRYPOINT ===================
 
 def main():
@@ -7379,12 +7937,21 @@ def main():
         .connection_pool_size(TELEGRAM_CONNECTION_POOL_SIZE)
         .pool_timeout(TELEGRAM_POOL_TIMEOUT_SECONDS)
     )
+    if AIORateLimiter is not None:
+        try:
+            builder = builder.rate_limiter(
+                AIORateLimiter(overall_max_rate=28, overall_time_period=1, max_retries=1)
+            )
+            logger.info("[TELEGRAM] AIORateLimiter aktif.")
+        except Exception as exc:
+            logger.info(f"[TELEGRAM] Rate limiter opsional tidak aktif: {exc}")
     if PerChatUpdateProcessor is not None:
         builder = builder.concurrent_updates(PerChatUpdateProcessor(BOT_CONCURRENT_UPDATES))
     else:
         # PTB 20.0-20.3: tetap paralel, tetapi tanpa serializer per-chat bawaan kustom.
         builder = builder.concurrent_updates(BOT_CONCURRENT_UPDATES)
     app = builder.build()
+    app.add_error_handler(global_error_handler)
 
     # User Commands
     app.add_handler(CommandHandler("start",   start))
@@ -7527,10 +8094,10 @@ def main():
 
     logger.info(
         f"Bot Hyper Family Store berjalan | concurrent={BOT_CONCURRENT_UPDATES} | "
-        f"telegram_pool={TELEGRAM_CONNECTION_POOL_SIZE} | db_pool={DB_POOL_MAX} | "
-        f"global_poller_interval={_GLOBAL_POLLER_INTERVAL}s | stats_cache_ttl={STATS_CACHE_TTL_SECONDS}s"
+        f"telegram_pool={TELEGRAM_CONNECTION_POOL_SIZE} | db_pool={DB_POOL_MAX}"
     )
     app.run_polling(allowed_updates=["message", "callback_query", "chat_join_request"])
 
 if __name__ == "__main__":
+    _install_uvloop_if_available()
     main()

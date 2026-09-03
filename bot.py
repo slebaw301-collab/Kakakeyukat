@@ -3752,6 +3752,11 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _callback_feedback(query, context, "🚫 Akun kamu diblokir. Hubungi admin.")
         return
 
+    cooldown_sisa = await get_cooldown_sisa_db(user_id)
+    if cooldown_sisa > 0:
+        await _show_cooldown_alert(query, cooldown_sisa)
+        return
+
     products = await get_all_products()
     aktif = [p for p in products if p.get('aktif', True)]
     if not aktif:
@@ -3786,6 +3791,11 @@ async def pilih_paket(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
     await _fast_callback_ack(query)
+
+    cooldown_sisa = await get_cooldown_sisa_db(user_id)
+    if cooldown_sisa > 0:
+        await _show_cooldown_alert(query, cooldown_sisa)
+        return
 
     paket_id = query.data.replace("pilih_", "")
     banned, paket = await asyncio.gather(

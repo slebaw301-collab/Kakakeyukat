@@ -292,7 +292,9 @@ AUTOGOPAY_POLL_MEDIUM_SECONDS = _env_int("AUTOGOPAY_POLL_MEDIUM_SECONDS", 10, 5,
 AUTOGOPAY_POLL_SLOW_SECONDS = _env_int("AUTOGOPAY_POLL_SLOW_SECONDS", 20, 10, 120)
 AUTOGOPAY_POLL_VERY_SLOW_SECONDS = _env_int("AUTOGOPAY_POLL_VERY_SLOW_SECONDS", 30, 15, 180)
 
-DEFAULT_LINK = "https://t.me/Kikukkvd"
+ADMIN_USERNAME = "@Gilbiie"
+ADMIN_URL = "https://t.me/Gilbiie"
+DEFAULT_LINK = ADMIN_URL
 
 if not TOKEN:
     raise ValueError("BOT_TOKEN tidak di-set!")
@@ -307,6 +309,15 @@ if not AUTOGOPAY_API_KEY:
 # =================== CONCURRENCY & BACKGROUND TASKS ===================
 _background_tasks: set = set()
 _invoice_creation_in_progress: set = set()
+_user_notice_locks = None
+
+
+def _get_user_notice_lock(user_id: int) -> asyncio.Lock:
+    """Serialisasi notifikasi status per buyer agar spam command tidak membuat duplikat."""
+    global _user_notice_locks
+    if _user_notice_locks is None:
+        _user_notice_locks = [asyncio.Lock() for _ in range(64)]
+    return _user_notice_locks[int(user_id) % len(_user_notice_locks)]
 
 
 def claim_invoice_creation(user_id: int) -> bool:
@@ -335,6 +346,17 @@ async def _callback_feedback(query, context, text: str):
         await query.message.reply_text(text)
     except Exception:
         await context.bot.send_message(chat_id=query.from_user.id, text=text)
+
+
+async def _show_cooldown_alert(query, sisa: int):
+    """Feedback cooldown lewat alert callback agar tidak menambah bubble chat."""
+    try:
+        await query.answer(
+            f"⏳ Cooldown aktif. Coba lagi dalam {sisa} menit.",
+            show_alert=True,
+        )
+    except Exception as exc:
+        logger.debug(f"[COOLDOWN] Gagal menampilkan alert: {exc}")
 
 
 # Pisahkan antrean query database dari pekerjaan CPU/file (QR, ZIP, JSON).
@@ -1061,12 +1083,12 @@ def init_db():
                     emoji TEXT DEFAULT '📦',
                     deskripsi TEXT DEFAULT '',
                     harga INTEGER NOT NULL,
-                    link TEXT DEFAULT 'https://t.me/Kikukkvd',
+                    link TEXT DEFAULT 'https://t.me/Gilbiie',
                     group_chat_id TEXT DEFAULT NULL,
                     aktif BOOLEAN DEFAULT TRUE
                 )
             """)
-            c.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS link TEXT DEFAULT 'https://t.me/Kikukkvd'")
+            c.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS link TEXT DEFAULT 'https://t.me/Gilbiie'")
             c.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS group_chat_id TEXT DEFAULT NULL")
             c.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS aktif BOOLEAN DEFAULT TRUE")
             c.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS requires_paket_ids TEXT DEFAULT NULL")
@@ -1105,6 +1127,7 @@ def init_db():
             """)
             c.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS admin_msg_id BIGINT DEFAULT NULL")
             c.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS buyer_msg_id BIGINT DEFAULT NULL")
+            c.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS prereq_update_msg_id BIGINT DEFAULT NULL")
             c.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS sent_link TEXT DEFAULT NULL")
             c.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_status TEXT DEFAULT 'not_sent'")
             c.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_error TEXT DEFAULT NULL")
@@ -1182,13 +1205,24 @@ def init_db():
 
             for key, val in [
                 ('link_testimoni', 'https://t.me/+7zsdSrwYIG8wOTg1'),
-                ('link_admin', 'https://t.me/Kikukkvd'),
+                ('link_admin', 'https://t.me/Gilbiie'),
                 ('testimoni_channel_id', ''),
             ]:
                 c.execute(
                     "INSERT INTO settings (key, value) VALUES (%s, %s) ON CONFLICT DO NOTHING",
                     (key, val)
                 )
+
+            # Migrasikan link admin lama agar tombol/menu yang tersimpan di DB
+            # ikut menunjuk ke username baru.
+            c.execute(
+                "UPDATE settings SET value=%s WHERE key='link_admin' AND value IN (%s, %s)",
+                (ADMIN_URL, 'https://t.me/Kikukkvd', '@Kikukkvd')
+            )
+            c.execute(
+                "UPDATE products SET link=%s WHERE link IN (%s, %s)",
+                (ADMIN_URL, 'https://t.me/Kikukkvd', '@Kikukkvd')
+            )
 
             c.execute("SELECT COUNT(*) as cnt FROM products")
             row = c.fetchone()
@@ -2155,6 +2189,14 @@ def get_completed_order_for_user(order_id: str, user_id: int):
             row = c.fetchone()
             return dict(row) if row else None
 
+
+
+@async_wrap
+def set_prereq_update_msg_id(order_id, msg_id):
+    with db_session_safe() as conn:
+        with conn.cursor() as c:
+            c.execute("UPDATE orders SET prereq_update_msg_id=%s WHERE order_id=%s", (msg_id, order_id))
+
 @async_wrap
 def check_prerequisites_sync(user_id: int, requires_paket_ids_str: str) -> list:
     """Cek pemenuhan syarat pembelian paket."""
@@ -2429,6 +2471,11 @@ def _get_setting_sync(key):
             row = c.fetchone()
             return row['value'] if row else None
 
+def _normalize_setting_value(key, value):
+    if key == 'link_admin' and value in ('https://t.me/Kikukkvd', '@Kikukkvd'):
+        return ADMIN_URL
+    return value
+
 async def get_setting(key, default=None):
     global _settings_cache_lock
     hit, cached_val = _settings_cache_get(key)
@@ -2447,6 +2494,7 @@ async def get_setting(key, default=None):
                 val = row.get('value') if row else None
             else:
                 val = await run_db(_get_setting_sync, key)
+            val = _normalize_setting_value(key, val)
             if version == _settings_cache_versions.get(key, 0):
                 _settings_cache_set(key, val)
                 return val if val is not None else default
@@ -2790,6 +2838,34 @@ async def get_product_link(bot, paket, order_id):
 async def is_maintenance() -> bool:
     return await get_setting('maintenance') == '1'
 
+
+async def _reject_new_invoice_during_maintenance(query, context, user_id: int) -> bool:
+    """Blokir invoice baru saat maintenance tanpa mengganggu invoice yang sudah ada."""
+    if not await is_maintenance():
+        return False
+
+    notice = (
+        "⚙️ Maintenance aktif.\n"
+        "Invoice baru sementara ditutup untuk semua pengguna.\n"
+        "Invoice yang sudah dibuat tetap diproses."
+    )
+    try:
+        if query is not None:
+            # Alert callback tidak membuat pesan baru sehingga chat tetap bersih.
+            await query.answer(notice, show_alert=True)
+        else:
+            await context.bot.send_message(chat_id=user_id, text=notice)
+    except Exception:
+        if query is not None:
+            try:
+                if getattr(query.message, 'photo', None):
+                    await query.message.edit_caption(notice)
+                else:
+                    await query.edit_message_text(notice)
+            except Exception:
+                await _callback_feedback(query, context, notice)
+    return True
+
 # =================== NOTIFIKASI ORDER ===================
 
 def _compact_waktu(value=None) -> str:
@@ -2965,7 +3041,7 @@ async def build_main_menu_text():
 
 async def build_main_menu_keyboard():
     link_testi = await get_setting('link_testimoni', 'https://t.me/+7zsdSrwYIG8wOTg1')
-    link_cs = await get_setting('link_admin', 'https://t.me/Kikukkvd')
+    link_cs = await get_setting('link_admin', ADMIN_URL)
     return [
         [InlineKeyboardButton("🛒 Beli Sekarang", callback_data="buy")],
         [
@@ -3024,6 +3100,22 @@ async def hapus_msg_user_lama(context, user_id, keep_last=1):
 
     spawn_background(_cleanup(), name=f"cleanup-user-{user_id}")
 
+
+async def _send_user_message_replace(context: ContextTypes.DEFAULT_TYPE, user_id: int,
+                                     text: str, parse_mode: str = None,
+                                     reply_markup=None, keep_last: int = 1):
+    """Kirim pesan status secara serial lalu bersihkan status lama milik buyer."""
+    async with _get_user_notice_lock(user_id):
+        msg = await context.bot.send_message(
+            chat_id=user_id,
+            text=text,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup,
+        )
+        simpan_msg_user(context, user_id, msg.message_id)
+        await hapus_msg_user_lama(context, user_id, keep_last=keep_last)
+        return msg
+
 # =================== COOLDOWN MESSAGE ANTI-SPAM ===================
 COOLDOWN_NOTICE_DEBOUNCE_SECONDS = 5
 
@@ -3035,40 +3127,85 @@ async def _safe_delete_chat_message(bot, chat_id, message_id, label="pesan"):
     except Exception as e:
         logger.debug(f"Gagal hapus {label}: {e}")
 
+
+async def _clear_user_notice(context, user_id: int, key: str, label: str):
+    """Hapus pesan status lama yang disimpan per user, jika masih ada."""
+    message_id = context.user_data.pop(key, None)
+    if message_id:
+        await _safe_delete_chat_message(context.bot, user_id, message_id, label)
+
+
+async def _send_single_maintenance_notice(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    """Tampilkan satu notice maintenance; /start berulang hanya mengganti notice lama."""
+    chat_id = update.effective_chat.id
+    async with _get_user_notice_lock(user_id):
+        if update.message:
+            await _safe_delete_chat_message(
+                context.bot, chat_id, update.message.message_id, "pesan /start user"
+            )
+
+        last_msg_id = context.user_data.get('_maintenance_notice_msg_id')
+        if last_msg_id:
+            await _safe_delete_chat_message(
+                context.bot, chat_id, last_msg_id, "pesan maintenance lama"
+            )
+
+        msg = await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "⚙️ <b>BOT SEDANG MAINTENANCE</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n\n"
+                "Bot sedang diperbaiki sementara.\n"
+                "Invoice baru ditutup sampai maintenance selesai.\n"
+                "Invoice yang sudah dibuat tetap diproses.\n\n"
+                f"Hubungi admin: {ADMIN_USERNAME}"
+            ),
+            parse_mode="HTML",
+        )
+        context.user_data['_maintenance_notice_msg_id'] = msg.message_id
+        simpan_msg_user(context, user_id, msg.message_id)
+        await hapus_msg_user_lama(context, user_id, keep_last=1)
+
+
 async def _send_single_cooldown_notice(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, sisa: int):
     """Kirim satu pesan cooldown saja agar chat tidak numpuk saat user spam /start."""
     chat_id = update.effective_chat.id
 
-    # Bersihkan command /start dari user jika Telegram mengizinkan.
-    if update.message:
-        await _safe_delete_chat_message(context.bot, chat_id, update.message.message_id, "pesan /start user")
+    async with _get_user_notice_lock(user_id):
+        # Bersihkan command /start dari user jika Telegram mengizinkan.
+        if update.message:
+            await _safe_delete_chat_message(
+                context.bot, chat_id, update.message.message_id, "pesan /start user"
+            )
 
-    now_mono = _time.monotonic()
-    last_ts = context.user_data.get('_cooldown_notice_ts', 0)
-    last_msg_id = context.user_data.get('_cooldown_notice_msg_id')
+        now_mono = _time.monotonic()
+        last_ts = context.user_data.get('_cooldown_notice_ts', 0)
+        last_msg_id = context.user_data.get('_cooldown_notice_msg_id')
 
-    # Debounce ringan: kalau user spam sangat cepat, cukup hapus /start-nya tanpa kirim ulang.
-    if last_msg_id and (now_mono - last_ts) < COOLDOWN_NOTICE_DEBOUNCE_SECONDS:
-        return
+        # Debounce ringan: kalau user spam sangat cepat, cukup hapus /start-nya tanpa kirim ulang.
+        if last_msg_id and (now_mono - last_ts) < COOLDOWN_NOTICE_DEBOUNCE_SECONDS:
+            return
 
-    # Replace pesan cooldown lama supaya yang tersisa hanya pesan terbaru.
-    if last_msg_id:
-        await _safe_delete_chat_message(context.bot, chat_id, last_msg_id, "pesan cooldown lama")
+        # Replace pesan cooldown lama supaya yang tersisa hanya pesan terbaru.
+        if last_msg_id:
+            await _safe_delete_chat_message(context.bot, chat_id, last_msg_id, "pesan cooldown lama")
 
-    end_time = (now_wib() + timedelta(minutes=sisa)).strftime('%H:%M')
-    msg = await context.bot.send_message(
-        chat_id=chat_id,
-        text=(
-            f"⏳ <b>Cooldown Aktif</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Kamu baru saja membatalkan pesanan.\n\n"
-            f"⏱ Sisa waktu : <b>{sisa} menit</b>\n"
-            f"⏰ Berakhir   : <b>{end_time} WIB</b>"
-        ),
-        parse_mode="HTML"
-    )
-    context.user_data['_cooldown_notice_msg_id'] = msg.message_id
-    context.user_data['_cooldown_notice_ts'] = now_mono
+        end_time = (now_wib() + timedelta(minutes=sisa)).strftime('%H:%M')
+        msg = await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"⏳ <b>Cooldown Aktif</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"Kamu baru saja membatalkan pesanan.\n\n"
+                f"⏱ Sisa waktu: <b>{sisa} menit</b>\n"
+                f"⏰ Berakhir: <b>{end_time} WIB</b>"
+            ),
+            parse_mode="HTML"
+        )
+        context.user_data['_cooldown_notice_msg_id'] = msg.message_id
+        context.user_data['_cooldown_notice_ts'] = now_mono
+        simpan_msg_user(context, user_id, msg.message_id)
+        await hapus_msg_user_lama(context, user_id, keep_last=1)
 
 async def kirim_link_ke_buyer(context, user_id, paket, order_id, amount):
     group_link = await generate_group_link(context.bot, paket, order_id)
@@ -3094,7 +3231,7 @@ async def kirim_link_ke_buyer(context, user_id, paket, order_id, amount):
             [InlineKeyboardButton("⭐ Beri Ulasan / Testimoni", callback_data=f"rate_start|{order_id}")],
             [
                 InlineKeyboardButton("🔄 Kirim Ulang Link", callback_data=f"resendlink|{order_id}"),
-                InlineKeyboardButton("💬 Chat Admin", url=await get_setting('link_admin', 'https://t.me/Kikukkvd'))
+                InlineKeyboardButton("💬 Chat Admin", url=await get_setting('link_admin', ADMIN_URL))
             ]
         ])
     )
@@ -3278,7 +3415,7 @@ async def _event_loop_lag_monitor():
 async def _prewarm_hot_settings():
     await asyncio.gather(
         get_setting('link_testimoni', 'https://t.me/+7zsdSrwYIG8wOTg1'),
-        get_setting('link_admin', 'https://t.me/Kikukkvd'),
+        get_setting('link_admin', ADMIN_URL),
         get_setting('notif_channel_id', ''),
         get_setting('maintenance', 'off'),
         get_setting('testimoni_channel_id', ''),
@@ -3474,16 +3611,16 @@ async def _start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, tra
     if trace:
         trace.mark("buyer-checks")
 
-    if not is_admin_flag and maint:
-        await update.message.reply_text(
-            "⚙️ <b>BOT SEDANG MAINTENANCE</b>\n"
-            "========================\n\n"
-            "Bot sedang dalam perbaikan sementara.\n"
-            "Silakan coba lagi nanti.\n\n"
-            "Hubungi admin: @Kikukkvd",
-            parse_mode="HTML"
-        )
+    if not is_admin_flag and maint and not active:
+        await _send_single_maintenance_notice(update, context, user_id)
         return
+
+    # Setelah maintenance selesai, atau saat ada invoice lama yang harus
+    # dilanjutkan, bersihkan notice maintenance yang tersimpan.
+    if is_admin_flag or not maint or active:
+        await _clear_user_notice(
+            context, user_id, '_maintenance_notice_msg_id', "pesan maintenance lama"
+        )
 
     if banned:
         await update.message.reply_text(
@@ -3531,9 +3668,14 @@ async def _start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, tra
             f"<i>Silakan selesaikan pembayaran atau batalkan pesanan dulu.</i>"
         )
         keyboard = [[InlineKeyboardButton("❌ Batalkan Pesanan", callback_data="cancel_order")]]
-        msg = await update.message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
-        simpan_msg_user(context, user_id, msg.message_id)
-        await hapus_msg_user_lama(context, user_id, keep_last=2)
+        await _send_user_message_replace(
+            context,
+            user_id,
+            text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            keep_last=2,
+        )
         if trace:
             trace.mark("active-order-send")
         return
@@ -3544,14 +3686,14 @@ async def _start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, tra
     )
     if trace:
         trace.mark("menu-built")
-    msg = await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text=menu_text,
+    await _send_user_message_replace(
+        context,
+        user_id,
+        menu_text,
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(menu_keyboard)
+        reply_markup=InlineKeyboardMarkup(menu_keyboard),
+        keep_last=1,
     )
-    simpan_msg_user(context, user_id, msg.message_id)
-    await hapus_msg_user_lama(context, user_id, keep_last=1)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3591,7 +3733,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "========================\n"
         "💬 Butuh bantuan? Hubungi admin:"
     )
-    link_admin = await get_setting('link_admin', 'https://t.me/Kikukkvd')
+    link_admin = await get_setting('link_admin', ADMIN_URL)
     await update.message.reply_text(
         text,
         parse_mode="HTML",
@@ -3606,14 +3748,13 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _fast_callback_ack(query)
 
     # Spinner Telegram sudah berhenti; validasi tetap paralel agar menu muncul secepat mungkin.
-    is_admin_flag, maint, banned = await asyncio.gather(
-        is_admin(user_id, context),
+    maint, banned = await asyncio.gather(
         is_maintenance(),
         is_banned(user_id),
     )
 
-    if not is_admin_flag and maint:
-        await _callback_feedback(query, context, "⚙️ Bot sedang maintenance. Coba lagi nanti.")
+    if maint:
+        await _reject_new_invoice_during_maintenance(query, context, user_id)
         return
 
     if banned:
@@ -3756,8 +3897,11 @@ async def confirm_buy_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             trace.mark("active-order")
             return
 
+        if await _reject_new_invoice_during_maintenance(query, context, user_id):
+            return
+
         if sisa > 0:
-            await _callback_feedback(query, context, f"⏳ Kamu baru saja membatalkan order. Coba lagi dalam {sisa} menit.")
+            await _show_cooldown_alert(query, sisa)
             return
 
         await _buat_order_baru(
@@ -3805,8 +3949,11 @@ async def prereq_buy_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await _callback_feedback(query, context, "⏳ Kamu sudah punya invoice aktif! Batalkan dulu.")
             return
 
+        if await _reject_new_invoice_during_maintenance(query, context, user_id):
+            return
+
         if sisa > 0:
-            await _callback_feedback(query, context, f"⏳ Kamu baru saja membatalkan order. Coba lagi dalam {sisa} menit.")
+            await _show_cooldown_alert(query, sisa)
             return
 
         if parent_order_id:
@@ -3850,6 +3997,11 @@ async def _post_invoice_created_tasks(bot, context, user_id: int, order_id: str,
 
 
 async def _buat_order_baru(update, context, query, user_id, user_name, paket, order_changes=0, perf_trace=None):
+    # Guard terakhir untuk callback lama/race saat admin mengaktifkan maintenance
+    # tepat ketika buyer menekan tombol konfirmasi.
+    if await _reject_new_invoice_during_maintenance(query, context, user_id):
+        return False
+
     # Gunakan pesan callback sebagai indikator loading agar tidak menambah request Telegram.
     loading_msg = None
     if query:
@@ -4178,6 +4330,9 @@ async def ganti_paket_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     await _fast_callback_ack(query)
 
+    if await _reject_new_invoice_during_maintenance(query, context, user_id):
+        return
+
     active = await get_active_order(user_id)
     if not active:
         await _callback_feedback(query, context, "❌ Tidak ada pesanan aktif.")
@@ -4225,6 +4380,9 @@ async def ganti_paket_konfirm(update: Update, context: ContextTypes.DEFAULT_TYPE
     user_id = query.from_user.id
     await _fast_callback_ack(query)
 
+    if await _reject_new_invoice_during_maintenance(query, context, user_id):
+        return
+
     new_paket_id = query.data.split("|", 1)[1]
     new_paket = await get_product(new_paket_id)
     if not new_paket:
@@ -4266,6 +4424,9 @@ async def ganti_paket_exec(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     user_name = query.from_user.full_name
     await _fast_callback_ack(query, "⏳ Memproses pergantian paket...")
+
+    if await _reject_new_invoice_during_maintenance(query, context, user_id):
+        return
 
     active = await get_active_order(user_id)
     if not active:
@@ -4630,7 +4791,7 @@ async def _send_buyer_product_link(bot, user_id: int, order_id: str, paket: dict
     link = group_link or (paket.get("link") or DEFAULT_LINK)
     link_section = _build_link_section(group_link, link)
 
-    await telegram_send_rate_retry(
+    msg = await telegram_send_rate_retry(
         lambda: bot.send_message(
             chat_id=user_id,
             text=(
@@ -4652,13 +4813,20 @@ async def _send_buyer_product_link(bot, user_id: int, order_id: str, paket: dict
         ),
         label=f"kirim link buyer {order_id}",
     )
+    if msg and getattr(msg, 'message_id', None):
+        try:
+            await set_buyer_msg_id(order_id, msg.message_id)
+        except Exception as exc:
+            # ID hanya dipakai untuk cleanup/dedup; jangan menganggap delivery gagal
+            # jika link sudah berhasil diterima buyer.
+            logger.warning(f"[DELIVERY] Gagal menyimpan buyer_msg_id {order_id}: {exc}")
     return link, bool(group_link)
 
 async def _send_prereq_hold_message(bot, user_id: int, order_id: str, paket: dict, paid_amount: int, progress: dict):
     await mark_delivery_held(order_id, 'Syarat belum terpenuhi')
     product_name = f"{paket.get('emoji','📦')} {paket.get('nama','Produk')}"
     prerequisite_text = "\n".join(progress['lines'])
-    await bot.send_message(
+    msg = await bot.send_message(
         chat_id=user_id,
         text=(
             f"✅ <b>PEMBAYARAN BERHASIL</b>\n"
@@ -4677,6 +4845,64 @@ async def _send_prereq_hold_message(bot, user_id: int, order_id: str, paket: dic
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(progress['buttons']) if progress['buttons'] else None
     )
+    # Simpan ID pesan hold agar update berikutnya mengedit pesan yang sama,
+    # bukan mengirim pesan baru yang menumpuk di chat buyer.
+    try:
+        await set_prereq_update_msg_id(order_id, msg.message_id)
+    except Exception as exc:
+        logger.warning(f"[PREREQ] Gagal menyimpan prereq_update_msg_id {order_id}: {exc}")
+
+
+def _format_buyer_prereq_update(parent_label: str, parent_name: str, progress: dict) -> str:
+    missing_count = len(progress['missing'])
+    return (
+        "📋 <b>UPDATE AKSES</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🎯 Target: <b>{esc(parent_label)}</b>\n\n"
+        "✅ Pembayaran target sudah diterima.\n\n"
+        f"📊 Progress syarat: <b>{progress['fulfilled_count']}/{progress['total_count']}</b>\n\n"
+        f"{progress['text']}\n\n"
+        f"⏳ Masih kurang <b>{missing_count} paket</b> lagi.\n\n"
+        "Tekan tombol di bawah untuk membeli paket yang belum terpenuhi.\n"
+        f"Setelah lengkap, link {esc(parent_name)} akan dikirim otomatis."
+    )
+
+
+def _format_buyer_prereq_complete(parent_label: str, parent_name: str, progress: dict) -> str:
+    return (
+        "✅ <b>SEMUA SYARAT SUDAH LENGKAP</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 Target: <b>{esc(parent_label)}</b>\n"
+        f"📊 Progress: <b>{progress['fulfilled_count']}/{progress['total_count']}</b>\n\n"
+        f"Link {esc(parent_name)} sedang dikirim otomatis."
+    )
+
+
+async def _edit_or_send_buyer_prereq_update(bot, user_id: int, parent_order: dict,
+                                            text: str, reply_markup=None) -> bool:
+    """Update syarat memakai pesan baru. Hanya notifikasi update syarat lama yang dihapus."""
+    old_message_id = parent_order.get('prereq_update_msg_id')
+    if old_message_id:
+        try:
+            await bot.delete_message(chat_id=user_id, message_id=int(old_message_id))
+        except Exception:
+            pass
+
+    try:
+        msg = await bot.send_message(
+            chat_id=user_id,
+            text=text,
+            parse_mode="HTML",
+            reply_markup=reply_markup,
+        )
+        try:
+            await set_prereq_update_msg_id(parent_order['order_id'], msg.message_id)
+        except Exception as exc:
+            logger.warning(f"[PREREQ UPDATE] Gagal simpan ID update: {exc}")
+        return True
+    except Exception as exc:
+        logger.error(f"[PREREQ UPDATE] Gagal kirim update buyer {user_id}: {exc}")
+        return False
 
 async def _notify_parent_prereq_progress(bot, user_id: int, user_name: str, parent_order: dict,
                                           parent_paket: dict, progress: dict, purchased_paket_id: str):
@@ -4687,24 +4913,13 @@ async def _notify_parent_prereq_progress(bot, user_id: int, user_name: str, pare
     parent_label = f"{parent_paket.get('emoji','📦')} {parent_name}"
 
     if progress['missing']:
-        missing_count = len(progress['missing'])
-        try:
-            await bot.send_message(
-                chat_id=user_id,
-                text=(
-                    f"📋 <b>UPDATE SYARAT</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"🎯 Target  : {esc(parent_label)}\n"
-                    f"📊 Progress: {progress['fulfilled_count']}/{progress['total_count']} terpenuhi\n\n"
-                    f"{progress['text']}\n\n"
-                    f"🔐 Link {esc(parent_name)} masih ditahan.\n"
-                    f"Lengkapi {missing_count} produk lagi agar link otomatis dikirim."
-                ),
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup(progress['buttons']) if progress['buttons'] else None
-            )
-        except Exception as e:
-            logger.error(f"[PREREQ PROGRESS] Gagal kirim progress parent ke buyer {user_id}: {e}")
+        await _edit_or_send_buyer_prereq_update(
+            bot,
+            user_id,
+            parent_order,
+            _format_buyer_prereq_update(parent_label, parent_name, progress),
+            InlineKeyboardMarkup(progress['buttons']) if progress['buttons'] else None,
+        )
 
         extra = (
             f"🎯 Target  : {esc(parent_label)}\n"
@@ -4728,21 +4943,12 @@ async def _notify_parent_prereq_progress(bot, user_id: int, user_name: str, pare
         )
         return
 
-    try:
-        await bot.send_message(
-            chat_id=user_id,
-            text=(
-                f"🎉 <b>SYARAT TERPENUHI</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"🎯 Target  : {esc(parent_label)}\n"
-                f"📊 Progress: {progress['fulfilled_count']}/{progress['total_count']} terpenuhi\n\n"
-                f"{progress['text']}\n\n"
-                f"🔓 Link {esc(parent_name)} otomatis dikirim sekarang ✅"
-            ),
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        logger.error(f"[PREREQ PROGRESS] Gagal kirim final progress ke buyer {user_id}: {e}")
+    await _edit_or_send_buyer_prereq_update(
+        bot,
+        user_id,
+        parent_order,
+        _format_buyer_prereq_complete(parent_label, parent_name, progress),
+    )
 
 async def _process_completed_order_delivery(bot, order_id: str, paket_id: str, user_id: int,
                                             user_name: str, paid_amount: int,
@@ -4857,6 +5063,7 @@ async def _auto_deliver_pending_prereq_orders(bot, user_id: int, user_name: str,
     for order in pending:
         pid = order['paket_id']
         oid = order['order_id']
+        old_notice_id = order.get('buyer_msg_id')
         if exclude_order_id and oid == exclude_order_id:
             continue
 
@@ -4898,6 +5105,10 @@ async def _auto_deliver_pending_prereq_orders(bot, user_id: int, user_name: str,
             continue
 
         await set_sent_link(oid, link)
+        if old_notice_id:
+            await _safe_delete_chat_message(
+                bot, user_id, old_notice_id, "pesan update syarat lama"
+            )
 
         async def _finalize_auto_prereq(order_id=oid, order_data=order, paket_data=paket):
             await hapus_notif_lama(bot, order_id)
@@ -4934,6 +5145,7 @@ async def admin_kirim_link_prereq(update: Update, context: ContextTypes.DEFAULT_
     user_id = order['user_id']
     paket_id = order['paket_id']
     paket = await get_product(paket_id) or {"emoji": "📦", "nama": "Produk", "harga": 0, "link": DEFAULT_LINK}
+    old_notice_id = order.get('buyer_msg_id')
 
     group_link = await generate_group_link(context.bot, paket, order_id)
     link = group_link or (paket.get("link") or DEFAULT_LINK)
@@ -4941,7 +5153,7 @@ async def admin_kirim_link_prereq(update: Update, context: ContextTypes.DEFAULT_
 
     kirim_berhasil = False
     try:
-        await context.bot.send_message(
+        msg = await context.bot.send_message(
             chat_id=user_id,
             text=(
                 f"<b>✅ LINK PRODUK KAMU SUDAH SIAP!</b>\n"
@@ -4964,6 +5176,15 @@ async def admin_kirim_link_prereq(update: Update, context: ContextTypes.DEFAULT_
 
     if kirim_berhasil:
         await set_sent_link(order_id, link)
+        if msg and getattr(msg, 'message_id', None):
+            try:
+                await set_buyer_msg_id(order_id, msg.message_id)
+            except Exception as exc:
+                logger.warning(f"[PREREQ] Gagal menyimpan buyer_msg_id {order_id}: {exc}")
+        if old_notice_id:
+            await _safe_delete_chat_message(
+                context.bot, user_id, old_notice_id, "pesan hold syarat lama"
+            )
     else:
         await set_delivery_status(order_id, 'failed', 'Manual prereq delivery gagal')
 
@@ -8041,9 +8262,12 @@ async def admpanel_setting_maintenance(update: Update, context: ContextTypes.DEF
     was_on = await is_maintenance()
     await set_setting('maintenance', '0' if was_on else '1')
     if was_on:
-        msg = "✅ <b>Maintenance mode dinonaktifkan.</b>\n\nBot kembali normal - buyer bisa akses."
+        msg = "✅ <b>Maintenance mode dinonaktifkan.</b>\n\nBot kembali normal - buyer bisa membuat invoice baru."
     else:
-        msg = "⚙️ <b>Maintenance mode diaktifkan.</b>\n\nBuyer tidak bisa akses bot sampai maintenance dimatikan."
+        msg = (
+            "⚙️ <b>Maintenance mode diaktifkan.</b>\n\n"
+            "Invoice baru ditutup. Invoice yang sudah dibuat tetap diproses."
+        )
     await query.edit_message_text(
         msg, parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali ke Pengaturan", callback_data="admpanel_setting")]])

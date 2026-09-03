@@ -269,11 +269,6 @@ ADMIN_PANEL_CACHE_TTL_SECONDS = _env_float("ADMIN_PANEL_CACHE_TTL_SECONDS", 3.0,
 COOLDOWN_EMPTY_TTL_SECONDS = _env_float("COOLDOWN_EMPTY_TTL_SECONDS", 30.0, 5.0, 300.0)
 BROADCAST_INTERVAL_SECONDS = _env_float("BROADCAST_INTERVAL_SECONDS", 0.15, 0.05, 1.0)
 
-# Default mempertahankan perilaku lama: paket bersyarat boleh dibayar dahulu,
-# tetapi link ditahan sampai syarat lengkap. Set 1 untuk memblokir pembayaran.
-ENFORCE_PREREQUISITES_BEFORE_PAYMENT = (
-    os.environ.get("ENFORCE_PREREQUISITES_BEFORE_PAYMENT", "0").strip() == "1"
-)
 # Set 1 jika syarat dianggap terpenuhi setelah link paket syarat benar-benar terkirim.
 PREREQUISITE_REQUIRES_DELIVERY = (
     os.environ.get("PREREQUISITE_REQUIRES_DELIVERY", "0").strip() == "1"
@@ -2957,9 +2952,8 @@ async def build_main_menu_text():
         "Selamat datang! Pilih paket yang tersedia:\n\n"
     )
     for p in aktif_products:
-        requirement_badge = " 🔒 <i>(Syarat berlaku)</i>" if p.get('requires_paket_ids') else ""
         text += (
-            f"{esc(p['emoji'])} <b>{esc(p['nama']).upper()}</b>{requirement_badge}\n"
+            f"{esc(p['emoji'])} <b>{esc(p['nama']).upper()}</b>\n"
             f"- {esc(p['deskripsi'])}\n"
             f"- {format_harga(p['harga'])}\n\n"
         )
@@ -3646,15 +3640,13 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Silakan pilih paket yang ingin kamu beli:"
     )
 
-    keyboard = []
-    for p in aktif:
-        badge = " 🔒" if p.get('requires_paket_ids') else ""
-        keyboard.append([
-            InlineKeyboardButton(
-                f"{p['emoji']}{badge} {p['nama']} - {format_harga(p['harga'])}",
-                callback_data=f"pilih_{p['paket_id']}"
-            )
-        ])
+    keyboard = [
+        [InlineKeyboardButton(
+            f"{p['emoji']} {p['nama']} - {format_harga(p['harga'])}",
+            callback_data=f"pilih_{p['paket_id']}"
+        )]
+        for p in aktif
+    ]
     keyboard.append([InlineKeyboardButton("⬅️ Kembali", callback_data="back_to_menu")])
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
@@ -3686,20 +3678,9 @@ async def pilih_paket(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     if paket.get('aktif', True):
-        prereq_notice = _format_prerequisite_catalog(
-            paket.get('requires_paket_ids') or '',
-            await get_all_products(),
-        )
-        text += prereq_notice
-        text += "\n\nLanjut buat order dan bayar via QRIS?"
-        buy_label = (
-            "✅ Lanjut Bayar — Syarat Berlaku"
-            if paket.get('requires_paket_ids')
-            else
-            "✅ Lanjut Bayar"
-        )
+        text += "Lanjut buat order dan bayar via QRIS?"
         keyboard = [
-            [InlineKeyboardButton(buy_label, callback_data=f"confirm_buy_{paket_id}")],
+            [InlineKeyboardButton("✅ Lanjut Bayar", callback_data=f"confirm_buy_{paket_id}")],
             [InlineKeyboardButton("⬅️ Kembali", callback_data="buy")]
         ]
     else:
@@ -3778,27 +3759,6 @@ async def confirm_buy_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         if sisa > 0:
             await _callback_feedback(query, context, f"⏳ Kamu baru saja membatalkan order. Coba lagi dalam {sisa} menit.")
             return
-
-        if ENFORCE_PREREQUISITES_BEFORE_PAYMENT:
-            requires_str = paket.get('requires_paket_ids') or ''
-            if requires_str:
-                progress = await _build_prereq_progress(user_id, requires_str)
-                if progress['missing']:
-                    await query.edit_message_text(
-                        f"🔒 <b>PAKET BELUM DAPAT DIBELI</b>\n"
-                        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-                        f"Penuhi paket syarat berikut terlebih dahulu:\n\n"
-                        f"{progress['text']}\n\n"
-                        f"📊 Progress: <b>{progress['fulfilled_count']}/{progress['total_count']}</b> paket syarat\n\n"
-                        f"Setelah semua paket syarat selesai dibayar, "
-                        f"kamu dapat membeli paket {esc(paket.get('nama', 'ini'))}.",
-                        parse_mode="HTML",
-                        reply_markup=(
-                            InlineKeyboardMarkup(progress["buttons"])
-                            if progress["buttons"] else None
-                        ),
-                    )
-                    return
 
         await _buat_order_baru(
             update, context, query, user_id, user_name, paket,
@@ -4588,28 +4548,6 @@ async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
 
 def _split_required_ids(requires_str: str) -> list:
     return [pid.strip() for pid in (requires_str or '').split(',') if pid.strip()]
-
-
-def _format_prerequisite_catalog(requires_str: str, products: list) -> str:
-    """Tampilkan syarat sebelum user membuat invoice agar tidak kaget setelah bayar."""
-    required_ids = _split_required_ids(requires_str)
-    if not required_ids:
-        return ""
-    products_by_id = {p.get('paket_id'): p for p in products}
-    lines = []
-    for pid in required_ids:
-        product = products_by_id.get(pid)
-        if product:
-            lines.append(f"• {esc(product.get('emoji', '📦'))} {esc(product.get('nama', pid))}")
-        else:
-            lines.append(f"• {esc(pid)}")
-    return (
-        "\n\n🔒 <b>SYARAT AKSES</b>\n"
-        "Paket ini tetap bisa dibayar, tetapi link belum dikirim "
-        "sebelum semua paket syarat terpenuhi.\n\n"
-        + "\n".join(lines)
-        + "\n\n✅ Link akan dikirim otomatis setelah semua paket syarat selesai dibayar."
-    )
 
 
 async def _build_prereq_progress(user_id: int, requires_str: str, parent_order_id: str = None) -> dict:

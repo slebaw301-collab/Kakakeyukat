@@ -236,11 +236,19 @@ TELEGRAM_CONNECTION_POOL_SIZE = _env_int("TELEGRAM_CONNECTION_POOL_SIZE", 64, 16
 TELEGRAM_POOL_TIMEOUT_SECONDS = _env_float("TELEGRAM_POOL_TIMEOUT_SECONDS", 15.0, 1.0, 60.0)
 DB_POOL_MIN = _env_int("DB_POOL_MIN", 2, 1, 10)
 DB_POOL_MAX = _env_int("DB_POOL_MAX", 20, DB_POOL_MIN, 50)
-DB_THREAD_WORKERS = _env_int("DB_THREAD_WORKERS", min(24, DB_POOL_MAX), 4, 50)
 # Jalur DB admin/background dibatasi agar query berat tidak menghabiskan semua worker buyer.
 DB_ADMIN_THREAD_WORKERS = _env_int("DB_ADMIN_THREAD_WORKERS", 2, 1, 6)
+# Worker buyer default menyisakan slot untuk worker admin pada pool psycopg2 yang sama.
+# Jika nilainya diubah manual, pastikan DB_POOL_MAX >= jumlah seluruh worker DB.
+DB_THREAD_WORKERS = _env_int(
+    "DB_THREAD_WORKERS",
+    min(18, max(4, DB_POOL_MAX - DB_ADMIN_THREAD_WORKERS)),
+    4,
+    50,
+)
 CPU_THREAD_WORKERS = _env_int("CPU_THREAD_WORKERS", 4, 2, 12)
 ASYNCPG_POOL_MAX = _env_int("ASYNCPG_POOL_MAX", 4, 1, 12)
+DB_STATEMENT_TIMEOUT_MS = _env_int("DB_STATEMENT_TIMEOUT_MS", 8000, 1000, 60000)
 ACTIVE_ORDER_CACHE_TTL_SECONDS = _env_float("ACTIVE_ORDER_CACHE_TTL_SECONDS", 2.5, 0.5, 10.0)
 WAITING_ORDERS_CACHE_TTL_SECONDS = _env_float("WAITING_ORDERS_CACHE_TTL_SECONDS", 3.0, 0.5, 15.0)
 ADMIN_CACHE_TTL_SECONDS = _env_float("ADMIN_CACHE_TTL_SECONDS", 30.0, 5.0, 300.0)
@@ -258,6 +266,22 @@ TELEGRAM_RETRY_ATTEMPTS = _env_int("TELEGRAM_RETRY_ATTEMPTS", 2, 1, 4)
 ADMIN_ORDER_PAGE_SIZE = _env_int("ADMIN_ORDER_PAGE_SIZE", 8, 5, 15)
 ADMIN_LIST_PAGE_SIZE = _env_int("ADMIN_LIST_PAGE_SIZE", 10, 5, 20)
 ADMIN_PANEL_CACHE_TTL_SECONDS = _env_float("ADMIN_PANEL_CACHE_TTL_SECONDS", 3.0, 0.5, 15.0)
+COOLDOWN_EMPTY_TTL_SECONDS = _env_float("COOLDOWN_EMPTY_TTL_SECONDS", 30.0, 5.0, 300.0)
+BROADCAST_INTERVAL_SECONDS = _env_float("BROADCAST_INTERVAL_SECONDS", 0.15, 0.05, 1.0)
+
+# Default mempertahankan perilaku lama: paket bersyarat boleh dibayar dahulu,
+# tetapi link ditahan sampai syarat lengkap. Set 1 untuk memblokir pembayaran.
+ENFORCE_PREREQUISITES_BEFORE_PAYMENT = (
+    os.environ.get("ENFORCE_PREREQUISITES_BEFORE_PAYMENT", "0").strip() == "1"
+)
+# Set 1 jika syarat dianggap terpenuhi setelah link paket syarat benar-benar terkirim.
+PREREQUISITE_REQUIRES_DELIVERY = (
+    os.environ.get("PREREQUISITE_REQUIRES_DELIVERY", "0").strip() == "1"
+)
+# Set 0 setelah migrasi pertama/deployment selesai agar DDL tidak menghambat cold start.
+RUN_DB_MIGRATIONS_ON_STARTUP = (
+    os.environ.get("RUN_DB_MIGRATIONS_ON_STARTUP", "1").strip() == "1"
+)
 
 # Timeout dibuat lebih pendek agar gangguan provider tidak menahan update Telegram terlalu lama.
 AUTOGOPAY_HTTP_TIMEOUT = aiohttp.ClientTimeout(
@@ -959,6 +983,10 @@ def init_pool():
         DATABASE_URL,
         cursor_factory=RealDictCursor,
         connect_timeout=10,
+        options=(
+            f"-c statement_timeout={DB_STATEMENT_TIMEOUT_MS} "
+            "-c idle_in_transaction_session_timeout=10000"
+        ),
         application_name="hyperfamily_bot",
     )
     logger.info(
@@ -1343,6 +1371,9 @@ _active_order_cache_epoch = 0
 _waiting_orders_cache = None
 _waiting_orders_cache_lock: asyncio.Lock = None
 _waiting_orders_cache_generation = 0
+_start_snapshot_cache: dict = {}
+_start_snapshot_cache_locks = None
+START_SNAPSHOT_CACHE_TTL_SECONDS = _env_float("START_SNAPSHOT_CACHE_TTL_SECONDS", 2.0, 0.5, 10.0)
 
 def _get_active_cache_lock(user_id: int) -> asyncio.Lock:
     global _active_order_cache_locks
@@ -1374,6 +1405,7 @@ def _active_order_cache_version(user_id: int):
 
 def _invalidate_active_order_cache(user_id=None):
     global _active_order_cache_epoch
+    _invalidate_start_snapshot_cache(user_id)
     if user_id is None:
         _active_order_cache_epoch += 1
         _active_order_cache.clear()
@@ -1421,6 +1453,158 @@ async def get_active_order(user_id):
             if version == _active_order_cache_version(user_id):
                 _active_order_cache_set(user_id, value)
                 return copy.deepcopy(value)
+
+
+def _get_start_snapshot_lock(user_id: int) -> asyncio.Lock:
+    global _start_snapshot_cache_locks
+    if _start_snapshot_cache_locks is None:
+        _start_snapshot_cache_locks = [asyncio.Lock() for _ in range(64)]
+    return _start_snapshot_cache_locks[int(user_id) % len(_start_snapshot_cache_locks)]
+
+
+def _start_snapshot_cache_get(user_id: int):
+    uid = int(user_id)
+    entry = _start_snapshot_cache.get(uid)
+    if entry and _time.monotonic() < entry[1]:
+        return True, copy.deepcopy(entry[0])
+    if entry:
+        _start_snapshot_cache.pop(uid, None)
+    return False, None
+
+
+def _start_snapshot_cache_set(user_id: int, snapshot: dict):
+    uid = int(user_id)
+    now_mono = _time.monotonic()
+    if len(_start_snapshot_cache) > 10000:
+        for old_uid, entry in list(_start_snapshot_cache.items()):
+            if now_mono >= entry[1]:
+                _start_snapshot_cache.pop(old_uid, None)
+    _start_snapshot_cache[uid] = (
+        copy.deepcopy(snapshot),
+        now_mono + START_SNAPSHOT_CACHE_TTL_SECONDS,
+    )
+
+
+def _invalidate_start_snapshot_cache(user_id=None):
+    if user_id is None:
+        _start_snapshot_cache.clear()
+    else:
+        _start_snapshot_cache.pop(int(user_id), None)
+
+
+_START_SNAPSHOT_SQL = """
+SELECT
+    EXISTS (
+        SELECT 1 FROM banned_users
+        WHERE user_id = $1
+    ) AS banned,
+    COALESCE(
+        GREATEST(
+            0,
+            CEIL(EXTRACT(EPOCH FROM
+                (c.expires_at - CURRENT_TIMESTAMP)
+            ) / 60)
+        ),
+        0
+    )::int AS cooldown_minutes,
+    c.expires_at AS cooldown_expires_at,
+    CASE
+        WHEN o.id IS NULL THEN NULL
+        ELSE row_to_json(o)::text
+    END AS active_json
+FROM (SELECT 1) AS seed
+LEFT JOIN LATERAL (
+    SELECT expires_at
+    FROM cooldowns
+    WHERE user_id = $1
+    LIMIT 1
+) c ON TRUE
+LEFT JOIN LATERAL (
+    SELECT *
+    FROM orders
+    WHERE user_id = $1
+      AND status IN ('waiting', 'pending')
+    ORDER BY id DESC
+    LIMIT 1
+) o ON TRUE
+"""
+
+
+def _decode_start_snapshot(row):
+    if not row:
+        return {
+            "banned": False,
+            "cooldown_minutes": 0,
+            "cooldown_expires_at": None,
+            "active": None,
+        }
+    active = None
+    active_json = row.get("active_json")
+    if active_json:
+        try:
+            active = json.loads(active_json)
+        except (TypeError, ValueError) as exc:
+            logger.warning(f"[START] Gagal membaca snapshot active order: {exc}")
+    return {
+        "banned": bool(row.get("banned")),
+        "cooldown_minutes": int(row.get("cooldown_minutes") or 0),
+        "cooldown_expires_at": row.get("cooldown_expires_at"),
+        "active": active,
+    }
+
+
+def _prime_start_related_caches(user_id: int, snapshot: dict):
+    """Isi cache lama juga agar klik berikutnya tidak mengulang query yang sama."""
+    uid = int(user_id)
+    _banned_cache[uid] = (
+        bool(snapshot.get("banned")),
+        _time.monotonic() + _BANNED_CACHE_TTL,
+    )
+    _active_order_cache_set(uid, snapshot.get("active"))
+
+    expires_at = snapshot.get("cooldown_expires_at")
+    if expires_at:
+        if isinstance(expires_at, str):
+            expires_at = parse_provider_datetime(expires_at)
+        if expires_at and expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if expires_at and expires_at > now_utc():
+            _set_cooldown_memory(uid, expires_at.astimezone(timezone.utc))
+            _cooldown_empty_cache.pop(uid, None)
+            return
+    _clear_cooldown_memory(uid)
+    _cooldown_empty_cache[uid] = _time.monotonic() + COOLDOWN_EMPTY_TTL_SECONDS
+
+
+def _get_start_snapshot_sync(user_id: int):
+    # psycopg2 memakai placeholder %s, tetapi tetap satu query/round-trip.
+    query = _START_SNAPSHOT_SQL.replace("$1", "%s")
+    with db_session_safe() as conn:
+        with conn.cursor() as c:
+            uid = int(user_id)
+            c.execute(query, (uid, uid, uid))
+            return _decode_start_snapshot(c.fetchone())
+
+
+async def get_start_snapshot(user_id: int):
+    hit, value = _start_snapshot_cache_get(user_id)
+    if hit:
+        _prime_start_related_caches(int(user_id), value)
+        return value
+
+    async with _get_start_snapshot_lock(user_id):
+        hit, value = _start_snapshot_cache_get(user_id)
+        if hit:
+            _prime_start_related_caches(int(user_id), value)
+            return value
+        row, used_async = await _asyncpg_fetchrow(_START_SNAPSHOT_SQL, int(user_id))
+        if used_async:
+            value = _decode_start_snapshot(row)
+        else:
+            value = await run_db(_get_start_snapshot_sync, int(user_id))
+        _prime_start_related_caches(int(user_id), value)
+        _start_snapshot_cache_set(user_id, value)
+        return copy.deepcopy(value)
 
 @async_wrap_admin
 def get_all_pending():
@@ -1859,6 +2043,7 @@ def _invalidate_stats_cache():
     _stats_cache = None
 
 def _invalidate_order_caches(user_id=None):
+    _invalidate_start_snapshot_cache(user_id)
     _invalidate_active_order_cache(user_id)
     _invalidate_waiting_orders_cache()
     _invalidate_admin_order_page_cache()
@@ -1983,11 +2168,14 @@ def check_prerequisites_sync(user_id: int, requires_paket_ids_str: str) -> list:
     required_ids = [p.strip() for p in requires_paket_ids_str.split(",") if p.strip()]
     if not required_ids:
         return []
+    delivery_clause = "AND delivery_status = 'sent'" if PREREQUISITE_REQUIRES_DELIVERY else ""
     with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute(
-                """SELECT DISTINCT paket_id FROM orders
-                   WHERE user_id=%s AND status='completed' AND paket_id = ANY(%s)""",
+                f"""SELECT DISTINCT paket_id FROM orders
+                   WHERE user_id=%s AND status='completed'
+                     {delivery_clause}
+                     AND paket_id = ANY(%s)""",
                 (user_id, required_ids)
             )
             done_ids = {row["paket_id"] for row in c.fetchall()}
@@ -2191,6 +2379,7 @@ async def ban_user(user_id, reason=""):
     async with _get_banned_lock(uid):
         await run_db_admin(_ban_user_sync, uid, reason)
         _banned_cache[uid] = (True, _time.monotonic() + _BANNED_CACHE_TTL)
+        _invalidate_start_snapshot_cache(uid)
 
 def _unban_user_sync(user_id):
     with db_session_safe() as conn:
@@ -2202,6 +2391,7 @@ async def unban_user(user_id):
     async with _get_banned_lock(uid):
         await run_db_admin(_unban_user_sync, uid)
         _banned_cache[uid] = (False, _time.monotonic() + _BANNED_CACHE_TTL)
+        _invalidate_start_snapshot_cache(uid)
 
 @async_wrap_admin
 def get_all_banned():
@@ -2290,6 +2480,8 @@ async def set_setting(key, value):
 COOLDOWN_MENIT = 5
 COOLDOWN_MENIT_MAX = 60
 _cooldown_memory_cache: dict = {}
+# Cache negatif agar user tanpa cooldown tidak query PostgreSQL pada setiap /start.
+_cooldown_empty_cache: dict = {}
 # Cancel escalation disimpan 24 jam saja agar memory tidak tumbuh selamanya.
 _cancel_count_cache: dict = {}
 _CANCEL_COUNT_TTL_SECONDS = 24 * 60 * 60
@@ -2366,11 +2558,13 @@ def _set_cooldown_sync(user_id, expires_at):
 async def set_cooldown_db(user_id):
     uid = int(user_id)
     async with _get_cooldown_lock(uid):
+        _cooldown_empty_cache.pop(uid, None)
         cooldown_minutes = _get_dynamic_cooldown_minutes(uid)
         expires_at = now_utc() + timedelta(minutes=cooldown_minutes)
         await run_db(_set_cooldown_sync, uid, expires_at)
         _set_cooldown_memory(uid, expires_at)
         _increment_cancel_count(uid)
+        _invalidate_start_snapshot_cache(uid)
 
 def _get_cooldown_sync(user_id):
     with db_session_safe() as conn:
@@ -2386,17 +2580,30 @@ async def get_cooldown_sisa_db(user_id):
         return math.ceil(sisa / 60) if sisa > 0 else 0
 
     uid = int(user_id)
+    now_mono = _time.monotonic()
+    empty_until = _cooldown_empty_cache.get(uid)
+    if empty_until and now_mono < empty_until:
+        return 0
+    if empty_until:
+        _cooldown_empty_cache.pop(uid, None)
+
     async with _get_cooldown_lock(uid):
         mem_expires = _get_cooldown_memory(uid)
         if mem_expires is not None:
             sisa = (mem_expires - now_utc()).total_seconds()
             return math.ceil(sisa / 60) if sisa > 0 else 0
+        empty_until = _cooldown_empty_cache.get(uid)
+        now_mono = _time.monotonic()
+        if empty_until and now_mono < empty_until:
+            return 0
         row, used_async = await _asyncpg_fetchrow("SELECT expires_at FROM cooldowns WHERE user_id=$1", uid)
         until = row.get('expires_at') if (used_async and row) else None
         if not used_async:
             until = await run_db(_get_cooldown_sync, uid)
         if until is None:
+            _cooldown_empty_cache[uid] = _time.monotonic() + COOLDOWN_EMPTY_TTL_SECONDS
             return 0
+        _cooldown_empty_cache.pop(uid, None)
         try:
             if until.tzinfo is None:
                 until = until.replace(tzinfo=timezone.utc)
@@ -2419,6 +2626,8 @@ async def clear_cooldown_db(user_id):
     async with _get_cooldown_lock(uid):
         await run_db(_clear_cooldown_sync, uid)
         _clear_cooldown_memory(uid)
+        _cooldown_empty_cache[uid] = _time.monotonic() + COOLDOWN_EMPTY_TTL_SECONDS
+        _invalidate_start_snapshot_cache(uid)
 
 @async_wrap_admin
 def cleanup_expired_cooldowns():
@@ -2748,8 +2957,9 @@ async def build_main_menu_text():
         "Selamat datang! Pilih paket yang tersedia:\n\n"
     )
     for p in aktif_products:
+        requirement_badge = " 🔒 <i>(Syarat berlaku)</i>" if p.get('requires_paket_ids') else ""
         text += (
-            f"{esc(p['emoji'])} <b>{esc(p['nama']).upper()}</b>\n"
+            f"{esc(p['emoji'])} <b>{esc(p['nama']).upper()}</b>{requirement_badge}\n"
             f"- {esc(p['deskripsi'])}\n"
             f"- {format_harga(p['harga'])}\n\n"
         )
@@ -3080,17 +3290,8 @@ async def _prewarm_hot_settings():
         get_setting('testimoni_channel_id', ''),
     )
 
-async def post_init(application: Application):
-    global _current_bot
-    _current_bot = application.bot
-
-    logger.info(
-        f"[PERFORMANCE] Executor aktif: buyer_db={DB_THREAD_WORKERS}, "
-        f"admin_db={DB_ADMIN_THREAD_WORKERS}, cpu={CPU_THREAD_WORKERS}"
-    )
-    await asyncio.gather(get_http_session(), init_async_db_pool())
-
-    # Preload cache yang langsung dipakai buyer pertama setelah deploy/restart.
+async def _post_init_warmup(application: Application):
+    """Warmup non-kritis dipisahkan agar polling bisa menerima /start lebih cepat."""
     waiting_orders, all_products, _, _ = await asyncio.gather(
         get_all_waiting(force=True),
         get_all_products(),
@@ -3132,6 +3333,8 @@ async def post_init(application: Application):
             elif order.get('created_at'):
                 try:
                     created_at = order['created_at']
+                    if isinstance(created_at, str):
+                        created_at = parse_provider_datetime(created_at)
                     if created_at.tzinfo is None:
                         created_at = created_at.replace(tzinfo=timezone.utc)
                     elapsed = int((now_wib() - created_at.astimezone(WIB)).total_seconds())
@@ -3152,6 +3355,20 @@ async def post_init(application: Application):
                 paket=paket,
             )
             logger.debug(f"[POST_INIT] Monitoring dipulihkan: {order['order_id']}")
+
+
+async def post_init(application: Application):
+    global _current_bot
+    _current_bot = application.bot
+
+    logger.info(
+        f"[PERFORMANCE] Executor aktif: buyer_db={DB_THREAD_WORKERS}, "
+        f"admin_db={DB_ADMIN_THREAD_WORKERS}, cpu={CPU_THREAD_WORKERS}"
+    )
+    # Resource wajib siap sebelum polling; warmup, command setup, dan recovery
+    # tidak lagi menahan update pertama setelah bot hidup.
+    await asyncio.gather(get_http_session(), init_async_db_pool())
+    spawn_background(_post_init_warmup(application), name="post-init-warmup")
 
     spawn_background(_auto_backup_loop(), name="auto-backup-loop")
     spawn_background(_buyer_reminder_loop(_current_bot), name="buyer-reminder-loop")
@@ -3247,17 +3464,21 @@ async def _refresh_active_order_status(bot, active: dict, paket: dict, user_name
             f"[PAYMENT REFRESH] Gagal refresh order {active.get('order_id')}: {e}"
         )
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def _start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, trace=None):
     user_id = update.effective_user.id
 
-    # Jalankan semua pengecekan awal secara paralel untuk respons lebih cepat
-    is_admin_flag, maint, banned, sisa, active = await asyncio.gather(
+    # Admin/maintenance sudah memakai cache; tiga pemeriksaan buyer digabung
+    # menjadi satu snapshot DB agar cache miss tidak membuat tiga round-trip.
+    is_admin_flag, maint, snapshot = await asyncio.gather(
         is_admin(user_id, context),
         is_maintenance(),
-        is_banned(user_id),
-        get_cooldown_sisa_db(user_id),
-        get_active_order(user_id),
+        get_start_snapshot(user_id),
     )
+    banned = snapshot['banned']
+    sisa = snapshot['cooldown_minutes']
+    active = snapshot['active']
+    if trace:
+        trace.mark("buyer-checks")
 
     if not is_admin_flag and maint:
         await update.message.reply_text(
@@ -3294,6 +3515,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             paket,
             active.get('user_name', update.effective_user.full_name)
         )
+        # Membantu kasus webhook terlambat/gagal tanpa menahan balasan /start.
+        spawn_background(
+            _refresh_active_order_status(
+                context.bot,
+                active,
+                paket,
+                active.get('user_name', update.effective_user.full_name),
+            ),
+            name=f"start-refresh-{active['order_id']}",
+        )
 
         total = active.get("harga_dibayar") or paket["harga"]
         text = (
@@ -3309,12 +3540,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = await update.message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
         simpan_msg_user(context, user_id, msg.message_id)
         await hapus_msg_user_lama(context, user_id, keep_last=2)
+        if trace:
+            trace.mark("active-order-send")
         return
 
     menu_text, menu_keyboard = await asyncio.gather(
         build_main_menu_text(),
         build_main_menu_keyboard(),
     )
+    if trace:
+        trace.mark("menu-built")
     msg = await context.bot.send_message(
         chat_id=update.effective_chat.id,
         text=menu_text,
@@ -3323,6 +3558,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     simpan_msg_user(context, user_id, msg.message_id)
     await hapus_msg_user_lama(context, user_id, keep_last=1)
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Wrapper tracing untuk mengukur delay /start tanpa mengubah alur bisnis."""
+    trace = PerfTrace(
+        "start",
+        user_id=getattr(getattr(update, "effective_user", None), "id", "-"),
+    )
+    try:
+        return await _start_handler(update, context, trace=trace)
+    finally:
+        trace.finish()
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler untuk /help - menampilkan bantuan penggunaan bot."""
@@ -3399,10 +3646,15 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Silakan pilih paket yang ingin kamu beli:"
     )
 
-    keyboard = [
-        [InlineKeyboardButton(f"{p['emoji']} {p['nama']} - {format_harga(p['harga'])}", callback_data=f"pilih_{p['paket_id']}")]
-        for p in aktif
-    ]
+    keyboard = []
+    for p in aktif:
+        badge = " 🔒" if p.get('requires_paket_ids') else ""
+        keyboard.append([
+            InlineKeyboardButton(
+                f"{p['emoji']}{badge} {p['nama']} - {format_harga(p['harga'])}",
+                callback_data=f"pilih_{p['paket_id']}"
+            )
+        ])
     keyboard.append([InlineKeyboardButton("⬅️ Kembali", callback_data="back_to_menu")])
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
@@ -3434,9 +3686,20 @@ async def pilih_paket(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     if paket.get('aktif', True):
-        text += "Lanjut buat order dan bayar via QRIS?"
+        prereq_notice = _format_prerequisite_catalog(
+            paket.get('requires_paket_ids') or '',
+            await get_all_products(),
+        )
+        text += prereq_notice
+        text += "\n\nLanjut buat order dan bayar via QRIS?"
+        buy_label = (
+            "✅ Lanjut Bayar — Syarat Berlaku"
+            if paket.get('requires_paket_ids')
+            else
+            "✅ Lanjut Bayar"
+        )
         keyboard = [
-            [InlineKeyboardButton("✅ Lanjut Bayar", callback_data=f"confirm_buy_{paket_id}")],
+            [InlineKeyboardButton(buy_label, callback_data=f"confirm_buy_{paket_id}")],
             [InlineKeyboardButton("⬅️ Kembali", callback_data="buy")]
         ]
     else:
@@ -3515,6 +3778,27 @@ async def confirm_buy_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         if sisa > 0:
             await _callback_feedback(query, context, f"⏳ Kamu baru saja membatalkan order. Coba lagi dalam {sisa} menit.")
             return
+
+        if ENFORCE_PREREQUISITES_BEFORE_PAYMENT:
+            requires_str = paket.get('requires_paket_ids') or ''
+            if requires_str:
+                progress = await _build_prereq_progress(user_id, requires_str)
+                if progress['missing']:
+                    await query.edit_message_text(
+                        f"🔒 <b>PAKET BELUM DAPAT DIBELI</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                        f"Penuhi paket syarat berikut terlebih dahulu:\n\n"
+                        f"{progress['text']}\n\n"
+                        f"📊 Progress: <b>{progress['fulfilled_count']}/{progress['total_count']}</b> paket syarat\n\n"
+                        f"Setelah semua paket syarat selesai dibayar, "
+                        f"kamu dapat membeli paket {esc(paket.get('nama', 'ini'))}.",
+                        parse_mode="HTML",
+                        reply_markup=(
+                            InlineKeyboardMarkup(progress["buttons"])
+                            if progress["buttons"] else None
+                        ),
+                    )
+                    return
 
         await _buat_order_baru(
             update, context, query, user_id, user_name, paket,
@@ -3806,25 +4090,44 @@ async def cancel_order_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     if active:
         paket = await get_product(active["paket_id"])
         amount = active.get("harga_dibayar") or (paket["harga"] if paket else 0)
-        if amount:
-            await cancel_transaction(active["order_id"], amount)
-        await update_order_status(active["order_id"], "cancelled")
-        await _stop_payment_task(user_id)
-        await hapus_qris_buyer_lama(context.bot, active["order_id"], user_id)
-
         cancelled_order_id = active["order_id"]
-        await hapus_notif_lama(context.bot, cancelled_order_id)
+        cancelled_user_name = query.from_user.full_name
+        # Status lokal diubah segera agar /start berikutnya tidak tertahan oleh
+        # HTTP cancel provider. Cleanup provider/notifikasi berjalan di background.
+        await update_order_status(cancelled_order_id, "cancelled")
+        await _stop_payment_task(user_id)
 
-        paket_notif = await get_product(active["paket_id"]) or {"emoji": "📦", "nama": active["paket_id"]}
-        msg_id = await kirim_notif(
-            context.bot,
-            _format_order_notif(
-                "❌ <b>DIBATALKAN BUYER</b>",
-                query.from_user.full_name, user_id, paket_notif, cancelled_order_id
-            )
+        async def _finalize_cancel():
+            try:
+                if amount:
+                    await cancel_transaction(cancelled_order_id, amount)
+                await hapus_qris_buyer_lama(context.bot, cancelled_order_id, user_id)
+                await hapus_notif_lama(context.bot, cancelled_order_id)
+                paket_notif = paket or {
+                    "emoji": "📦",
+                    "nama": active["paket_id"],
+                }
+                msg_id = await kirim_notif(
+                    context.bot,
+                    _format_order_notif(
+                        "❌ <b>DIBATALKAN BUYER</b>",
+                        cancelled_user_name,
+                        user_id,
+                        paket_notif,
+                        cancelled_order_id,
+                    )
+                )
+                if msg_id:
+                    await set_admin_msg_id(cancelled_order_id, msg_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error(f"[CANCEL] Cleanup order {cancelled_order_id} gagal: {exc}")
+
+        spawn_background(
+            _finalize_cancel(),
+            name=f"cancel-finalize-{cancelled_order_id}",
         )
-        if msg_id:
-            await set_admin_msg_id(cancelled_order_id, msg_id)
 
     await set_cooldown_db(user_id)
 
@@ -4286,6 +4589,29 @@ async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
 def _split_required_ids(requires_str: str) -> list:
     return [pid.strip() for pid in (requires_str or '').split(',') if pid.strip()]
 
+
+def _format_prerequisite_catalog(requires_str: str, products: list) -> str:
+    """Tampilkan syarat sebelum user membuat invoice agar tidak kaget setelah bayar."""
+    required_ids = _split_required_ids(requires_str)
+    if not required_ids:
+        return ""
+    products_by_id = {p.get('paket_id'): p for p in products}
+    lines = []
+    for pid in required_ids:
+        product = products_by_id.get(pid)
+        if product:
+            lines.append(f"• {esc(product.get('emoji', '📦'))} {esc(product.get('nama', pid))}")
+        else:
+            lines.append(f"• {esc(pid)}")
+    return (
+        "\n\n🔒 <b>SYARAT AKSES</b>\n"
+        "Paket ini tetap bisa dibayar, tetapi link belum dikirim "
+        "sebelum semua paket syarat terpenuhi.\n\n"
+        + "\n".join(lines)
+        + "\n\n✅ Link akan dikirim otomatis setelah semua paket syarat selesai dibayar."
+    )
+
+
 async def _build_prereq_progress(user_id: int, requires_str: str, parent_order_id: str = None) -> dict:
     all_req_ids = _split_required_ids(requires_str)
     missing = await check_prerequisites_sync(user_id, requires_str)
@@ -4299,11 +4625,15 @@ async def _build_prereq_progress(user_id: int, requires_str: str, parent_order_i
         label = f"{p_obj['emoji']} {p_obj['nama']}" if p_obj else pid
         if pid in missing_set:
             lines.append(f"❌ {esc(label)}")
-            if parent_order_id:
-                buttons.append([InlineKeyboardButton(
-                    f"🛒 Beli {p_obj['nama'] if p_obj else pid}",
-                    callback_data=f"prereq_buy_{pid}|{parent_order_id}"
-                )])
+            callback_data = (
+                f"prereq_buy_{pid}|{parent_order_id}"
+                if parent_order_id
+                else f"prereq_buy_{pid}"
+            )
+            buttons.append([InlineKeyboardButton(
+                f"🛒 Beli {p_obj['nama'] if p_obj else pid}",
+                callback_data=callback_data
+            )])
         else:
             lines.append(f"✅ {esc(label)}")
 
@@ -4389,21 +4719,22 @@ async def _send_buyer_product_link(bot, user_id: int, order_id: str, paket: dict
 async def _send_prereq_hold_message(bot, user_id: int, order_id: str, paket: dict, paid_amount: int, progress: dict):
     await mark_delivery_held(order_id, 'Syarat belum terpenuhi')
     product_name = f"{paket.get('emoji','📦')} {paket.get('nama','Produk')}"
-    prerequisite_text = "\n".join(
-        line.replace("❌ ", "⬜ ", 1) if line.startswith("❌ ") else line
-        for line in progress['lines']
-    )
+    prerequisite_text = "\n".join(progress['lines'])
     await bot.send_message(
         chat_id=user_id,
         text=(
-            f"🔒 <b>Akses {esc(paket.get('nama','Produk'))} Belum Terbuka</b>\n"
+            f"✅ <b>PEMBAYARAN BERHASIL</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"Pesanan {esc(product_name)} kamu tetap aman.\n\n"
-            f"Untuk mendapatkan link akses {esc(paket.get('nama','Produk'))}, kamu perlu melengkapi paket berikut:\n\n"
-            f"📋 Progress: {progress['fulfilled_count']} dari {progress['total_count']} paket\n\n"
+            f"Pembayaran untuk paket {esc(product_name)} sudah berhasil.\n\n"
+            f"Namun, link paket ini belum dapat dikirim karena masih ada "
+            f"paket syarat yang belum terpenuhi.\n\n"
+            f"🔒 <b>PAKET SYARAT:</b>\n"
             f"{prerequisite_text}\n\n"
-            f"Pilih paket yang belum dimiliki melalui tombol di bawah.\n\n"
-            f"Link {esc(paket.get('nama','Produk'))} akan dikirim otomatis setelah semua paket terpenuhi."
+            f"📊 Progress: <b>{progress['fulfilled_count']}/{progress['total_count']}</b> paket syarat\n\n"
+            f"Silakan tekan tombol paket yang bertanda ❌ untuk membelinya.\n\n"
+            f"Setelah semua paket syarat selesai dibayar:\n"
+            f"✅ Link {esc(paket.get('nama','Produk'))} akan dikirim otomatis.\n\n"
+            f"<i>Kamu tidak perlu membayar ulang paket ini.</i>"
         ),
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(progress['buttons']) if progress['buttons'] else None
@@ -6368,9 +6699,10 @@ async def _run_broadcast(bot, admin_id: int, buyers: list, text_blast: str):
                 logger.error(f"[BLAST] Gagal mengirim pesan ke {target_id}: {e}")
                 failed += 1
 
-            await asyncio.sleep(0.05)
+            # Sisakan kapasitas rate limiter untuk /start, pembayaran, dan chat user.
+            await asyncio.sleep(BROADCAST_INTERVAL_SECONDS)
 
-            if (index + 1) % 20 == 0 or (index + 1) == total:
+            if (index + 1) % 50 == 0 or (index + 1) == total:
                 percent = int(((index + 1) / total) * 100)
                 try:
                     await bot.edit_message_text(
@@ -8079,7 +8411,10 @@ def _install_uvloop_if_available():
 
 def main():
     init_pool()
-    init_db()
+    if RUN_DB_MIGRATIONS_ON_STARTUP:
+        init_db()
+    else:
+        logger.info("[DB] Startup migrations dilewati (RUN_DB_MIGRATIONS_ON_STARTUP=0).")
 
     builder = (
         Application.builder()

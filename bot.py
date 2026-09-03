@@ -352,7 +352,7 @@ async def _show_cooldown_alert(query, sisa: int):
     """Feedback cooldown lewat alert callback agar tidak menambah bubble chat."""
     try:
         await query.answer(
-            f"⏳ Cooldown aktif. Coba lagi dalam {sisa} menit.",
+            f"⏳ COOLDOWN AKTIF\n\nTunggu {sisa} menit lagi sebelum membuat invoice baru.",
             show_alert=True,
         )
     except Exception as exc:
@@ -1127,7 +1127,6 @@ def init_db():
             """)
             c.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS admin_msg_id BIGINT DEFAULT NULL")
             c.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS buyer_msg_id BIGINT DEFAULT NULL")
-            c.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS prereq_update_msg_id BIGINT DEFAULT NULL")
             c.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS sent_link TEXT DEFAULT NULL")
             c.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_status TEXT DEFAULT 'not_sent'")
             c.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_error TEXT DEFAULT NULL")
@@ -2189,14 +2188,6 @@ def get_completed_order_for_user(order_id: str, user_id: int):
             row = c.fetchone()
             return dict(row) if row else None
 
-
-
-@async_wrap
-def set_prereq_update_msg_id(order_id, msg_id):
-    with db_session_safe() as conn:
-        with conn.cursor() as c:
-            c.execute("UPDATE orders SET prereq_update_msg_id=%s WHERE order_id=%s", (msg_id, order_id))
-
 @async_wrap
 def check_prerequisites_sync(user_id: int, requires_paket_ids_str: str) -> list:
     """Cek pemenuhan syarat pembelian paket."""
@@ -2845,9 +2836,9 @@ async def _reject_new_invoice_during_maintenance(query, context, user_id: int) -
         return False
 
     notice = (
-        "⚙️ Maintenance aktif.\n"
-        "Invoice baru sementara ditutup untuk semua pengguna.\n"
-        "Invoice yang sudah dibuat tetap diproses."
+        "⚠️ BOT SEDANG MAINTENANCE\n\n"
+        "Pembelian sementara ditutup.\n"
+        "Silakan coba lagi nanti."
     )
     try:
         if query is not None:
@@ -4848,23 +4839,27 @@ async def _send_prereq_hold_message(bot, user_id: int, order_id: str, paket: dic
     # Simpan ID pesan hold agar update berikutnya mengedit pesan yang sama,
     # bukan mengirim pesan baru yang menumpuk di chat buyer.
     try:
-        await set_prereq_update_msg_id(order_id, msg.message_id)
+        await set_buyer_msg_id(order_id, msg.message_id)
     except Exception as exc:
-        logger.warning(f"[PREREQ] Gagal menyimpan prereq_update_msg_id {order_id}: {exc}")
+        logger.warning(f"[PREREQ] Gagal menyimpan buyer_msg_id {order_id}: {exc}")
 
 
 def _format_buyer_prereq_update(parent_label: str, parent_name: str, progress: dict) -> str:
     missing_count = len(progress['missing'])
     return (
         "📋 <b>UPDATE AKSES</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "━━━━━━━━━━━━━━━\n\n"
         f"🎯 Target: <b>{esc(parent_label)}</b>\n\n"
         "✅ Pembayaran target sudah diterima.\n\n"
-        f"📊 Progress syarat: <b>{progress['fulfilled_count']}/{progress['total_count']}</b>\n\n"
+        f"Untuk mendapatkan akses {esc(parent_name)},\n"
+        "silakan selesaikan paket syarat terlebih dahulu.\n\n"
+        "📦 Progress syarat:\n"
+        f"<b>{progress['fulfilled_count']}/{progress['total_count']} paket selesai</b>\n\n"
+        "Status paket syarat:\n"
         f"{progress['text']}\n\n"
         f"⏳ Masih kurang <b>{missing_count} paket</b> lagi.\n\n"
-        "Tekan tombol di bawah untuk membeli paket yang belum terpenuhi.\n"
-        f"Setelah lengkap, link {esc(parent_name)} akan dikirim otomatis."
+        "Tekan tombol di bawah untuk membeli paket syarat.\n"
+        f"Setelah semua lengkap, link {esc(parent_name)} akan dikirim otomatis."
     )
 
 
@@ -4880,13 +4875,20 @@ def _format_buyer_prereq_complete(parent_label: str, parent_name: str, progress:
 
 async def _edit_or_send_buyer_prereq_update(bot, user_id: int, parent_order: dict,
                                             text: str, reply_markup=None) -> bool:
-    """Update syarat memakai pesan baru. Hanya notifikasi update syarat lama yang dihapus."""
-    old_message_id = parent_order.get('prereq_update_msg_id')
+    """Edit pesan hold/update lama; fallback kirim satu pesan jika pesan sudah hilang."""
+    old_message_id = parent_order.get('buyer_msg_id')
     if old_message_id:
         try:
-            await bot.delete_message(chat_id=user_id, message_id=int(old_message_id))
-        except Exception:
-            pass
+            await bot.edit_message_text(
+                chat_id=user_id,
+                message_id=int(old_message_id),
+                text=text,
+                parse_mode="HTML",
+                reply_markup=reply_markup,
+            )
+            return True
+        except Exception as exc:
+            logger.debug(f"[PREREQ PROGRESS] Gagal edit pesan buyer {old_message_id}: {exc}")
 
     try:
         msg = await bot.send_message(
@@ -4896,12 +4898,14 @@ async def _edit_or_send_buyer_prereq_update(bot, user_id: int, parent_order: dic
             reply_markup=reply_markup,
         )
         try:
-            await set_prereq_update_msg_id(parent_order['order_id'], msg.message_id)
+            await set_buyer_msg_id(parent_order['order_id'], msg.message_id)
         except Exception as exc:
-            logger.warning(f"[PREREQ UPDATE] Gagal simpan ID update: {exc}")
+            logger.warning(
+                f"[PREREQ PROGRESS] Gagal menyimpan buyer_msg_id {parent_order['order_id']}: {exc}"
+            )
         return True
     except Exception as exc:
-        logger.error(f"[PREREQ UPDATE] Gagal kirim update buyer {user_id}: {exc}")
+        logger.error(f"[PREREQ PROGRESS] Gagal kirim update buyer {user_id}: {exc}")
         return False
 
 async def _notify_parent_prereq_progress(bot, user_id: int, user_name: str, parent_order: dict,

@@ -1269,6 +1269,7 @@ _settings_cache: dict = {}
 _SETTINGS_TTL = 60
 _settings_cache_lock: asyncio.Lock = None
 _products_cache: tuple = None
+_products_by_id_cache: tuple = None
 _PRODUCTS_TTL = 30
 _products_cache_lock: asyncio.Lock = None
 _products_cache_generation = 0
@@ -1302,7 +1303,7 @@ def _load_all_products_sync():
             return [dict(r) for r in c.fetchall()]
 
 async def get_all_products():
-    global _products_cache, _products_cache_lock
+    global _products_cache, _products_by_id_cache, _products_cache_lock
     now_mono = _time.monotonic()
     cached = _products_cache
     if cached and now_mono < cached[1]:
@@ -1324,14 +1325,28 @@ async def get_all_products():
             # Jika admin mengubah produk saat query berjalan, ulangi agar cache tidak berisi snapshot lama.
             if generation == _products_cache_generation:
                 _products_cache = (data, _time.monotonic() + _PRODUCTS_TTL)
+                # Lookup detail paket tidak perlu menyalin dan memindai seluruh daftar produk.
+                # Cache ini selalu dibuat bersamaan dengan cache list agar snapshot konsisten.
+                _products_by_id_cache = (
+                    {item.get('paket_id'): item for item in data if item.get('paket_id') is not None},
+                    _time.monotonic() + _PRODUCTS_TTL,
+                )
                 return copy.deepcopy(data)
 
 def _invalidate_products_cache():
-    global _products_cache, _products_cache_generation
+    global _products_cache, _products_by_id_cache, _products_cache_generation
     _products_cache_generation += 1
     _products_cache = None
+    _products_by_id_cache = None
 
 async def get_product(paket_id):
+    # Jalur tombol detail memakai index in-memory sehingga tidak perlu deep-copy + scan semua produk.
+    # Saat cache belum terisi, fallback ke get_all_products tetap menjaga perilaku lama.
+    cached_by_id = _products_by_id_cache
+    if cached_by_id and _time.monotonic() < cached_by_id[1]:
+        item = cached_by_id[0].get(paket_id)
+        return copy.deepcopy(item) if item is not None else None
+
     # Single-flight get_all_products memastikan banyak callback saat TTL habis hanya memicu satu query.
     products = await get_all_products()
     for item in products:
@@ -3010,8 +3025,18 @@ async def hapus_qris_buyer_lama(bot, order_id, user_id):
 
 # =================== MAIN MENU ===================
 
-async def build_main_menu_text():
-    products = await get_all_products()
+async def build_main_menu_parts():
+    """Bangun teks dan keyboard menu dalam satu batch pengambilan data.
+
+    Sebelumnya /start dan tombol kembali menjalankan dua coroutine terpisah.
+    Cache memang mencegah dua query DB, tetapi tetap ada dua jalur coroutine dan
+    dua deep-copy list produk. Satu helper ini membuat satu snapshot menu.
+    """
+    products, link_testi, link_cs = await asyncio.gather(
+        get_all_products(),
+        get_setting('link_testimoni', 'https://t.me/+7zsdSrwYIG8wOTg1'),
+        get_setting('link_admin', ADMIN_URL),
+    )
     aktif_products = [p for p in products if p.get('aktif', True)]
     text = (
         "<b>🛒 HYPER FAMILY STORE</b>\n"
@@ -3028,18 +3053,22 @@ async def build_main_menu_text():
         "========================\n"
         "💳 QRIS (All E-Wallet)  |  ⚡ 1-5 Menit  |  🕒 24 Jam"
     )
-    return text
-
-async def build_main_menu_keyboard():
-    link_testi = await get_setting('link_testimoni', 'https://t.me/+7zsdSrwYIG8wOTg1')
-    link_cs = await get_setting('link_admin', ADMIN_URL)
-    return [
+    keyboard = [
         [InlineKeyboardButton("🛒 Beli Sekarang", callback_data="buy")],
         [
             InlineKeyboardButton("⭐ Testimoni", url=link_testi),
             InlineKeyboardButton("💬 Admin", url=link_cs)
         ]
     ]
+    return text, keyboard
+
+async def build_main_menu_text():
+    text, _ = await build_main_menu_parts()
+    return text
+
+async def build_main_menu_keyboard():
+    _, keyboard = await build_main_menu_parts()
+    return keyboard
 
 def simpan_admin_msg(context, user_id, message_id):
     context.bot_data.setdefault('admin_messages', {})
@@ -3671,10 +3700,7 @@ async def _start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, tra
             trace.mark("active-order-send")
         return
 
-    menu_text, menu_keyboard = await asyncio.gather(
-        build_main_menu_text(),
-        build_main_menu_keyboard(),
-    )
+    menu_text, menu_keyboard = await build_main_menu_parts()
     if trace:
         trace.mark("menu-built")
     await _send_user_message_replace(
@@ -3735,28 +3761,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    user_id = query.from_user.id
     await _fast_callback_ack(query)
 
-    # Spinner Telegram sudah berhenti; validasi tetap paralel agar menu muncul secepat mungkin.
-    maint, banned = await asyncio.gather(
-        is_maintenance(),
-        is_banned(user_id),
-    )
-
-    if maint:
-        await _reject_new_invoice_during_maintenance(query, context, user_id)
-        return
-
-    if banned:
-        await _callback_feedback(query, context, "🚫 Akun kamu diblokir. Hubungi admin.")
-        return
-
-    cooldown_sisa = await get_cooldown_sisa_db(user_id)
-    if cooldown_sisa > 0:
-        await _show_cooldown_alert(query, cooldown_sisa)
-        return
-
+    # Validasi maintenance, blokir, order aktif, dan cooldown tetap dilakukan
+    # di confirm_buy_handler. Di sini cukup render daftar dari cache agar tombol
+    # navigasi terasa instan dan tidak menunggu beberapa query DB.
     products = await get_all_products()
     aktif = [p for p in products if p.get('aktif', True)]
     if not aktif:
@@ -3789,22 +3798,12 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def pilih_paket(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    user_id = query.from_user.id
     await _fast_callback_ack(query)
 
-    cooldown_sisa = await get_cooldown_sisa_db(user_id)
-    if cooldown_sisa > 0:
-        await _show_cooldown_alert(query, cooldown_sisa)
-        return
-
     paket_id = query.data.replace("pilih_", "")
-    banned, paket = await asyncio.gather(
-        is_banned(user_id),
-        get_product(paket_id),
-    )
-    if banned:
-        await _callback_feedback(query, context, "🚫 Akun kamu diblokir. Hubungi admin.")
-        return
+    # get_product memakai index paket_id di memory; pengecekan pembelian tetap
+    # dilakukan ulang saat tombol "Lanjut Bayar" ditekan.
+    paket = await get_product(paket_id)
     if not paket:
         await _callback_feedback(query, context, "❌ Produk tidak ditemukan.")
         return
@@ -4299,11 +4298,12 @@ async def cancel_order_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             await hapus_msg_user_lama(context, user_id, keep_last=1)
             return
 
+    menu_text, menu_keyboard = await build_main_menu_parts()
     msg = await context.bot.send_message(
         chat_id=update.effective_chat.id,
-        text=await build_main_menu_text(),
+        text=menu_text,
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(await build_main_menu_keyboard())
+        reply_markup=InlineKeyboardMarkup(menu_keyboard)
     )
     simpan_msg_user(context, user_id, msg.message_id)
     await hapus_msg_user_lama(context, user_id, keep_last=1)
@@ -4312,12 +4312,9 @@ async def cancel_order_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await _fast_callback_ack(query)
 
-    menu_text, menu_keyboard = await asyncio.gather(
-        build_main_menu_text(),
-        build_main_menu_keyboard(),
-    )
+    menu_text, menu_keyboard = await build_main_menu_parts()
     await query.edit_message_text(
         text=menu_text,
         parse_mode="HTML",

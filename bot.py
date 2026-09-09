@@ -224,10 +224,16 @@ _ADMIN_ID_RAW = os.environ.get("ADMIN_ID", "")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 APP_ENV = os.environ.get("APP_ENV") or os.environ.get("ENV") or "development"
 
-# AutoGoPay adalah satu-satunya payment provider.
+# AutoGoPay gateway: GoPay utama, ShopeePay merchant sebagai cadangan.
 AUTOGOPAY_API_KEY = (os.environ.get("AUTOGOPAY_API_KEY") or "").strip()
 AUTOGOPAY_BASE_URL = (os.environ.get("AUTOGOPAY_BASE_URL") or "https://v1-gateway.autogopay.site").rstrip("/")
 AUTOGOPAY_DEFAULT_TIMEOUT_SECONDS = 15 * 60
+# GoPay tetap provider utama. ShopeePay hanya dipakai bila GoPay mengembalikan
+# penolakan JSON eksplisit, bukan 5xx/timeout/JSON rusak yang masih
+# mungkin berarti transaksi GoPay sebenarnya sudah tercipta.
+SHOPEEPAY_FALLBACK_ENABLED = (
+    os.environ.get("SHOPEEPAY_FALLBACK_ENABLED", "1").strip() == "1"
+)
 
 # =================== PERFORMANCE TUNING ===================
 # Berbeda user/chat diproses paralel, tetapi update dari chat yang sama tetap berurutan.
@@ -643,6 +649,10 @@ AUTOGOPAY_STATUS_MAP = {
     "cancel": "cancelled",
     "cancelled": "cancelled",
     "canceled": "cancelled",
+    # ShopeePay memakai status success + paid=true, sedangkan GoPay memakai
+    # settlement. Keduanya harus masuk ke status internal completed.
+    "success": "completed",
+    "paid": "completed",
 }
 
 
@@ -695,7 +705,7 @@ async def _read_json_response(response: aiohttp.ClientResponse) -> dict:
             f"[PAYMENT] Respons non-JSON dari provider (HTTP {response.status}): "
             f"{raw_text[:500]}"
         )
-        return {"success": False, "message": raw_text[:500]}
+        return {"success": False, "message": raw_text[:500], "_invalid_json": True}
 
 
 def _autogopay_headers() -> dict:
@@ -725,7 +735,7 @@ def _normalize_autogopay_transaction(data: dict, fallback_amount: int = 0) -> di
     )
     transaction_id = data.get("transaction_id") or data.get("id")
     return {
-        "payment_provider": "autogopay",
+        "payment_provider": "gopay",
         "provider_transaction_id": transaction_id,
         "provider_order_id": data.get("order_id"),
         "provider_status": str(provider_status).lower(),
@@ -738,6 +748,33 @@ def _normalize_autogopay_transaction(data: dict, fallback_amount: int = 0) -> di
         "qr_url": data.get("qr_url"),
         "checkout_url": data.get("checkout_url"),
         "transaction_time": data.get("transaction_time") or data.get("time"),
+        "expiry_time": data.get("expiry_time"),
+        "raw": data,
+    }
+
+
+def _normalize_shopeepay_transaction(data: dict, fallback_amount: int = 0) -> dict:
+    """Normalisasi respons ShopeePay yang memakai order_sn, bukan transaction_id."""
+    order_sn = data.get("order_sn") or data.get("transaction_id") or data.get("id")
+    paid = data.get("paid") is True or _safe_int(data.get("order_status"), 0) == 1
+    if "paid" in data and data.get("paid") is not True:
+        paid = False
+    if "order_status" in data and _safe_int(data.get("order_status"), 0) != 1:
+        paid = False
+    provider_status = str(data.get("status") or ("success" if paid else "pending")).lower()
+    return {
+        "payment_provider": "shopeepay",
+        "provider_transaction_id": str(order_sn) if order_sn is not None else None,
+        "provider_order_id": str(order_sn) if order_sn is not None else None,
+        "provider_status": provider_status,
+        "status": "completed" if paid else "waiting",
+        "amount": _safe_int(data.get("amount"), _safe_int(fallback_amount)),
+        "fee": _safe_int(data.get("fee"), 0),
+        "payment_number": data.get("qr_string") or "",
+        "qr_string": data.get("qr_string") or "",
+        "qr_url": data.get("qr_url"),
+        "checkout_url": data.get("checkout_url"),
+        "transaction_time": data.get("transaction_time") or data.get("paid_at"),
         "expiry_time": data.get("expiry_time"),
         "raw": data,
     }
@@ -777,12 +814,13 @@ def _autogopay_record_failure():
         )
 
 
-async def _autogopay_create_transaction(amount: int):
+async def _autogopay_create_transaction_detailed(amount: int):
+    """Return (QR, failure); timeout/5xx/malformed JSON may have created a QR."""
     if not AUTOGOPAY_API_KEY:
         logger.error("[AUTOGOPAY] AUTOGOPAY_API_KEY tidak tersedia.")
-        return None
+        return None, "definitive"
     if _autogopay_circuit_is_open():
-        return None
+        return None, "circuit"
     started = _time.monotonic()
     try:
         semaphore = await _get_autogopay_semaphore()
@@ -796,17 +834,26 @@ async def _autogopay_create_transaction(amount: int):
             ) as response:
                 result = await _read_json_response(response)
                 if response.status < 200 or response.status >= 300 or result.get("success") is False:
-                    if response.status == 429 or response.status >= 500:
-                        _autogopay_record_failure()
+                    _autogopay_record_failure()
                     logger.error(f"[AUTOGOPAY] Gagal generate QRIS HTTP {response.status}: {result}")
-                    return None
+                    failure_data = _extract_autogopay_data(result)
+                    uncertain = (
+                        response.status >= 500
+                        or result.get("_invalid_json")
+                        or any(failure_data.get(key) for key in (
+                            "transaction_id", "order_id", "id", "qr_string", "checkout_url"
+                        ))
+                        or result.get("success") is not False
+                    )
+                    return None, "uncertain" if uncertain else "definitive"
                 data = _extract_autogopay_data(result)
                 normalized = _normalize_autogopay_transaction(data, amount)
                 if not normalized.get("provider_transaction_id") or not normalized.get("qr_string"):
                     logger.error(f"[AUTOGOPAY] Respons generate tidak lengkap: {result}")
-                    return None
+                    _autogopay_record_failure()
+                    return None, "uncertain"
                 _autogopay_record_success()
-                return normalized
+                return normalized, None
     except asyncio.TimeoutError:
         _autogopay_record_failure()
         logger.error("[AUTOGOPAY] Timeout saat membuat transaksi QRIS.")
@@ -817,6 +864,93 @@ async def _autogopay_create_transaction(amount: int):
         logger.error(f"[AUTOGOPAY] Error saat membuat QRIS: {e}", exc_info=True)
     finally:
         _record_latency("autogopay-create", _time.monotonic() - started)
+    return None, "uncertain"
+
+
+async def _autogopay_create_transaction(amount: int):
+    """Kompatibilitas untuk call-site lama yang hanya membutuhkan data QR."""
+    data, _failure = await _autogopay_create_transaction_detailed(amount)
+    return data
+
+
+async def _autogopay_create_shopeepay_transaction(amount: int):
+    """Buat QRIS ShopeePay merchant melalui endpoint AutoGoPay."""
+    if not AUTOGOPAY_API_KEY:
+        return None
+    started = _time.monotonic()
+    try:
+        semaphore = await _get_autogopay_semaphore()
+        async with semaphore:
+            session = await get_http_session()
+            async with session.post(
+                f"{AUTOGOPAY_BASE_URL}/shopeepay/qris/create",
+                json={"amount": int(amount)},
+                headers=_autogopay_headers(),
+                timeout=AUTOGOPAY_HTTP_TIMEOUT,
+            ) as response:
+                result = await _read_json_response(response)
+                if response.status < 200 or response.status >= 300 or result.get("success") is False:
+                    logger.error(f"[SHOPEEPAY] Gagal generate QRIS HTTP {response.status}: {result}")
+                    return None
+                data = _extract_autogopay_data(result)
+                normalized = _normalize_shopeepay_transaction(data, amount)
+                if not normalized.get("provider_transaction_id") or not normalized.get("qr_string"):
+                    logger.error(f"[SHOPEEPAY] Respons generate tidak lengkap: {result}")
+                    return None
+                return normalized
+    except asyncio.TimeoutError:
+        logger.error("[SHOPEEPAY] Timeout saat membuat transaksi QRIS.")
+    except aiohttp.ClientError as e:
+        logger.error(f"[SHOPEEPAY] Gangguan koneksi saat membuat QRIS: {e}")
+    except Exception as e:
+        logger.error(f"[SHOPEEPAY] Error saat membuat QRIS: {e}", exc_info=True)
+    finally:
+        _record_latency("shopeepay-create", _time.monotonic() - started)
+    return None
+
+
+async def _autogopay_get_shopeepay_status(order_sn: str, fallback_amount: int = 0):
+    """Cek status QR ShopeePay berdasarkan order_sn."""
+    if not AUTOGOPAY_API_KEY or not order_sn:
+        return None
+    started = _time.monotonic()
+    try:
+        semaphore = await _get_autogopay_semaphore()
+        async with semaphore:
+            session = await get_http_session()
+            async with session.get(
+                f"{AUTOGOPAY_BASE_URL}/shopeepay/qris/status",
+                params={"order_sn": str(order_sn)},
+                headers=_autogopay_headers(),
+                timeout=AUTOGOPAY_HTTP_TIMEOUT,
+            ) as response:
+                result = await _read_json_response(response)
+                if response.status < 200 or response.status >= 300 or result.get("success") is False:
+                    logger.warning(f"[SHOPEEPAY] Gagal cek status HTTP {response.status}: {result}")
+                    return None
+                data = _extract_autogopay_data(result)
+                if data.get("order_sn") is not None and str(data["order_sn"]) != str(order_sn):
+                    logger.error("[SHOPEEPAY] ID status tidak cocok; respons ditolak.")
+                    return None
+                normalized = _normalize_shopeepay_transaction(data, fallback_amount)
+                if normalized["status"] == "completed" and (
+                    _safe_int(data.get("amount"), -1) != _safe_int(fallback_amount)
+                    or _safe_int(fallback_amount) <= 0
+                ):
+                    logger.error("[SHOPEEPAY] Nominal status tidak cocok; respons ditolak.")
+                    return None
+                normalized["provider_transaction_id"] = (
+                    normalized.get("provider_transaction_id") or str(order_sn)
+                )
+                return normalized
+    except asyncio.TimeoutError:
+        logger.warning(f"[SHOPEEPAY] Timeout cek status {order_sn}")
+    except aiohttp.ClientError as e:
+        logger.warning(f"[SHOPEEPAY] Gangguan koneksi cek status {order_sn}: {e}")
+    except Exception as e:
+        logger.error(f"[SHOPEEPAY] Error cek status {order_sn}: {e}", exc_info=True)
+    finally:
+        _record_latency("shopeepay-status", _time.monotonic() - started)
     return None
 
 
@@ -897,30 +1031,46 @@ async def _autogopay_cancel_transaction(transaction_id: str):
 
 
 async def create_transaction_qris(order_id, amount, description):
-    """Buat transaksi QRIS AutoGoPay. Parameter lama dipertahankan agar call-site tetap stabil."""
+    """Buat QR GoPay sebagai utama, ShopeePay sebagai fallback aman."""
     del order_id, description
-    return await _autogopay_create_transaction(amount)
+    gopay_data, failure_kind = await _autogopay_create_transaction_detailed(amount)
+    if gopay_data:
+        return gopay_data
+    if SHOPEEPAY_FALLBACK_ENABLED and failure_kind in {"definitive", "circuit"}:
+        logger.warning("[PAYMENT] GoPay gagal; mencoba fallback ShopeePay.")
+        return await _autogopay_create_shopeepay_transaction(amount)
+    logger.error(
+        "[PAYMENT] GoPay tidak memberi hasil pasti (%s); fallback ShopeePay dilewati.",
+        failure_kind or "unknown",
+    )
+    return None
 
 
 async def get_transaction_detail(order_id, amount):
-    """Cek status transaksi AutoGoPay berdasarkan transaction_id yang tersimpan."""
+    """Cek status transaksi sesuai provider yang tersimpan."""
     order = await get_order_by_id(order_id)
     if not order:
         return None
     transaction_id = order.get("provider_transaction_id")
-    detail = await _autogopay_get_status(transaction_id, amount)
+    if str(order.get("payment_provider") or "").lower() == "shopeepay":
+        detail = await _autogopay_get_shopeepay_status(transaction_id, amount)
+    else:
+        detail = await _autogopay_get_status(transaction_id, amount)
     if detail:
         await update_order_provider_status(order_id, detail.get("provider_status"))
     return detail
 
 
 async def cancel_transaction(order_id, amount=0):
-    """Batalkan transaksi AutoGoPay berdasarkan transaction_id yang tersimpan."""
+    """Batalkan transaksi GoPay; ShopeePay tidak memiliki endpoint cancel di docs."""
     del amount
     order = await get_order_by_id(order_id)
     if not order:
         return None
     transaction_id = order.get("provider_transaction_id")
+    if str(order.get("payment_provider") or "").lower() == "shopeepay":
+        logger.info("[SHOPEEPAY] Tidak ada endpoint cancel; perubahan status hanya lokal di bot.")
+        return None
     result = await _autogopay_cancel_transaction(transaction_id)
     if result is not None:
         await update_order_provider_status(order_id, "cancel")
@@ -3264,7 +3414,8 @@ async def kirim_link_ke_buyer(context, user_id, paket, order_id, amount):
 async def _process_autogopay_settlement(order: dict, paid_amount: int):
     """Proses delivery di luar response webhook agar callback dibalas cepat."""
     try:
-        await _stop_payment_task(order["user_id"])
+        # Poller berhenti setelah membaca status completed. Jangan membatalkan
+        # task berdasarkan user_id di sini: buyer mungkin sudah punya order lain.
         paket = await get_product(order["paket_id"])
         await _handle_payment_success(
             _current_bot,
@@ -3317,6 +3468,8 @@ async def autogopay_webhook_handler(request: aio_web.Request) -> aio_web.Respons
         data = json.loads(body)
     except json.JSONDecodeError:
         return aio_web.Response(status=400, text="invalid json")
+    if not isinstance(data, dict):
+        return aio_web.Response(status=400, text="invalid payload")
 
     callback_event = str(
         data.get("event") or request.headers.get("X-Callback-Event") or ""
@@ -3328,28 +3481,56 @@ async def autogopay_webhook_handler(request: aio_web.Request) -> aio_web.Respons
     if not isinstance(transaction, dict):
         return aio_web.Response(status=400, text="missing transaction")
 
-    provider_transaction_id = transaction.get("id") or transaction.get("transaction_id")
+    payment_method = str(transaction.get("payment_method") or "QRIS").strip().upper()
+    expected_provider = {"QRIS": "gopay", "QRIS_SHOPEEPAY": "shopeepay"}.get(payment_method)
+    if expected_provider is None:
+        return aio_web.json_response({"success": True, "ignored": True})
+    transaction_ids = list(dict.fromkeys(
+        str(transaction[key]) for key in ("order_sn", "transaction_id", "id", "order_id")
+        if transaction.get(key)
+    ))
     provider_status = str(transaction.get("status") or "").strip().lower()
+    if payment_method == "QRIS_SHOPEEPAY":
+        # Sebagian payload ShopeePay mengirim paid/order_status, bukan
+        # transaction status settlement seperti GoPay.
+        if transaction.get("paid") is True or _safe_int(transaction.get("order_status"), 0) == 1:
+            provider_status = "success"
     paid_amount = _safe_int(transaction.get("amount"), -1)
 
-    if not provider_transaction_id:
+    if not transaction_ids:
         return aio_web.Response(status=400, text="missing transaction id")
 
-    order = await get_order_by_provider_transaction_id(str(provider_transaction_id))
+    order = None
+    for transaction_id in transaction_ids:
+        candidate = await get_order_by_provider_transaction_id(transaction_id)
+        if candidate:
+            stored_provider = str(candidate.get("payment_provider") or "autogopay").lower()
+            if stored_provider == "autogopay":
+                stored_provider = "gopay"  # Order GoPay lama tetap kompatibel.
+            if stored_provider == expected_provider:
+                order = candidate
+                break
     if not order:
         logger.warning(
-            f"[AUTOGOPAY WEBHOOK] Transaction ID tidak ditemukan: {provider_transaction_id}"
+            f"[AUTOGOPAY WEBHOOK] Transaction ID/provider tidak cocok: {transaction_ids}"
         )
         return aio_web.Response(status=404, text="order not found")
 
     await update_order_provider_status(order["order_id"], provider_status)
 
     # Event non-settlement cukup dicatat. Polling tetap menjadi fallback status.
-    if provider_status != "settlement":
+    is_paid = (
+        provider_status in {"settlement", "success", "paid"}
+        or transaction.get("paid") is True
+        or _safe_int(transaction.get("order_status"), 0) == 1
+    )
+    if expected_provider == "shopeepay":
+        if "paid" in transaction and transaction.get("paid") is not True:
+            is_paid = False
+        if "order_status" in transaction and _safe_int(transaction.get("order_status"), 0) != 1:
+            is_paid = False
+    if not is_paid:
         return aio_web.json_response({"success": True, "ignored": True})
-
-    if order.get("status") != "waiting":
-        return aio_web.json_response({"success": True, "already_processed": True})
 
     expected_amount = _safe_int(order.get("harga_dibayar"), 0)
     if paid_amount < 0 or expected_amount <= 0 or paid_amount != expected_amount:
@@ -3358,6 +3539,20 @@ async def autogopay_webhook_handler(request: aio_web.Request) -> aio_web.Respons
             f"expected={expected_amount}, received={paid_amount}"
         )
         return aio_web.Response(status=400, text="amount mismatch")
+
+    if order.get("status") != "waiting":
+        if order.get("status") != "completed":
+            logger.error("[PAYMENT] Dana masuk pada order non-aktif: %s", order["order_id"])
+            if _current_bot and normalize_autogopay_status(order.get("provider_status")) != "completed":
+                spawn_background(kirim_notif(
+                    _current_bot,
+                    "⚠️ <b>DANA MASUK PADA ORDER NON-AKTIF</b>\n"
+                    f"Order: <code>{esc(order['order_id'])}</code>\n"
+                    f"Provider: {esc(expected_provider)}\n"
+                    f"Nominal: {format_harga(paid_amount)}\n"
+                    "Periksa pembayaran ini secara manual; link tidak dikirim otomatis."
+                ), name=f"late-payment-{order['order_id']}")
+        return aio_web.json_response({"success": True, "already_processed": True})
 
     if not _current_bot:
         logger.error(f"[AUTOGOPAY WEBHOOK] Bot belum siap: {order['order_id']}")
@@ -4074,7 +4269,7 @@ async def _buat_order_baru(update, context, query, user_id, user_name, paket, or
     fee = trans_data.get('fee', 0)
     total_payment = amount + fee
 
-    payment_provider = "autogopay"
+    payment_provider = str(trans_data.get("payment_provider") or "gopay").lower()
     expiry_dt = parse_provider_datetime(trans_data.get('expiry_time'))
     if expiry_dt is None:
         expiry_dt = now_wib() + timedelta(seconds=AUTOGOPAY_DEFAULT_TIMEOUT_SECONDS)
@@ -4098,7 +4293,8 @@ async def _buat_order_baru(update, context, query, user_id, user_name, paket, or
             perf_trace.mark("save-order")
     except Exception as e:
         logger.error(f"[PAYMENT] Gagal menyimpan order {order_id}: {e}", exc_info=True)
-        await _autogopay_cancel_transaction(trans_data.get('provider_transaction_id'))
+        if payment_provider != "shopeepay":
+            await _autogopay_cancel_transaction(trans_data.get('provider_transaction_id'))
         msg = await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text="❌ Gagal menyimpan invoice. Silakan coba lagi.\nKetik /start untuk memulai ulang.",
@@ -4597,6 +4793,7 @@ async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
     try:
         order = await get_order_by_id(order_id)
         transaction_id = (order or {}).get("provider_transaction_id")
+        payment_provider = str((order or {}).get("payment_provider") or "gopay").lower()
         last_provider_status = str((order or {}).get("provider_status") or "").lower()
         if not transaction_id:
             logger.error(f"[PAYMENT] transaction_id AutoGoPay tidak ditemukan untuk {order_id}")
@@ -4625,7 +4822,10 @@ async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
                 if not row or row['status'] != 'waiting':
                     return
 
-            trans = await _autogopay_get_status(transaction_id, amount)
+            if payment_provider == "shopeepay":
+                trans = await _autogopay_get_shopeepay_status(transaction_id, amount)
+            else:
+                trans = await _autogopay_get_status(transaction_id, amount)
             if not trans:
                 continue
             current_provider_status = str(trans.get("provider_status") or "").lower()
@@ -4644,7 +4844,10 @@ async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
         if not row or row['status'] != 'waiting':
             return
 
-        trans = await _autogopay_get_status(transaction_id, amount)
+        if payment_provider == "shopeepay":
+            trans = await _autogopay_get_shopeepay_status(transaction_id, amount)
+        else:
+            trans = await _autogopay_get_status(transaction_id, amount)
         if trans:
             current_provider_status = str(trans.get("provider_status") or "").lower()
             if current_provider_status and current_provider_status != last_provider_status:
@@ -5050,12 +5253,15 @@ async def _process_completed_order_delivery(bot, order_id: str, paket_id: str, u
 
 async def _handle_payment_success(bot, order_id: str, paket_id: str, user_id: int,
                                   user_name: str, amount: int, trans: dict, paket: dict = None):
+    paid_amount = _safe_int(trans.get('amount'), -1)
+    if _safe_int(amount) <= 0 or paid_amount != _safe_int(amount):
+        logger.error("[PAYMENT] Nominal settlement ditolak untuk %s", order_id)
+        return
     success = await mark_order_completed(order_id)
     if not success:
         logger.debug(f"[PAYMENT] Order ID {order_id} sudah diproses sebelumnya, skip duplikasi.")
         return
 
-    paid_amount = _safe_int(trans.get('amount', amount), amount)
     await _process_completed_order_delivery(
         bot, order_id, paket_id, user_id, user_name, paid_amount,
         source_title="✅ <b>PEMBAYARAN BERHASIL</b>",

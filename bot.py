@@ -3205,6 +3205,7 @@ async def build_main_menu_parts():
     )
     keyboard = [
         [InlineKeyboardButton("🛒 Beli Sekarang", callback_data="buy")],
+        [InlineKeyboardButton("🔄 Kirim Ulang Link", callback_data="resend_menu")],
         [
             InlineKeyboardButton("⭐ Testimoni", url=link_testi),
             InlineKeyboardButton("💬 Admin", url=link_cs)
@@ -3400,7 +3401,7 @@ async def kirim_link_ke_buyer(context, user_id, paket, order_id, amount):
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("⭐ Beri Ulasan / Testimoni", callback_data=f"rate_start|{order_id}")],
             [
-                InlineKeyboardButton("🔄 Kirim Ulang Link", callback_data=f"resendlink|{order_id}"),
+                InlineKeyboardButton("🔄 Kirim Ulang Link", callback_data="resend_menu"),
                 InlineKeyboardButton("💬 Chat Admin", url=await get_setting('link_admin', ADMIN_URL))
             ]
         ])
@@ -3651,6 +3652,7 @@ async def _post_init_warmup(application: Application):
                 BotCommand("start",   "Buka toko"),
                 BotCommand("help",    "Bantuan penggunaan bot"),
                 BotCommand("riwayat", "Lihat riwayat ordermu"),
+                BotCommand("resend", "Kirim ulang link produk yang dibeli"),
             ],
             scope=BotCommandScopeDefault()
         ),
@@ -3932,7 +3934,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>📋 COMMAND TERSEDIA:</b>\n"
         "/start - Buka toko & mulai belanja\n"
         "/help - Tampilkan bantuan ini\n"
-        "/riwayat - Lihat riwayat order kamu\n\n"
+        "/riwayat - Lihat riwayat order kamu\n"
+        "/resend - Pilih produk untuk kirim ulang link terbaru\n\n"
         "<b>❓ PERTANYAAN UMUM:</b>\n\n"
         "<b>Q: Bagaimana cara membayar?</b>\n"
         "A: Scan QRIS yang muncul dengan e-wallet (GoPay, OVO, Dana, dll).\n\n"
@@ -5009,7 +5012,8 @@ async def _send_buyer_product_link(bot, user_id: int, order_id: str, paket: dict
         ),
         parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⭐ Beri Ulasan / Testimoni", callback_data=f"rate_start|{order_id}")]
+                [InlineKeyboardButton("⭐ Beri Ulasan / Testimoni", callback_data=f"rate_start|{order_id}")],
+                [InlineKeyboardButton("🔄 Kirim Ulang Link", callback_data="resend_menu")]
             ])
         ),
         label=f"kirim link buyer {order_id}",
@@ -5384,7 +5388,8 @@ async def admin_kirim_link_prereq(update: Update, context: ContextTypes.DEFAULT_
             ),
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⭐ Beri Ulasan / Testimoni", callback_data=f"rate_start|{order_id}")]
+                [InlineKeyboardButton("⭐ Beri Ulasan / Testimoni", callback_data=f"rate_start|{order_id}")],
+                [InlineKeyboardButton("🔄 Kirim Ulang Link", callback_data="resend_menu")]
             ])
         )
         kirim_berhasil = True
@@ -5624,7 +5629,8 @@ async def handle_rate_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Terima kasih telah berbelanja! 🙏",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⭐ Beri Ulasan / Testimoni", callback_data=f"rate_start|{order_id}")]
+            [InlineKeyboardButton("⭐ Beri Ulasan / Testimoni", callback_data=f"rate_start|{order_id}")],
+            [InlineKeyboardButton("🔄 Kirim Ulang Link", callback_data="resend_menu")]
         ])
     )
 
@@ -6518,7 +6524,12 @@ async def cmd_riwayat(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"- {o.get('waktu', '-')}\n\n"
         )
 
-    await update.message.reply_text(text, parse_mode="HTML")
+    await update.message.reply_text(
+        text, parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔄 Kirim Ulang Link", callback_data="resend_menu")
+        ]])
+    )
 
 # =================== BACKUP & EXPORT ===================
 
@@ -6868,58 +6879,205 @@ async def handle_json_document(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # =================== KIRIM ULANG LINK ===================
 
-def _get_completed_order_sync(order_id, user_id):
+# All resend lookups bypass the product cache. Keep paket_id when replacing a group.
+RESEND_PAGE_SIZE = 8
+RESEND_COOLDOWN_SECONDS = 10
+
+
+@async_wrap
+def get_resend_product_page(user_id, page=0):
     with db_session_safe() as conn:
         with conn.cursor() as c:
-            c.execute(
-                "SELECT * FROM orders WHERE order_id=%s AND user_id=%s AND status='completed'",
-                (order_id, user_id)
+            c.execute("""
+                SELECT recent.id, recent.paket_id, p.nama, p.emoji
+                FROM (
+                    SELECT DISTINCT ON (paket_id) id, paket_id
+                    FROM orders
+                    WHERE user_id=%s AND status='completed'
+                    ORDER BY paket_id, id DESC
+                ) recent
+                LEFT JOIN products p ON p.paket_id=recent.paket_id
+                ORDER BY recent.id DESC
+                LIMIT %s OFFSET %s
+            """, (user_id, RESEND_PAGE_SIZE + 1, page * RESEND_PAGE_SIZE))
+            return [dict(row) for row in c.fetchall()]
+
+
+@async_wrap
+def get_resend_order(user_id, row_id):
+    with db_session_safe() as conn:
+        with conn.cursor() as c:
+            c.execute("""
+                SELECT * FROM orders
+                WHERE id=%s AND user_id=%s AND status='completed'
+            """, (row_id, user_id))
+            row = c.fetchone()
+            return dict(row) if row else None
+
+
+@async_wrap
+def get_resend_product(paket_id):
+    with db_session_safe() as conn:
+        with conn.cursor() as c:
+            c.execute("SELECT * FROM products WHERE paket_id=%s", (paket_id,))
+            row = c.fetchone()
+            return dict(row) if row else None
+
+
+def _resend_menu_keyboard():
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔄 Pilih Produk Lain", callback_data="resend_menu")
+    ]])
+
+
+async def _resend_access_allowed(update, context):
+    if not update.effective_chat or update.effective_chat.type != 'private':
+        if update.callback_query:
+            await _fast_callback_ack(update.callback_query, "Buka chat pribadi bot untuk kirim ulang link.")
+        elif update.effective_message:
+            await update.effective_message.reply_text("Buka chat pribadi bot lalu ketik /resend.")
+        return False
+    if await is_banned(update.effective_user.id):
+        if update.callback_query:
+            await _fast_callback_ack(update.callback_query, "Akses dibatasi. Hubungi admin.")
+        else:
+            await update.effective_message.reply_text("Akses dibatasi. Hubungi admin.")
+        return False
+    return True
+
+
+async def show_resend_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """New and legacy resend buttons first open the buyer's product selector."""
+    if not await _resend_access_allowed(update, context):
+        return
+    query = update.callback_query
+    page = 0
+    if query:
+        await _fast_callback_ack(query)
+        if query.data.startswith('resend_menu|'):
+            try:
+                page = min(100000, max(0, int(query.data.split('|', 1)[1])))
+            except (ValueError, IndexError):
+                page = 0
+    try:
+        rows = await get_resend_product_page(update.effective_user.id, page)
+        if not rows and page:
+            page = 0
+            rows = await get_resend_product_page(update.effective_user.id, page)
+        keyboard = []
+        for row in rows[:RESEND_PAGE_SIZE]:
+            label = f"{row.get('emoji') or '📦'} {row.get('nama') or row['paket_id']}"
+            keyboard.append([InlineKeyboardButton(
+                label[:80], callback_data=f"resend_select|{row['id']}"
+            )])
+        navigation = []
+        if page:
+            navigation.append(InlineKeyboardButton("⬅️ Sebelumnya", callback_data=f"resend_menu|{page - 1}"))
+        if len(rows) > RESEND_PAGE_SIZE:
+            navigation.append(InlineKeyboardButton("Berikutnya ➡️", callback_data=f"resend_menu|{page + 1}"))
+        if navigation:
+            keyboard.append(navigation)
+        keyboard.append([InlineKeyboardButton("🏠 Menu Utama", callback_data="back_to_menu")])
+        text = (
+            "🔄 <b>KIRIM ULANG LINK</b>\n\n"
+            "Pilih produk yang mau dikirim ulang link-nya.\n"
+            "Link akan dibuat memakai data produk terbaru.\n\n"
+            f"Halaman {page + 1}"
+        ) if rows else "📦 Belum ada pembelian lunas yang bisa dikirim ulang link-nya."
+        markup = InlineKeyboardMarkup(keyboard)
+        if query and query.data.startswith('resend_menu|'):
+            try:
+                await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+            except telegram.error.BadRequest as exc:
+                if 'message is not modified' not in str(exc).lower():
+                    raise
+        else:
+            # Preserve the original payment/access message when opening the selector.
+            await context.bot.send_message(
+                chat_id=update.effective_user.id, text=text,
+                parse_mode="HTML", reply_markup=markup
             )
-            return c.fetchone()
+    except Exception:
+        logger.exception("[RESEND] Gagal menampilkan pilihan produk")
+        await context.bot.send_message(
+            chat_id=update.effective_user.id,
+            text="⚠️ Daftar produk belum bisa dimuat. Coba /resend lagi sebentar."
+        )
+
 
 async def resend_group_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
-
-    user_id = query.from_user.id
-    parts = query.data.split("|")
-    order_id = parts[1] if len(parts) > 1 else None
-    if not order_id:
-        await query.edit_message_text("⚠️ Order ID tidak valid.")
+    if not await _resend_access_allowed(update, context):
         return
-
-    order = await run_db(_get_completed_order_sync, order_id, user_id)
-    if not order:
-        await query.edit_message_text("⚠️ Order tidak ditemukan atau belum lunas.")
+    # No await between checking and claiming: concurrent callbacks cannot double-send.
+    if context.user_data.get('_resend_busy'):
+        await _fast_callback_ack(query, "⏳ Link sedang diproses. Tunggu sebentar.")
         return
-
-    order = dict(order)
-    paket = await get_product(order['paket_id'])
-    if not paket:
-        await query.edit_message_text("⚠️ Produk tidak ditemukan.")
+    last_sent = context.user_data.get('_resend_last_sent')
+    if last_sent is not None and _time.monotonic() - last_sent < RESEND_COOLDOWN_SECONDS:
+        await _fast_callback_ack(query, "⏳ Tunggu 10 detik sebelum kirim ulang lagi.")
         return
-
-    new_link = await generate_group_link(context.bot, paket, order_id)
-
-    if new_link:
-        await query.edit_message_text(
-            f"✅ <b>Link Baru Berhasil Dibuat!</b>\n\n"
-            f"🔗 {new_link}\n\n"
-            f"📋 <b>Cara gabung:</b>\n"
-            f"1. Klik link di atas\n"
-            f"2. Pencet <b>\"Minta Bergabung\"</b>\n"
-            f"3. Bot langsung approve otomatis ✅\n\n"
-            f"<i>Segera join ya!</i>",
-            parse_mode="HTML"
+    context.user_data['_resend_busy'] = True
+    try:
+        await _fast_callback_ack(query, "⏳ Mengambil akses terbaru...")
+        parts = query.data.split('|')
+        if len(parts) != 2 or not parts[1].isdigit() or len(parts[1]) > 18:
+            await _callback_feedback(query, context, "⚠️ Pilihan tidak valid. Buka /resend lagi.")
+            return
+        user_id = query.from_user.id
+        order = await get_resend_order(user_id, int(parts[1]))
+        if not order:
+            await _callback_feedback(query, context, "⚠️ Pembelian tidak ditemukan atau belum lunas.")
+            return
+        paket = await get_resend_product(order['paket_id'])
+        if not paket:
+            await _callback_feedback(query, context, "⚠️ Produk sudah tidak tersedia. Hubungi admin untuk akses pengganti.")
+            return
+        if order.get('delivery_status') == 'pending':
+            await _callback_feedback(query, context, "⏳ Pengiriman pesanan sedang diproses. Coba lagi sebentar.")
+            return
+        # Previously delivered access (including manual admin releases) remains valid.
+        # Undelivered purchases must satisfy the same prerequisites as initial delivery.
+        if order.get('delivery_status') != 'sent':
+            missing = await check_prerequisites_sync(user_id, paket.get('requires_paket_ids') or '')
+            if missing:
+                await _callback_feedback(query, context, "🔒 Syarat paket belum lengkap. Selesaikan syarat pembelian atau hubungi admin.")
+                return
+        group_link = None
+        if paket.get('group_chat_id'):
+            group_link = await generate_group_link(context.bot, paket, order['order_id'])
+            if not group_link:
+                # The fallback may still point to a deleted group when only Group ID changed.
+                await _callback_feedback(query, context, "⚠️ Link grup terbaru belum bisa dibuat. Hubungi admin agar Group ID dan izin bot di grup pengganti diperiksa.")
+                return
+            link = group_link
+        else:
+            link = (paket.get('link') or '').strip()
+            if not link or link == DEFAULT_LINK:
+                await _callback_feedback(query, context, "⚠️ Akses produk belum tersedia. Hubungi admin.")
+                return
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=(
+                "✅ <b>LINK PRODUK TERBARU</b>\n\n"
+                f"📦 {esc(paket.get('emoji') or '📦')} <b>{esc(paket.get('nama') or order['paket_id'])}</b>\n"
+                f"🔖 Order: <code>{esc(order['order_id'])}</code>\n\n"
+                f"{_build_link_section(esc(group_link) if group_link else None, esc(link))}"
+            ),
+            parse_mode="HTML", reply_markup=_resend_menu_keyboard()
         )
-    else:
-        fallback_link = paket.get("link") or DEFAULT_LINK
-        await query.edit_message_text(
-            f"✅ <b>Link Produk</b>\n\n"
-            f"🔗 {fallback_link}\n\n"
-            f"<i>Produk ini pakai link biasa.</i>",
-            parse_mode="HTML"
-        )
+        context.user_data['_resend_last_sent'] = _time.monotonic()
+        try:
+            await set_sent_link(order['order_id'], link)
+        except Exception:
+            # The buyer already received access; a database error must not claim delivery failed.
+            logger.exception("[RESEND] Link terkirim tetapi gagal menyimpan order %s", order['order_id'])
+    except Exception:
+        logger.exception("[RESEND] Gagal mengirim ulang link")
+        await _callback_feedback(query, context, "⚠️ Link belum berhasil dikirim. Coba /resend lagi sebentar atau hubungi admin.")
+    finally:
+        context.user_data.pop('_resend_busy', None)
+
 
 # =================== BACKGROUND LOOPS ===================
 REMINDER_HARI = 7
@@ -8823,6 +8981,7 @@ def main():
     app.add_handler(CommandHandler("start",   start))
     app.add_handler(CommandHandler("help",    cmd_help))
     app.add_handler(CommandHandler("riwayat", cmd_riwayat))
+    app.add_handler(CommandHandler("resend", show_resend_menu))
 
     # Admin Commands
     app.add_handler(CommandHandler("admin",       cmd_admin))
@@ -8854,7 +9013,8 @@ def main():
     app.add_handler(CallbackQueryHandler(ganti_paket_batal,    pattern="^ganti_paket_batal$"))
 
     # Buyer Actions Handlers
-    app.add_handler(CallbackQueryHandler(resend_group_link, pattern="^resendlink\\|"))
+    app.add_handler(CallbackQueryHandler(show_resend_menu, pattern=r"^(?:resend_menu(?:\|\d+)?|resendlink\|.*)$"))
+    app.add_handler(CallbackQueryHandler(resend_group_link, pattern=r"^resend_select\|"))
 
     # Testimonial Flow Handlers
     app.add_handler(CallbackQueryHandler(handle_rate_start,      pattern="^rate_start\\|"))

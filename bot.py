@@ -90,6 +90,8 @@ class UserStateManager:
     AWAITING_TESTI_CHANNEL_ID = "awaiting_testi_channel_id"
     AWAITING_LINK_TESTI = "awaiting_link_testi"
     AWAITING_LINK_ADMIN = "awaiting_link_admin"
+    AWAITING_MAIN_GROUP_NAME = "awaiting_main_group_name"
+    AWAITING_MAIN_GROUP_LINK = "awaiting_main_group_link"
     AWAITING_CARI = "awaiting_cari"
     AWAITING_KICK_SEARCH = "awaiting_kick_search"
     AWAITING_ADD_GROUP = "awaiting_add_group"
@@ -122,6 +124,10 @@ def get_user_state(context) -> str:
         return UserStateManager.AWAITING_LINK_TESTI
     if ud.get('awaiting_link_admin'):
         return UserStateManager.AWAITING_LINK_ADMIN
+    if ud.get('awaiting_main_group_name'):
+        return UserStateManager.AWAITING_MAIN_GROUP_NAME
+    if ud.get('awaiting_main_group_link'):
+        return UserStateManager.AWAITING_MAIN_GROUP_LINK
     if ud.get('awaiting_cari'):
         return UserStateManager.AWAITING_CARI
     if ud.get('awaiting_kick_search'):
@@ -179,6 +185,19 @@ def styled_button(text: str, *, style: str = None,
         # Saat ikon Premium aktif, hilangkan emoji Unicode di awal agar tidak dobel.
         text = re.sub(r'^\S+\s+', '', text, count=1)
     return InlineKeyboardButton(text, api_kwargs=extra or None, **kwargs)
+
+
+def normalize_button_url(value):
+    """Normalisasi URL tombol dan tolak skema yang tidak didukung Telegram."""
+    val = str(value or '').strip()
+    if val.startswith('@') and len(val) > 1:
+        val = f"https://t.me/{val[1:]}"
+    if not val or len(val) > 512:
+        return None
+    parsed = urllib.parse.urlparse(val)
+    if parsed.scheme not in ('http', 'https', 'tg') or not parsed.netloc:
+        return None
+    return val
 
 
 def tg_user_link(user_id, name: str = None) -> str:
@@ -1369,6 +1388,8 @@ def init_db():
             for key, val in [
                 ('link_testimoni', 'https://t.me/+7zsdSrwYIG8wOTg1'),
                 ('link_admin', 'https://t.me/Gilbiie'),
+                ('main_group_button_name', '👥 Grup Hyper Family'),
+                ('main_group_button_link', ''),
                 ('testimoni_channel_id', ''),
             ]:
                 c.execute(
@@ -3195,16 +3216,18 @@ async def build_main_menu_parts():
     Cache memang mencegah dua query DB, tetapi tetap ada dua jalur coroutine dan
     dua deep-copy list produk. Satu helper ini membuat satu snapshot menu.
     """
-    products, link_testi, link_cs = await asyncio.gather(
+    products, link_testi, link_cs, group_button_name, group_button_link = await asyncio.gather(
         get_all_products(),
         get_setting('link_testimoni', 'https://t.me/+7zsdSrwYIG8wOTg1'),
         get_setting('link_admin', ADMIN_URL),
+        get_setting('main_group_button_name', '👥 Grup Hyper Family'),
+        get_setting('main_group_button_link', ''),
     )
     aktif_products = [p for p in products if p.get('aktif', True)]
     text = (
         "<b>🛒 HYPER FAMILY STORE</b>\n"
         "========================\n\n"
-        "Selamat datang! Pilih paket yang tersedia:\n\n"
+        "Selamat datang! Berikut paket yang tersedia:\n\n"
     )
     for p in aktif_products:
         text += (
@@ -3214,16 +3237,13 @@ async def build_main_menu_parts():
         )
     text += (
         "========================\n"
-        "<blockquote>💳 QRIS (All E-Wallet)  |  ⚡ 1-5 Menit  |  🕒 24 Jam</blockquote>"
+        "<blockquote>💳 Bayar via QRIS • E-Wallet &amp; Mobile Banking\n"
+        "⚡ Verifikasi 1–5 Menit • Layanan 24 Jam</blockquote>"
     )
     keyboard = [
         [styled_button(
             "🛒 Beli Sekarang", callback_data="buy", style="primary",
             icon_custom_emoji_id=os.environ.get("BTN_EMOJI_BUY_ID")
-        )],
-        [styled_button(
-            "🔄 Kirim Ulang Link", callback_data="resend_menu", style="success",
-            icon_custom_emoji_id=os.environ.get("BTN_EMOJI_RESEND_ID")
         )],
         [
             styled_button(
@@ -3236,6 +3256,14 @@ async def build_main_menu_parts():
             )
         ]
     ]
+    group_button_link = normalize_button_url(group_button_link)
+    if group_button_link:
+        keyboard.append([styled_button(
+            str(group_button_name or '👥 Grup Hyper Family').strip()[:64],
+            url=group_button_link,
+            style="primary",
+            icon_custom_emoji_id=os.environ.get("BTN_EMOJI_GROUP_ID")
+        )])
     return text, keyboard
 
 async def build_main_menu_text():
@@ -3425,10 +3453,7 @@ async def kirim_link_ke_buyer(context, user_id, paket, order_id, amount):
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([
             [styled_button("⭐ Beri Ulasan / Testimoni", style="primary", callback_data=f"rate_start|{order_id}")],
-            [
-                styled_button("🔄 Kirim Ulang Link", style="success", callback_data="resend_menu"),
-                styled_button("💬 Chat Admin", style="primary", url=await get_setting('link_admin', ADMIN_URL))
-            ]
+            [styled_button("💬 Chat Admin", style="primary", url=await get_setting('link_admin', ADMIN_URL))]
         ])
     )
     simpan_msg_user(context, user_id, msg.message_id)
@@ -3657,6 +3682,8 @@ async def _prewarm_hot_settings():
     await asyncio.gather(
         get_setting('link_testimoni', 'https://t.me/+7zsdSrwYIG8wOTg1'),
         get_setting('link_admin', ADMIN_URL),
+        get_setting('main_group_button_name', '👥 Grup Hyper Family'),
+        get_setting('main_group_button_link', ''),
         get_setting('notif_channel_id', ''),
         get_setting('maintenance', 'off'),
         get_setting('testimoni_channel_id', ''),
@@ -5083,8 +5110,7 @@ async def _send_buyer_product_link(bot, user_id: int, order_id: str, paket: dict
         ),
         parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
-                [styled_button("⭐ Beri Ulasan / Testimoni", style="primary", callback_data=f"rate_start|{order_id}")],
-                [styled_button("🔄 Kirim Ulang Link", style="success", callback_data="resend_menu")]
+                [styled_button("⭐ Beri Ulasan / Testimoni", style="primary", callback_data=f"rate_start|{order_id}")]
             ])
         ),
         label=f"kirim link buyer {order_id}",
@@ -5459,8 +5485,7 @@ async def admin_kirim_link_prereq(update: Update, context: ContextTypes.DEFAULT_
             ),
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
-                [styled_button("⭐ Beri Ulasan / Testimoni", style="primary", callback_data=f"rate_start|{order_id}")],
-                [styled_button("🔄 Kirim Ulang Link", style="success", callback_data="resend_menu")]
+                [styled_button("⭐ Beri Ulasan / Testimoni", style="primary", callback_data=f"rate_start|{order_id}")]
             ])
         )
         kirim_berhasil = True
@@ -5700,8 +5725,7 @@ async def handle_rate_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Terima kasih telah berbelanja! 🙏",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([
-            [styled_button("⭐ Beri Ulasan / Testimoni", style="primary", callback_data=f"rate_start|{order_id}")],
-            [styled_button("🔄 Kirim Ulang Link", style="success", callback_data="resend_menu")]
+            [styled_button("⭐ Beri Ulasan / Testimoni", style="primary", callback_data=f"rate_start|{order_id}")]
         ])
     )
 
@@ -8131,6 +8155,54 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        if context.user_data.get('awaiting_main_group_name'):
+            context.user_data.pop('awaiting_main_group_name', None)
+            val = text.strip()
+            if not val or len(val) > 64 or any(ord(ch) < 32 for ch in val):
+                await update.message.reply_text(
+                    "❌ Nama tombol harus 1–64 karakter dan tidak boleh mengandung baris baru."
+                )
+                return
+            await set_setting('main_group_button_name', val)
+            await update.message.reply_text(
+                f"✅ Nama tombol grup diperbarui menjadi:\n<b>{esc(val)}</b>",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[styled_button(
+                    "⬅️ Kembali ke Pengaturan", style="primary", callback_data="admpanel_setting"
+                )]])
+            )
+            return
+
+        if context.user_data.get('awaiting_main_group_link'):
+            context.user_data.pop('awaiting_main_group_link', None)
+            val = text.strip()
+            if val.lower() == 'hapus':
+                await set_setting('main_group_button_link', '')
+                await update.message.reply_text(
+                    "✅ Tombol grup disembunyikan dari menu utama.",
+                    reply_markup=InlineKeyboardMarkup([[styled_button(
+                        "⬅️ Kembali ke Pengaturan", style="primary", callback_data="admpanel_setting"
+                    )]])
+                )
+                return
+            val = normalize_button_url(val)
+            if not val:
+                await update.message.reply_text(
+                    "❌ Link tidak valid. Gunakan <code>https://t.me/...</code>, "
+                    "<code>tg://...</code>, atau <code>@username</code>.",
+                    parse_mode="HTML"
+                )
+                return
+            await set_setting('main_group_button_link', val)
+            await update.message.reply_text(
+                f"✅ Link tombol grup diperbarui:\n<code>{esc(val)}</code>",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[styled_button(
+                    "⬅️ Kembali ke Pengaturan", style="primary", callback_data="admpanel_setting"
+                )]])
+            )
+            return
+
         adding = context.user_data.get('adding_product')
         if adding:
             step = adding.get('step')
@@ -9009,13 +9081,16 @@ async def kick_do_kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admpanel_setting(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    clear_user_state(context)
 
-    channel_id, testi_channel_id, maint_on, link_testi, link_admin = await asyncio.gather(
+    channel_id, testi_channel_id, maint_on, link_testi, link_admin, group_name, group_link = await asyncio.gather(
         get_setting('notif_channel_id'),
         get_setting('testimoni_channel_id'),
         is_maintenance(),
         get_setting('link_testimoni'),
         get_setting('link_admin'),
+        get_setting('main_group_button_name', '👥 Grup Hyper Family'),
+        get_setting('main_group_button_link', ''),
     )
     ch_status = f"✅ ID: <code>{esc(channel_id)}</code>" if channel_id else "🔕 Nonaktif"
     testi_ch_status = f"✅ ID: <code>{esc(testi_channel_id)}</code>" if testi_channel_id else "🔕 Nonaktif"
@@ -9023,6 +9098,8 @@ async def admpanel_setting(update: Update, context: ContextTypes.DEFAULT_TYPE):
     maint_btn_label = "🟢 Matikan Maintenance" if maint_on else "⚙️ Aktifkan Maintenance"
     link_testi = link_testi or '-'
     link_admin = link_admin or '-'
+    group_name = group_name or '👥 Grup Hyper Family'
+    group_link = group_link or '- (tombol disembunyikan)'
 
     text = (
         "<b>⚙️ PENGATURAN</b>\n"
@@ -9036,7 +9113,10 @@ async def admpanel_setting(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>⭐ Link Button Testimoni</b>\n"
         f"<code>{esc(link_testi)}</code>\n\n"
         "<b>💬 Link Admin/CS</b>\n"
-        f"<code>{esc(link_admin)}</code>"
+        f"<code>{esc(link_admin)}</code>\n\n"
+        "<b>👥 Tombol Grup Menu Utama</b>\n"
+        f"Nama: <b>{esc(group_name)}</b>\n"
+        f"Link: <code>{esc(group_link)}</code>"
     )
 
     keyboard = InlineKeyboardMarkup([
@@ -9053,6 +9133,10 @@ async def admpanel_setting(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [
             InlineKeyboardButton("⭐ Ubah Link Testimoni", callback_data="admpanel_setting_link_testi"),
             InlineKeyboardButton("💬 Ubah Link Admin/CS",  callback_data="admpanel_setting_link_admin"),
+        ],
+        [
+            InlineKeyboardButton("✏️ Nama Tombol Grup", callback_data="admpanel_setting_group_name"),
+            InlineKeyboardButton("🔗 Link Tombol Grup", callback_data="admpanel_setting_group_link"),
         ],
         [styled_button("⬅️ Kembali", style="primary", callback_data="admpanel_back")],
     ])
@@ -9171,6 +9255,43 @@ async def admpanel_setting_link_admin(update: Update, context: ContextTypes.DEFA
         f"Kirim link baru:",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Batal", callback_data="admpanel_setting")]])
+    )
+
+
+async def admpanel_setting_group_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    clear_user_state(context)
+    context.user_data['awaiting_main_group_name'] = True
+    current = await get_setting('main_group_button_name', '👥 Grup Hyper Family')
+    await query.edit_message_text(
+        "<b>✏️ UBAH NAMA TOMBOL GRUP</b>\n"
+        "========================\n\n"
+        f"Nama saat ini:\n<b>{esc(current)}</b>\n\n"
+        "Kirim nama baru (maksimal 64 karakter):",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[styled_button(
+            "⬅️ Batal", style="danger", callback_data="admpanel_setting"
+        )]])
+    )
+
+
+async def admpanel_setting_group_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    clear_user_state(context)
+    context.user_data['awaiting_main_group_link'] = True
+    current = await get_setting('main_group_button_link', '') or '-'
+    await query.edit_message_text(
+        "<b>🔗 UBAH LINK TOMBOL GRUP</b>\n"
+        "========================\n\n"
+        f"Link saat ini:\n<code>{esc(current)}</code>\n\n"
+        "Kirim link grup baru. Bisa memakai <code>https://t.me/...</code> atau "
+        "<code>@username</code>.\nKetik <code>hapus</code> untuk menyembunyikan tombol.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[styled_button(
+            "⬅️ Batal", style="danger", callback_data="admpanel_setting"
+        )]])
     )
 
 # =================== ADMIN: BAN / UNBAN COMMANDS ===================
@@ -9522,6 +9643,8 @@ def main():
     app.add_handler(CallbackQueryHandler(admpanel_setting_maintenance,  pattern="^admpanel_setting_maintenance$"))
     app.add_handler(CallbackQueryHandler(admpanel_setting_link_testi,   pattern="^admpanel_setting_link_testi$"))
     app.add_handler(CallbackQueryHandler(admpanel_setting_link_admin,   pattern="^admpanel_setting_link_admin$"))
+    app.add_handler(CallbackQueryHandler(admpanel_setting_group_name,   pattern="^admpanel_setting_group_name$"))
+    app.add_handler(CallbackQueryHandler(admpanel_setting_group_link,   pattern="^admpanel_setting_group_link$"))
 
     # Super Admin Management Flow
     app.add_handler(CallbackQueryHandler(admpanel_admins,       pattern="^admpanel_admins$"))

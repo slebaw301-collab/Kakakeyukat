@@ -3209,12 +3209,12 @@ async def build_main_menu_parts():
     for p in aktif_products:
         text += (
             f"{esc(p['emoji'])} <b>{esc(p['nama']).upper()}</b>\n"
-            f"- {esc(p['deskripsi'])}\n"
-            f"- {format_harga(p['harga'])}\n\n"
+            f"<blockquote>{esc(p['deskripsi'])}\n"
+            f"💰 <b>{format_harga(p['harga'])}</b></blockquote>\n\n"
         )
     text += (
         "========================\n"
-        "💳 QRIS (All E-Wallet)  |  ⚡ 1-5 Menit  |  🕒 24 Jam"
+        "<blockquote>💳 QRIS (All E-Wallet)  |  ⚡ 1-5 Menit  |  🕒 24 Jam</blockquote>"
     )
     keyboard = [
         [styled_button(
@@ -4075,14 +4075,16 @@ async def pilih_paket(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _callback_feedback(query, context, "❌ Produk tidak ditemukan.")
         return
 
-    status_text = "Tersedia ✅" if paket.get('aktif', True) else "Tidak tersedia ❌"
+    status_text = "Tersedia ♾️" if paket.get('aktif', True) else "Tidak tersedia ❌"
     text = (
         f"{esc(paket.get('emoji', '📦'))} <b>DETAIL PAKET</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"<blockquote>"
         f"📦 Paket : <b>{esc(paket.get('nama', 'Produk'))}</b>\n"
         f"🎬 Isi   : {esc(paket.get('deskripsi') or '-')}\n"
-        f"💰 Harga : {format_harga(paket.get('harga', 0))}\n"
-        f"✅ Status: {status_text}\n\n"
+        f"💰 Harga : <b>{format_harga(paket.get('harga', 0))}</b>\n"
+        f"✅ Status: {status_text}"
+        f"</blockquote>\n"
     )
 
     if paket.get('aktif', True):

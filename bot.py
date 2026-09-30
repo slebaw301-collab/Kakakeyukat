@@ -15,6 +15,7 @@ import functools
 import urllib.parse
 import time as _time
 import copy
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 from aiohttp import web as aio_web
@@ -273,7 +274,6 @@ ADMIN_ORDER_PAGE_SIZE = _env_int("ADMIN_ORDER_PAGE_SIZE", 8, 5, 15)
 ADMIN_LIST_PAGE_SIZE = _env_int("ADMIN_LIST_PAGE_SIZE", 10, 5, 20)
 ADMIN_PANEL_CACHE_TTL_SECONDS = _env_float("ADMIN_PANEL_CACHE_TTL_SECONDS", 3.0, 0.5, 15.0)
 COOLDOWN_EMPTY_TTL_SECONDS = _env_float("COOLDOWN_EMPTY_TTL_SECONDS", 30.0, 5.0, 300.0)
-BROADCAST_INTERVAL_SECONDS = _env_float("BROADCAST_INTERVAL_SECONDS", 0.15, 0.05, 1.0)
 
 # Set 1 jika syarat dianggap terpenuhi setelah link paket syarat benar-benar terkirim.
 PREREQUISITE_REQUIRES_DELIVERY = (
@@ -1942,12 +1942,11 @@ def get_all_buyers():
     with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("""
-                SELECT o.user_id, o.user_name, MAX(o.id) as max_id
+                SELECT DISTINCT ON (o.user_id) o.user_id, o.user_name, o.id as max_id
                 FROM orders o
                 LEFT JOIN banned_users b ON o.user_id = b.user_id
-                WHERE b.user_id IS NULL
-                GROUP BY o.user_id, o.user_name
-                ORDER BY max_id DESC
+                WHERE b.user_id IS NULL AND o.user_id > 0
+                ORDER BY o.user_id, o.id DESC
             """)
             return [dict(r) for r in c.fetchall()]
 
@@ -3727,6 +3726,14 @@ async def post_init(application: Application):
     logger.info("[POST_INIT] Background task aktif dan bot siap menerima update.")
 
 # =================== GRACEFUL SHUTDOWN ===================
+
+async def _stop_blast_before_shutdown(application):
+    tasks = [task for task in list(_blast_tasks.values()) if not task.done()]
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
 
 async def post_shutdown(application: Application):
     global _http_session, _pool, _webhook_runner, _async_db_pool
@@ -7179,183 +7186,584 @@ async def _cleanup_cooldowns_loop():
         except Exception as e:
             logger.error(f"[CLEANUP] Error di cleanup cooldown loop: {e}")
 
-# =================== ADMIN: BROADCAST ===================
+# =================== ADMIN: DURABLE BROADCAST ===================
 
-_blast_tasks: dict = {}
+BLAST_RATE = _env_float('BLAST_MESSAGES_PER_SECOND', 18.0, 1.0, 22.0)
+BLAST_WORKERS = _env_int('BLAST_WORKERS', 6, 1, 10)
+BLAST_SEND_TIMEOUT = 25
+BLAST_LEASE_SECONDS = 120
+_blast_tasks = {}
 _blast_tasks_lock = None
+_blast_schema_ready = False
+_blast_schema_lock = None
 
-def _get_blast_tasks_lock() -> asyncio.Lock:
+
+def _get_blast_tasks_lock():
     global _blast_tasks_lock
     if _blast_tasks_lock is None:
         _blast_tasks_lock = asyncio.Lock()
     return _blast_tasks_lock
 
-async def _run_broadcast(bot, admin_id: int, buyers: list, text_blast: str):
-    total = len(buyers)
-    progress_msg = await bot.send_message(
-        chat_id=admin_id,
-        text=f"📢 <b>Memulai Broadcast...</b>\nTarget: {total} buyer.",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⛔ Hentikan Sekarang", callback_data="blast_stop")]])
+
+@contextmanager
+def _blast_transaction():
+    # db_session_safe defaults to autocommit: claims require an explicit transaction.
+    with db_session_safe() as conn:
+        conn.autocommit = False
+        with conn.cursor() as cursor:
+            yield cursor
+        conn.commit()
+
+
+def _blast_schema_sync():
+    with _blast_transaction() as c:
+        c.execute('SELECT pg_advisory_xact_lock(72419031)')
+        c.execute("""CREATE TABLE IF NOT EXISTS broadcast_jobs (
+            id BIGSERIAL PRIMARY KEY, admin_id BIGINT NOT NULL,
+            nonce TEXT NOT NULL UNIQUE, body TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'paused', message_id BIGINT,
+            lease_token TEXT, lease_until TIMESTAMPTZ,
+            retry_until TIMESTAMPTZ, error TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""")
+        c.execute("""CREATE UNIQUE INDEX IF NOT EXISTS broadcast_one_active
+            ON broadcast_jobs ((1)) WHERE status IN ('running','paused','cancelling')""")
+        c.execute("""CREATE TABLE IF NOT EXISTS broadcast_recipients (
+            job_id BIGINT NOT NULL REFERENCES broadcast_jobs(id),
+            user_id BIGINT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0, message_id BIGINT,
+            error TEXT, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (job_id, user_id)
+        )""")
+        c.execute("""CREATE INDEX IF NOT EXISTS broadcast_recipient_queue
+            ON broadcast_recipients(job_id, status, user_id)""")
+
+
+async def _ensure_blast_schema():
+    global _blast_schema_ready, _blast_schema_lock
+    if _blast_schema_ready:
+        return
+    if _blast_schema_lock is None:
+        _blast_schema_lock = asyncio.Lock()
+    async with _blast_schema_lock:
+        if not _blast_schema_ready:
+            await run_db_admin(_blast_schema_sync)
+            _blast_schema_ready = True
+
+
+def _blast_recover_locked(c, job):
+    # Only called with the job row locked, after the old runner's lease expired.
+    if job and job.get('lease_token') and not job['lease_live']:
+        c.execute("""UPDATE broadcast_recipients SET status='uncertain',
+            error='Proses terputus; hasil Telegram belum pasti', updated_at=NOW()
+            WHERE job_id=%s AND status='sending'""", (job['id'],))
+        c.execute("""UPDATE broadcast_jobs SET lease_token=NULL, lease_until=NULL,
+            status=CASE WHEN status='cancelling' THEN 'cancelled'
+                        WHEN status='running' THEN 'paused' ELSE status END,
+            error='Proses terputus. Periksa progres lalu lanjutkan sisa antrean.',
+            updated_at=NOW() WHERE id=%s""", (job['id'],))
+
+
+def _blast_snapshot_sync(job_id=None):
+    with _blast_transaction() as c:
+        if job_id is None:
+            c.execute("""SELECT *, COALESCE(lease_until>NOW(),FALSE) AS lease_live
+                FROM broadcast_jobs ORDER BY
+                (status IN ('running','paused','cancelling')) DESC, id DESC LIMIT 1 FOR UPDATE""")
+        else:
+            c.execute("""SELECT *, COALESCE(lease_until>NOW(),FALSE) AS lease_live
+                FROM broadcast_jobs WHERE id=%s FOR UPDATE""", (job_id,))
+        job = c.fetchone()
+        if not job:
+            return None
+        job = dict(job)
+        _blast_recover_locked(c, job)
+        c.execute("""SELECT *, COALESCE(lease_until>NOW(),FALSE) AS lease_live,
+            GREATEST(0, EXTRACT(EPOCH FROM retry_until-NOW())) AS wait_seconds
+            FROM broadcast_jobs WHERE id=%s""", (job['id'],))
+        job = dict(c.fetchone())
+        c.execute("""SELECT status, COUNT(*) AS n FROM broadcast_recipients
+            WHERE job_id=%s GROUP BY status""", (job['id'],))
+        job['counts'] = {r['status']: int(r['n']) for r in c.fetchall()}
+        return job
+
+
+def _blast_create_sync(admin_id, body, nonce):
+    with _blast_transaction() as c:
+        c.execute('SELECT pg_advisory_xact_lock(72419031)')
+        c.execute('SELECT id FROM broadcast_jobs WHERE nonce=%s', (nonce,))
+        old = c.fetchone()
+        if old:
+            return old['id'], False
+        c.execute("SELECT id FROM broadcast_jobs WHERE status IN ('running','paused','cancelling') LIMIT 1")
+        active = c.fetchone()
+        if active:
+            return active['id'], False
+        c.execute("INSERT INTO broadcast_jobs(admin_id,body,nonce) VALUES (%s,%s,%s) RETURNING id",
+                  (admin_id, body, nonce))
+        job_id = c.fetchone()['id']
+        # Frozen, unique audience. No reachability probe; keep the original all-order audience.
+        c.execute("""INSERT INTO broadcast_recipients(job_id,user_id)
+            SELECT %s, o.user_id FROM orders o
+            WHERE o.user_id>0 AND NOT EXISTS
+                (SELECT 1 FROM banned_users b WHERE b.user_id=o.user_id)
+            GROUP BY o.user_id ON CONFLICT DO NOTHING""", (job_id,))
+        if c.rowcount == 0:
+            c.execute("UPDATE broadcast_jobs SET status='completed' WHERE id=%s", (job_id,))
+        return job_id, True
+
+
+def _blast_acquire_sync(job_id, token):
+    with _blast_transaction() as c:
+        c.execute("""SELECT *, COALESCE(lease_until>NOW(),FALSE) AS lease_live
+            FROM broadcast_jobs WHERE id=%s FOR UPDATE""", (job_id,))
+        job = c.fetchone()
+        if not job or job['status'] not in ('paused','running') or job['lease_live']:
+            return False
+        _blast_recover_locked(c, job)
+        c.execute("""UPDATE broadcast_jobs SET status='running', lease_token=%s,
+            lease_until=NOW()+(%s * INTERVAL '1 second'), error=NULL, updated_at=NOW()
+            WHERE id=%s""", (token, BLAST_LEASE_SECONDS, job_id))
+        return True
+
+
+def _blast_heartbeat_sync(job_id, token):
+    with _blast_transaction() as c:
+        c.execute("""UPDATE broadcast_jobs SET lease_until=NOW()+(%s * INTERVAL '1 second'),
+            updated_at=NOW() WHERE id=%s AND lease_token=%s AND lease_until>NOW()
+            RETURNING status, body, GREATEST(0,EXTRACT(EPOCH FROM retry_until-NOW())) AS wait_seconds""",
+                  (BLAST_LEASE_SECONDS, job_id, token))
+        row = c.fetchone()
+        return dict(row) if row else None
+
+
+def _blast_claim_sync(job_id, token):
+    with _blast_transaction() as c:
+        # Serializes claim with pause/cancel. A claim is made just before sending.
+        c.execute("""SELECT id FROM broadcast_jobs WHERE id=%s AND lease_token=%s
+            AND lease_until>NOW() AND status='running'
+            AND (retry_until IS NULL OR retry_until<=NOW()) FOR UPDATE""", (job_id, token))
+        if not c.fetchone():
+            return None
+        c.execute("""SELECT user_id, attempts FROM broadcast_recipients
+            WHERE job_id=%s AND status='pending' ORDER BY user_id LIMIT 1 FOR UPDATE""", (job_id,))
+        row = c.fetchone()
+        if not row:
+            return None
+        c.execute("""UPDATE broadcast_recipients SET status='sending', attempts=attempts+1,
+            updated_at=NOW() WHERE job_id=%s AND user_id=%s""", (job_id, row['user_id']))
+        return {'user_id': row['user_id'], 'attempts': row['attempts'] + 1}
+
+
+def _blast_result_sync(job_id, token, user_id, status, error=None, message_id=None, delay=0):
+    with _blast_transaction() as c:
+        c.execute('SELECT id FROM broadcast_jobs WHERE id=%s AND lease_token=%s FOR UPDATE', (job_id, token))
+        if not c.fetchone():
+            raise RuntimeError('Broadcast lease lost while saving result')
+        c.execute("""UPDATE broadcast_recipients SET status=%s,error=%s,message_id=%s,
+            updated_at=NOW() WHERE job_id=%s AND user_id=%s AND status='sending'""",
+                  (status, (error or '')[:500], message_id, job_id, user_id))
+        if delay:
+            c.execute("""UPDATE broadcast_jobs SET retry_until=GREATEST(COALESCE(retry_until,NOW()),
+                NOW()+(%s * INTERVAL '1 second')) WHERE id=%s""", (delay, job_id))
+
+
+def _blast_control_sync(job_id, action):
+    with _blast_transaction() as c:
+        c.execute("""SELECT *, COALESCE(lease_until>NOW(),FALSE) AS lease_live
+            FROM broadcast_jobs WHERE id=%s FOR UPDATE""", (job_id,))
+        job = c.fetchone()
+        if not job:
+            return
+        _blast_recover_locked(c, job)
+        if action == 'pause':
+            c.execute("UPDATE broadcast_jobs SET status='paused',updated_at=NOW() WHERE id=%s AND status='running'", (job_id,))
+        elif action == 'cancel':
+            c.execute("""UPDATE broadcast_jobs SET status=CASE
+                WHEN lease_token IS NOT NULL AND lease_until>NOW() THEN 'cancelling' ELSE 'cancelled' END,
+                updated_at=NOW() WHERE id=%s AND status IN ('running','paused','cancelling')""", (job_id,))
+
+
+def _blast_release_sync(job_id, token, error=None):
+    with _blast_transaction() as c:
+        c.execute('SELECT status FROM broadcast_jobs WHERE id=%s AND lease_token=%s FOR UPDATE', (job_id, token))
+        job = c.fetchone()
+        if not job:
+            return
+        c.execute("""UPDATE broadcast_recipients SET status='uncertain',
+            error='Proses terputus; jangan kirim ulang otomatis', updated_at=NOW()
+            WHERE job_id=%s AND status='sending'""", (job_id,))
+        c.execute("SELECT COUNT(*) AS n FROM broadcast_recipients WHERE job_id=%s AND status='pending'", (job_id,))
+        remaining = c.fetchone()['n']
+        state = 'cancelled' if job['status']=='cancelling' else ('completed' if not remaining else 'paused')
+        c.execute("""UPDATE broadcast_jobs SET status=%s,lease_token=NULL,lease_until=NULL,
+            error=%s,updated_at=NOW() WHERE id=%s AND lease_token=%s""", (state, error, job_id, token))
+
+
+def _blast_message_sync(job_id, message_id):
+    with db_session_safe() as conn:
+        with conn.cursor() as c:
+            c.execute('UPDATE broadcast_jobs SET message_id=%s WHERE id=%s', (message_id, job_id))
+
+
+def _blast_panel(job):
+    counts = job['counts']
+    total = sum(counts.values())
+    processed = sum(counts.get(s,0) for s in ('sent','failed','skipped','uncertain'))
+    labels = {'running':'🟢 Berjalan','paused':'⏸ Dijeda','cancelling':'⏳ Membatalkan',
+              'cancelled':'⛔ Dibatalkan','completed':'✅ Selesai'}
+    status = labels.get(job['status'],job['status'])
+    wait = math.ceil(float(job.get('wait_seconds') or 0))
+    if job['status']=='running' and wait:
+        status = f'⏳ Menunggu batas Telegram ({wait} detik)'
+    elif job['status']=='paused' and job.get('lease_live'):
+        status = '⏸ Menjeda — menunggu pengiriman yang sedang berjalan'
+    text = (
+        f"📢 <b>BLAST #{job['id']}</b>\n{status}\n\n"
+        f"👥 Target unik: <b>{total}</b>\n"
+        f"📊 Diproses: <b>{processed}/{total}</b> ({processed*100//max(total,1)}%)\n"
+        f"✅ Berhasil: <b>{counts.get('sent',0)}</b>\n"
+        f"❌ Gagal: <b>{counts.get('failed',0)}</b>\n"
+        f"⏩ Dilewati / tidak dapat diakses: <b>{counts.get('skipped',0)}</b>\n"
+        f"❔ Belum pasti: <b>{counts.get('uncertain',0)}</b>\n"
+        f"📤 Sedang dikirim: <b>{counts.get('sending',0)}</b>\n"
+        f"📋 Belum diproses: <b>{counts.get('pending',0)}</b>\n"
     )
+    if job.get('created_at') and job.get('updated_at'):
+        endpoint = datetime.now(timezone.utc) if job['status'] in ('running','paused','cancelling') else job['updated_at']
+        duration = max(0, int((endpoint-job['created_at']).total_seconds()))
+        text += f"⏳ Durasi (termasuk jeda): {duration//60} menit {duration%60} detik\n"
+    runtime = _blast_tasks.get(job['id'])
+    if runtime and not runtime.done():
+        # Session metrics are live estimates, not a promise about Telegram delivery time.
+        metric = getattr(runtime, 'blast_metric', None)
+        if metric:
+            elapsed = max(.1, _time.monotonic()-metric['started'])
+            speed = max(0, processed-metric['baseline'])/elapsed
+            text += f"\n⚡ Kecepatan sesi: {speed:.1f} user/detik"
+            if speed and job['status']=='running' and not wait:
+                text += f"\n⏱ Estimasi sisa: {math.ceil((total-processed)/speed)} detik"
+    text += f"\n🕒 Update: {now_wib().strftime('%H:%M:%S WIB')}"
+    if job.get('error'):
+        text += f"\n⚠️ {esc(job['error'])}"
+    if counts.get('uncertain'):
+        text += '\n\nHasil belum pasti tidak dikirim ulang otomatis untuk mencegah pesan dobel.'
+    buttons = []
+    if job['status']=='running':
+        buttons.append(InlineKeyboardButton('⏸ Jeda',callback_data=f"blastctl|pause|{job['id']}"))
+    if job['status']=='paused' and not job.get('lease_live'):
+        buttons.append(InlineKeyboardButton('▶️ Lanjutkan',callback_data=f"blastctl|resume|{job['id']}"))
+    if job['status'] in ('running','paused'):
+        buttons.append(InlineKeyboardButton('⛔ Batalkan',callback_data=f"blastctl|cancel|{job['id']}"))
+    keyboard = [buttons] if buttons else []
+    keyboard.append([InlineKeyboardButton('🔄 Refresh Status',callback_data=f"blastctl|refresh|{job['id']}")])
+    if job['status'] in ('completed','cancelled'):
+        keyboard.append([InlineKeyboardButton('📢 Blast Baru', callback_data='admpanel_blast')])
+    keyboard.append([InlineKeyboardButton('⬅️ Panel Admin',callback_data='admpanel_back')])
+    return text, InlineKeyboardMarkup(keyboard)
 
-    sent = 0
-    failed = 0
-    skipped = 0
 
-    try:
-        for index, b in enumerate(buyers):
-            if asyncio.current_task().cancelled():
-                break
-
-            target_id = b['user_id']
-            try:
-                await bot.send_message(
-                    chat_id=target_id,
-                    text=text_blast,
-                    parse_mode="HTML"
-                )
-                sent += 1
-            except telegram.error.Forbidden:
-                skipped += 1
-                logger.info(f"[BLAST] User {target_id} memblokir bot, dilewati.")
-            except telegram.error.RetryAfter as e:
-                logger.warning(f"[BLAST] Terkena rate limit Telegram, tidur {e.retry_after} detik.")
-                await asyncio.sleep(e.retry_after)
-                try:
-                    await bot.send_message(chat_id=target_id, text=text_blast, parse_mode="HTML")
-                    sent += 1
-                except telegram.error.Forbidden:
-                    skipped += 1
-                except Exception:
-                    failed += 1
-            except Exception as e:
-                logger.error(f"[BLAST] Gagal mengirim pesan ke {target_id}: {e}")
-                failed += 1
-
-            # Sisakan kapasitas rate limiter untuk /start, pembayaran, dan chat user.
-            await asyncio.sleep(BROADCAST_INTERVAL_SECONDS)
-
-            if (index + 1) % 50 == 0 or (index + 1) == total:
-                percent = int(((index + 1) / total) * 100)
-                try:
-                    await bot.edit_message_text(
-                        chat_id=admin_id,
-                        message_id=progress_msg.message_id,
-                        text=(
-                            f"📢 <b>Progres Broadcast: {percent}%</b>\n"
-                            f"========================\n"
-                            f"👤 Diproses : {index + 1} / {total}\n"
-                            f"✅ Sukses   : {sent}\n"
-                            f"⏩ Dilewati (blokir bot) : {skipped}\n"
-                            f"❌ Gagal Lainnya         : {failed}"
-                        ),
-                        parse_mode="HTML",
-                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⛔ Hentikan Sekarang", callback_data="blast_stop")]])
-                    )
-                except Exception as ex:
-                    logger.debug(f"Gagal memperbarui progres broadcast admin: {ex}")
-
-    except asyncio.CancelledError:
-        logger.info(f"[BLAST] Broadcast dibatalkan oleh admin {admin_id}.")
-
-    finally:
-        async with _get_blast_tasks_lock():
-            _blast_tasks.pop(admin_id, None)
-        is_cancelled = sent + failed + skipped < total
+async def _blast_publish(bot, job, force_new=False, destination=None):
+    text, keyboard = _blast_panel(job)
+    chat_id = destination or job['admin_id']
+    if job.get('message_id') and not force_new and chat_id==job['admin_id']:
         try:
-            await bot.send_message(
-                chat_id=admin_id,
-                text=(
-                    f"{'⛔' if is_cancelled else '✅'} <b>BROADCAST SELESAI</b>\n"
-                    f"========================\n\n"
-                    f"✅ Sukses Terkirim          : <b>{sent}</b> buyer\n"
-                    f"⏩ Dilewati (blokir bot)   : <b>{skipped}</b> buyer\n"
-                    f"❌ Gagal Lainnya            : <b>{failed}</b>\n"
-                    f"📊 Total Target             : <b>{total}</b>\n\n"
-                    f"<i>Selesai pada: {now_wib().strftime('%H:%M, %d/%m/%Y WIB')}</i>"
-                ),
-                parse_mode="HTML"
-            )
-        except Exception as ex:
-            logger.debug(f"Gagal mengirim laporan final broadcast: {ex}")
+            await asyncio.wait_for(bot.edit_message_text(
+                chat_id=chat_id,message_id=job['message_id'],text=text,
+                parse_mode='HTML',reply_markup=keyboard), timeout=8)
+        except telegram.error.BadRequest as exc:
+            if 'message is not modified' in str(exc).lower():
+                return
+            if 'message to edit not found' not in str(exc).lower():
+                raise
+        else:
+            return
+    msg = await asyncio.wait_for(bot.send_message(chat_id=chat_id,text=text,
+        parse_mode='HTML',reply_markup=keyboard), timeout=8)
+    if chat_id==job['admin_id']:
+        await run_db_admin(_blast_message_sync, job['id'], msg.message_id)
+
+
+class _BlastPacer:
+    def __init__(self):
+        self.lock = asyncio.Lock()
+        self.next_at = 0.0
+        self.blocked_until = 0.0
+
+    async def wait(self, state):
+        async with self.lock:
+            while not state['stop']:
+                delay = max(self.next_at,self.blocked_until)-_time.monotonic()
+                if delay<=0:
+                    self.next_at = _time.monotonic()+1.0/BLAST_RATE
+                    return True
+                await asyncio.sleep(min(delay,.25))
+        return False
+
+
+def _blast_send_options(bot):
+    options = dict(read_timeout=15,write_timeout=15,connect_timeout=10,pool_timeout=5)
+    if getattr(bot,'rate_limiter',None) is not None:
+        # AIORateLimiter uses an integer override; handle 429 ourselves, once.
+        options['rate_limit_args'] = 0
+    return options
+
+
+async def _blast_worker_inner(bot, job_id, token, body, state, pacer):
+    while not state['stop']:
+        if not await pacer.wait(state):
+            return
+        row = await run_db_admin(_blast_claim_sync,job_id,token)
+        if not row:
+            await asyncio.sleep(.25)
+            continue
+        uid = row['user_id']
+        status, error, message_id, delay = 'uncertain', None, None, 0
+        try:
+            msg = await asyncio.wait_for(bot.send_message(chat_id=uid,text=body,
+                parse_mode='HTML',**_blast_send_options(bot)),timeout=BLAST_SEND_TIMEOUT)
+            status, message_id = 'sent', msg.message_id
+        except telegram.error.RetryAfter as exc:
+            delay = exc.retry_after.total_seconds() if isinstance(exc.retry_after,timedelta) else float(exc.retry_after)
+            delay = max(1,delay)+.5
+            pacer.blocked_until = max(pacer.blocked_until,_time.monotonic()+delay)
+            status = 'pending' if row['attempts']<3 else 'failed'
+            error = 'Batas Telegram; retry terjadwal' if status=='pending' else 'Batas Telegram berulang (3 percobaan)'
+        except telegram.error.Forbidden:
+            status, error = 'skipped', 'Bot diblokir atau chat tidak dapat diakses'
+        except telegram.error.BadRequest as exc:
+            status, error = 'failed', str(exc)
+        except (asyncio.TimeoutError, telegram.error.NetworkError) as exc:
+            error = f'Hasil belum pasti: {type(exc).__name__}'
+        except asyncio.CancelledError:
+            # Leave durable sending marker; coordinator/recovery changes it to uncertain.
+            raise
+        except Exception as exc:
+            error = f'Hasil belum pasti: {type(exc).__name__}'
+        # A DB error here stops the job; never blindly resend an unrecorded success.
+        await run_db_admin(_blast_result_sync,job_id,token,uid,status,error,message_id,delay)
+        if status == 'uncertain':
+            state['network_errors'] = state.get('network_errors', 0) + 1
+            if state['network_errors'] >= 5:
+                state['problem'] = 'Gangguan koneksi berulang. Blast dijeda untuk mencegah hasil tidak pasti bertambah.'
+                state['stop'] = True
+        elif status == 'sent':
+            state['network_errors'] = 0
+
+
+async def _blast_worker(bot, job_id, token, body, state, pacer):
+    try:
+        await _blast_worker_inner(bot, job_id, token, body, state, pacer)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        state['stop'] = True
+        state['problem'] = 'Gangguan database/proses. Periksa koneksi lalu lanjutkan sisa antrean.'
+        raise
+
+
+async def _run_broadcast(bot, job_id, token):
+    state = {'stop':False}
+    workers = []
+    problem = None
+    try:
+        job = await run_db_admin(_blast_snapshot_sync,job_id)
+        if not job or job['lease_token']!=token:
+            return
+        counts=job['counts']
+        asyncio.current_task().blast_metric = dict(started=_time.monotonic(),
+            baseline=sum(counts.get(s,0) for s in ('sent','failed','skipped','uncertain')))
+        pacer = _BlastPacer()
+        pacer.blocked_until = _time.monotonic()+float(job.get('wait_seconds') or 0)
+        workers = [asyncio.create_task(_blast_worker(bot,job_id,token,job['body'],state,pacer))
+                   for _ in range(BLAST_WORKERS)]
+        next_report=0
+        while True:
+            if state['stop']:
+                problem = state.get('problem')
+                break
+            current = await run_db_admin(_blast_heartbeat_sync,job_id,token)
+            if not current or current['status']!='running':
+                break
+            for task in workers:
+                if task.done():
+                    task.result()  # Propagate DB/worker failures to the coordinator.
+                    raise RuntimeError('Worker berhenti sebelum antrean selesai')
+            job = await run_db_admin(_blast_snapshot_sync,job_id)
+            if not job['counts'].get('pending') and not job['counts'].get('sending'):
+                break
+            if _time.monotonic()>=next_report:
+                next_report=_time.monotonic()+4
+                try:
+                    await _blast_publish(bot,job)
+                except Exception:
+                    logger.warning('[BLAST] Panel gagal diperbarui; /blast_status tetap tersedia',exc_info=True)
+            await asyncio.sleep(1)
+    except asyncio.CancelledError:
+        problem='Bot berhenti. Lanjutkan sisa antrean dari panel blast.'
+        raise
+    except Exception:
+        problem='Gangguan proses/database. Blast dijeda; buka /blast_status.'
+        logger.exception('[BLAST] Runner gagal; hentikan klaim baru')
+    finally:
+        state['stop']=True
+        # Allow requests already in flight to finish and persist their outcomes.
+        if workers:
+            try:
+                await asyncio.wait_for(asyncio.gather(*workers,return_exceptions=True),timeout=BLAST_SEND_TIMEOUT+20)
+            except (asyncio.TimeoutError,asyncio.CancelledError):
+                for task in workers:
+                    task.cancel()
+                await asyncio.gather(*workers,return_exceptions=True)
+        try:
+            await run_db_admin(_blast_release_sync,job_id,token,problem)
+            job = await run_db_admin(_blast_snapshot_sync,job_id)
+            if job:
+                await _blast_publish(bot,job)
+        except Exception:
+            logger.exception('[BLAST] Finalisasi gagal; lease recovery akan menjaga antrean')
+        finally:
+            async with _get_blast_tasks_lock():
+                if _blast_tasks.get(job_id) is asyncio.current_task():
+                    _blast_tasks.pop(job_id,None)
+
+
+async def _start_blast_runner(bot,job_id):
+    async with _get_blast_tasks_lock():
+        existing=_blast_tasks.get(job_id)
+        if existing and not existing.done():
+            return False
+        token=uuid.uuid4().hex
+        if not await run_db_admin(_blast_acquire_sync,job_id,token):
+            return False
+        _blast_tasks[job_id]=asyncio.create_task(_run_broadcast(bot,job_id,token),name=f'blast-{job_id}')
+        return True
+
+
+async def _blast_admin_allowed(update,context):
+    if not update.effective_chat or update.effective_chat.type!='private':
+        if update.callback_query:
+            await _fast_callback_ack(update.callback_query,'Buka panel lewat chat pribadi bot.')
+        return False
+    if not await is_admin(update.effective_user.id,context):
+        if update.callback_query:
+            await _fast_callback_ack(update.callback_query,'Khusus admin.')
+        return False
+    return True
+
+
+async def cmd_blast_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _blast_admin_allowed(update,context):
+        return
+    if update.callback_query:
+        await _fast_callback_ack(update.callback_query)
+    await _ensure_blast_schema()
+    job=await run_db_admin(_blast_snapshot_sync)
+    if not job:
+        await update.effective_message.reply_text('Belum ada riwayat blast. Ketik /blast untuk mulai.')
+        return
+    await _blast_publish(context.bot,job,force_new=True,destination=update.effective_user.id)
+
 
 async def cmd_blast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.message.from_user.id, context):
+    if not await _blast_admin_allowed(update,context):
         return
-
-    jumlah = await get_buyer_count()
-    if jumlah == 0:
-        await update.message.reply_text("❌ Belum ada buyer aktif terdaftar.")
+    if update.callback_query:
+        await _fast_callback_ack(update.callback_query)
+    await _ensure_blast_schema()
+    job=await run_db_admin(_blast_snapshot_sync)
+    if job and job['status'] in ('running','paused','cancelling'):
+        await _blast_publish(context.bot,job,force_new=True,destination=update.effective_user.id)
         return
+    context.user_data['blast_state']={'step':'typing'}
+    await update.effective_message.reply_text(
+        '📢 <b>BROADCAST PESAN</b>\n\nKirim teks yang mau di-blast. Mendukung HTML.\n'
+        'Penerima: semua user unik yang pernah membuat order, kecuali yang diban admin.\n\n'
+        'Pesan akan ditampilkan untuk preview sebelum dikirim.',parse_mode='HTML',
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('❌ Batal',callback_data='blast_batal')]]))
 
-    context.user_data['blast_state'] = {'step': 'typing', 'buyer_count': jumlah}
-    await update.message.reply_text(
-        f"<b>📢 BROADCAST PESAN</b>\n"
-        f"========================\n\n"
-        f"Total penerima: <b>{jumlah} buyer</b>\n\n"
-        f"Kirim pesan yang mau di-blast sekarang.\n"
-        f"<i>Mendukung HTML: &lt;b&gt;bold&lt;/b&gt;, &lt;i&gt;italic&lt;/i&gt;, &lt;code&gt;code&lt;/code&gt;</i>\n\n"
-        f"⚠️ Setelah kirim pesan, akan ada <b>preview dan konfirmasi</b> sebelum blast dikirim.\n"
-        f"⚠️ User yang memblokir bot akan <b>dilewati</b> (tidak di-ban).",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("❌ Batal", callback_data="blast_batal")]
-        ])
-    )
 
 async def blast_batal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    context.user_data.pop('blast_state', None)
-    await query.edit_message_text(
-        "✅ Broadcast dibatalkan.",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali ke Panel", callback_data="admpanel_back")]])
-    )
+    if not await _blast_admin_allowed(update,context):
+        return
+    await _fast_callback_ack(update.callback_query)
+    context.user_data.pop('blast_state',None)
+    await update.callback_query.edit_message_text('✅ Draft blast dibatalkan. Blast yang sudah berjalan dapat dikontrol lewat /blast_status.')
+
+
+async def _blast_preview(update,context,text):
+    # Validate the actual message with Telegram in admin chat only; never probe recipients.
+    if not await _blast_admin_allowed(update,context):
+        return
+    if len(text)>4096:
+        await update.effective_message.reply_text('⚠️ Pesan terlalu panjang. Maksimal 4096 karakter, termasuk kode HTML pada editor ini.')
+        return
+    try:
+        await update.effective_message.reply_text(text,parse_mode='HTML')
+    except telegram.error.BadRequest:
+        await update.effective_message.reply_text('⚠️ Format HTML tidak valid atau pesan terlalu panjang. Perbaiki lalu kirim lagi.')
+        return
+    nonce=uuid.uuid4().hex
+    context.user_data['blast_state']={'step':'preview','text':text,'nonce':nonce}
+    await update.effective_message.reply_text('📋 Pesan di atas adalah preview. Kirim ke seluruh target blast?',
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton('✅ Kirim Sekarang',callback_data=f'blast_confirm|{nonce}'),
+             InlineKeyboardButton('✍️ Ubah Pesan',callback_data='blast_retype')],
+            [InlineKeyboardButton('❌ Batalkan',callback_data='blast_batal')]]))
+
 
 async def blast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer("⏳ Memulai broadcast di background...")
-
-    blast_state = context.user_data.pop('blast_state', None)
-    if not blast_state or blast_state.get('step') != 'preview':
-        await query.edit_message_text("⚠️ Sesi blast tidak ditemukan. Mulai ulang dengan /blast.")
+    if not await _blast_admin_allowed(update,context):
         return
-
-    text_blast = blast_state.get('text', '')
-    admin_id = query.from_user.id
-    buyers = await get_all_buyers()
-    if not buyers:
-        await query.edit_message_text("⚠️ Tidak ada buyer aktif saat broadcast akan dimulai.")
+    query=update.callback_query
+    await _fast_callback_ack(query,'⏳ Menyiapkan antrean...')
+    draft=context.user_data.get('blast_state') or {}
+    nonce=query.data.partition('|')[2]
+    if draft.get('step')!='preview' or not nonce or nonce!=draft.get('nonce'):
+        await _callback_feedback(query,context,'Preview sudah tidak aktif. Buka /blast atau /blast_status.')
         return
+    await _ensure_blast_schema()
+    job_id,created=await run_db_admin(_blast_create_sync,query.from_user.id,draft['text'],nonce)
+    context.user_data.pop('blast_state',None)
+    job=await run_db_admin(_blast_snapshot_sync,job_id)
+    # Save the initial panel before starting the reporter to avoid duplicate status bubbles.
+    await _blast_publish(context.bot,job,force_new=True,destination=query.from_user.id)
+    if created and job['status']=='paused':
+        await _start_blast_runner(context.bot,job_id)
 
-    await query.edit_message_text(
-        f"📢 <b>Broadcast dimulai di background!</b>\n"
-        f"Target: <b>{len(buyers)}</b> buyer.\n\n"
-        f"<i>Progres akan muncul di bawah ini...</i>",
-        parse_mode="HTML"
-    )
 
-    task = asyncio.create_task(_run_broadcast(context.bot, admin_id, buyers, text_blast))
-    async with _get_blast_tasks_lock():
-        _blast_tasks[admin_id] = task
+async def blast_control(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _blast_admin_allowed(update,context):
+        return
+    query=update.callback_query
+    await _fast_callback_ack(query)
+    parts=query.data.split('|')
+    if len(parts)!=3 or parts[1] not in ('pause','resume','cancel','refresh') or not parts[2].isdigit():
+        return
+    job_id=int(parts[2])
+    await _ensure_blast_schema()
+    if parts[1]=='resume':
+        await _start_blast_runner(context.bot,job_id)
+    elif parts[1] in ('pause','cancel'):
+        await run_db_admin(_blast_control_sync,job_id,parts[1])
+    job=await run_db_admin(_blast_snapshot_sync,job_id)
+    if job:
+        text,markup=_blast_panel(job)
+        try:
+            await query.edit_message_text(text,parse_mode='HTML',reply_markup=markup)
+        except telegram.error.BadRequest as exc:
+            if 'message is not modified' not in str(exc).lower():
+                raise
+
 
 async def blast_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer("⛔ Menghentikan broadcast...")
+    # Old buttons have no job identity: never let one cancel an unrelated new blast.
+    if not await _blast_admin_allowed(update,context):
+        return
+    await _fast_callback_ack(update.callback_query)
+    await _callback_feedback(update.callback_query,context,'Tombol lama sudah tidak berlaku. Buka /blast_status untuk mengontrol blast aktif.')
 
-    admin_id = query.from_user.id
-    async with _get_blast_tasks_lock():
-        task = _blast_tasks.pop(admin_id, None)
-    if task and not task.done():
-        task.cancel()
-        await query.edit_message_text(
-            "⛔ <b>Broadcast dihentikan oleh admin.</b>\n\n"
-            f"<i>Laporan akhir akan muncul sebentar lagi.</i>",
-            parse_mode="HTML"
-        )
-    else:
-        await query.answer("ℹ️ Tidak ada broadcast yang berjalan.", show_alert=True)
 
 # =================== GENERAL MESSAGE HANDLER ===================
 
@@ -7417,30 +7825,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not text:
                 await update.message.reply_text("❌ Pesan tidak boleh kosong.")
                 return
-
-            buyer_count = int(blast_state.get('buyer_count') or len(blast_state.get('buyers') or []))
-            context.user_data['blast_state'] = {
-                'step': 'preview',
-                'text': text,
-                'buyer_count': buyer_count,
-            }
-
-            await update.message.reply_text(
-                f"📋 <b>PREVIEW PESAN BLAST</b>\n"
-                f"========================\n\n"
-                f"{text}\n\n"
-                f"========================\n"
-                f"Target: <b>{buyer_count} buyer</b>\n\n"
-                f"Apakah pesan ini sudah benar?",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([
-                    [
-                        InlineKeyboardButton("✅ Kirim Sekarang", callback_data="blast_confirm"),
-                        InlineKeyboardButton("✍️ Ubah Pesan", callback_data="blast_retype"),
-                    ],
-                    [InlineKeyboardButton("❌ Batalkan", callback_data="blast_batal")],
-                ])
-            )
+            await _blast_preview(update, context, text)
             return
 
         if context.user_data.get('awaiting_cari'):
@@ -8009,6 +8394,7 @@ def build_admin_panel_keyboard(user_id: int = None):
         [
             InlineKeyboardButton("📊 Statistik",      callback_data="admpanel_stats"),
             InlineKeyboardButton("📢 Broadcast",      callback_data="admpanel_blast"),
+            InlineKeyboardButton("📊 Status Blast", callback_data="admpanel_blast_status"),
         ],
         [
             InlineKeyboardButton("💾 Data & Backup",  callback_data="admpanel_data"),
@@ -8133,44 +8519,21 @@ async def admpanel_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_back")]]))
 
 async def admpanel_blast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await _fast_callback_ack(query)
+    await cmd_blast(update, context)
 
-    jumlah = await get_buyer_count()
-    if jumlah == 0:
-        await query.edit_message_text(
-            "❌ Belum ada buyer aktif terdaftar.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_back")]])
-        )
-        return
-
-    context.user_data['blast_state'] = {'step': 'typing', 'buyer_count': jumlah}
-    await query.edit_message_text(
-        f"<b>📢 BROADCAST PESAN</b>\n"
-        f"========================\n\n"
-        f"Total penerima: <b>{jumlah} buyer</b>\n\n"
-        f"Kirim pesan yang mau di-blast sekarang.\n"
-        f"<i>Mendukung HTML: &lt;b&gt;bold&lt;/b&gt;, &lt;i&gt;italic&lt;/i&gt;</i>\n\n"
-        f"⚠️ Akan ada <b>preview + konfirmasi</b> sebelum dikirim.",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Batal", callback_data="blast_batal")]])
-    )
 
 async def blast_retype(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    blast_state = context.user_data.get('blast_state', {})
-    buyer_count = int(blast_state.get('buyer_count') or len(blast_state.get('buyers') or []))
-    context.user_data['blast_state'] = {'step': 'typing', 'buyer_count': buyer_count}
-
-    await query.edit_message_text(
-        f"<b>📢 BROADCAST - UBAH PESAN</b>\n"
-        f"========================\n\n"
-        f"Kirim pesan baru:",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Batal", callback_data="blast_batal")]])
+    if not await _blast_admin_allowed(update, context):
+        return
+    await _fast_callback_ack(update.callback_query)
+    context.user_data['blast_state'] = {'step': 'typing'}
+    await update.callback_query.edit_message_text(
+        '✍️ Kirim teks blast yang baru. Akan ada preview sebelum pengiriman.',
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton('❌ Batal', callback_data='blast_batal')
+        ]])
     )
+
 
 async def admpanel_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -8961,6 +9324,8 @@ def main():
         .connection_pool_size(TELEGRAM_CONNECTION_POOL_SIZE)
         .pool_timeout(TELEGRAM_POOL_TIMEOUT_SECONDS)
     )
+    if hasattr(builder, 'post_stop'):
+        builder = builder.post_stop(_stop_blast_before_shutdown)
     if AIORateLimiter is not None:
         try:
             builder = builder.rate_limiter(
@@ -8982,6 +9347,8 @@ def main():
     app.add_handler(CommandHandler("help",    cmd_help))
     app.add_handler(CommandHandler("riwayat", cmd_riwayat))
     app.add_handler(CommandHandler("resend", show_resend_menu))
+    app.add_handler(CommandHandler("blast_status", cmd_blast_status))
+    app.add_handler(CallbackQueryHandler(cmd_blast_status, pattern="^admpanel_blast_status$"))
 
     # Admin Commands
     app.add_handler(CommandHandler("admin",       cmd_admin))
@@ -9097,9 +9464,11 @@ def main():
     app.add_handler(CallbackQueryHandler(admpanel_admin_remove, pattern="^admpanel_admin_remove$"))
     app.add_handler(CallbackQueryHandler(admpanel_admin_del,    pattern="^admpanel_admin_del_"))
 
+    app.add_handler(CallbackQueryHandler(blast_control, pattern=r"^blastctl\|"))
+
     # Blast Message Confirmation Flow
     app.add_handler(CallbackQueryHandler(blast_batal,   pattern="^blast_batal$"))
-    app.add_handler(CallbackQueryHandler(blast_confirm, pattern="^blast_confirm$"))
+    app.add_handler(CallbackQueryHandler(blast_confirm, pattern=r"^blast_confirm(?:\|[a-f0-9]{32})?$"))
     app.add_handler(CallbackQueryHandler(blast_stop,    pattern="^blast_stop$"))
     app.add_handler(CallbackQueryHandler(blast_retype,  pattern="^blast_retype$"))
 

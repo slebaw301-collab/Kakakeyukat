@@ -40,7 +40,7 @@ from contextlib import contextmanager
 import telegram.error
 from telegram import (
     Update, BotCommand, BotCommandScopeChat, BotCommandScopeDefault,
-    InlineKeyboardButton, InlineKeyboardMarkup
+    InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity
 )
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
@@ -165,6 +165,20 @@ def samarkan_nama(nama: str) -> str:
 def esc(text) -> str:
     """Escape karakter spesial HTML untuk parse_mode=HTML."""
     return html_module.escape(str(text))
+
+
+def styled_button(text: str, *, style: str = None,
+                  icon_custom_emoji_id: str = None, **kwargs):
+    """Kirim field tombol baru lewat Bot API, termasuk pada PTB versi lama."""
+    extra = {}
+    if style in {'primary', 'success', 'danger'}:
+        extra['style'] = style
+    emoji_id = str(icon_custom_emoji_id or '').strip()
+    if emoji_id:
+        extra['icon_custom_emoji_id'] = emoji_id
+        # Saat ikon Premium aktif, hilangkan emoji Unicode di awal agar tidak dobel.
+        text = re.sub(r'^\S+\s+', '', text, count=1)
+    return InlineKeyboardButton(text, api_kwargs=extra or None, **kwargs)
 
 
 def tg_user_link(user_id, name: str = None) -> str:
@@ -3203,11 +3217,23 @@ async def build_main_menu_parts():
         "💳 QRIS (All E-Wallet)  |  ⚡ 1-5 Menit  |  🕒 24 Jam"
     )
     keyboard = [
-        [InlineKeyboardButton("🛒 Beli Sekarang", callback_data="buy")],
-        [InlineKeyboardButton("🔄 Kirim Ulang Link", callback_data="resend_menu")],
+        [styled_button(
+            "🛒 Beli Sekarang", callback_data="buy", style="primary",
+            icon_custom_emoji_id=os.environ.get("BTN_EMOJI_BUY_ID")
+        )],
+        [styled_button(
+            "🔄 Kirim Ulang Link", callback_data="resend_menu", style="success",
+            icon_custom_emoji_id=os.environ.get("BTN_EMOJI_RESEND_ID")
+        )],
         [
-            InlineKeyboardButton("⭐ Testimoni", url=link_testi),
-            InlineKeyboardButton("💬 Admin", url=link_cs)
+            styled_button(
+                "⭐ Testimoni", url=link_testi, style="primary",
+                icon_custom_emoji_id=os.environ.get("BTN_EMOJI_TESTIMONI_ID")
+            ),
+            styled_button(
+                "💬 Admin", url=link_cs, style="primary",
+                icon_custom_emoji_id=os.environ.get("BTN_EMOJI_ADMIN_ID")
+            )
         ]
     ]
     return text, keyboard
@@ -3398,10 +3424,10 @@ async def kirim_link_ke_buyer(context, user_id, paket, order_id, amount):
         ),
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⭐ Beri Ulasan / Testimoni", callback_data=f"rate_start|{order_id}")],
+            [styled_button("⭐ Beri Ulasan / Testimoni", style="primary", callback_data=f"rate_start|{order_id}")],
             [
-                InlineKeyboardButton("🔄 Kirim Ulang Link", callback_data="resend_menu"),
-                InlineKeyboardButton("💬 Chat Admin", url=await get_setting('link_admin', ADMIN_URL))
+                styled_button("🔄 Kirim Ulang Link", style="success", callback_data="resend_menu"),
+                styled_button("💬 Chat Admin", style="primary", url=await get_setting('link_admin', ADMIN_URL))
             ]
         ])
     )
@@ -3660,6 +3686,7 @@ async def _post_init_warmup(application: Application):
                 BotCommand("start", "Buka toko"),
                 BotCommand("help", "Bantuan"),
                 BotCommand("admin", "Panel admin"),
+                BotCommand("emojiid", "Ambil ID emoji Premium"),
             ],
             scope=BotCommandScopeChat(chat_id=ADMIN_ID)
         ),
@@ -3891,7 +3918,7 @@ async def _start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, tra
             f"📝 Order ID: <code>{esc(active['order_id'])}</code>\n\n"
             f"<i>Silakan selesaikan pembayaran atau batalkan pesanan dulu.</i>"
         )
-        keyboard = [[InlineKeyboardButton("❌ Batalkan Pesanan", callback_data="cancel_order")]]
+        keyboard = [[styled_button("❌ Batalkan Pesanan", style="danger", callback_data="cancel_order")]]
         await _send_user_message_replace(
             context,
             user_id,
@@ -3927,6 +3954,41 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await _start_handler(update, context, trace=trace)
     finally:
         trace.finish()
+
+
+async def cmd_emojiid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Tampilkan custom_emoji_id dari emoji pada command atau pesan yang dibalas."""
+    if not await is_admin(update.effective_user.id, context):
+        return
+
+    messages = [update.effective_message]
+    if update.effective_message.reply_to_message:
+        messages.append(update.effective_message.reply_to_message)
+
+    emoji_ids = []
+    for message in messages:
+        entities = list(message.entities or []) + list(message.caption_entities or [])
+        for entity in entities:
+            if str(entity.type) in {'custom_emoji', 'MessageEntityType.CUSTOM_EMOJI'}:
+                emoji_id = getattr(entity, 'custom_emoji_id', None)
+                if emoji_id and emoji_id not in emoji_ids:
+                    emoji_ids.append(emoji_id)
+
+    if not emoji_ids:
+        await update.effective_message.reply_text(
+            "Kirim <code>/emojiid</code> diikuti emoji Premium, atau balas pesan "
+            "yang berisi emoji Premium dengan <code>/emojiid</code>.",
+            parse_mode="HTML"
+        )
+        return
+
+    lines = "\n".join(f"<code>{esc(emoji_id)}</code>" for emoji_id in emoji_ids)
+    await update.effective_message.reply_text(
+        f"✅ <b>Custom Emoji ID</b>\n\n{lines}\n\n"
+        "Masukkan ID tersebut ke variabel tombol yang diinginkan.",
+        parse_mode="HTML"
+    )
+
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler untuk /help - menampilkan bantuan penggunaan bot."""
@@ -3980,7 +4042,7 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Belum ada paket yang tersedia saat ini.",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ Kembali", callback_data="back_to_menu")]
+                [styled_button("⬅️ Kembali", style="primary", callback_data="back_to_menu")]
             ])
         )
         return
@@ -3998,7 +4060,7 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )]
         for p in aktif
     ]
-    keyboard.append([InlineKeyboardButton("⬅️ Kembali", callback_data="back_to_menu")])
+    keyboard.append([styled_button("⬅️ Kembali", style="primary", callback_data="back_to_menu")])
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def pilih_paket(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4026,12 +4088,12 @@ async def pilih_paket(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if paket.get('aktif', True):
         text += "Lanjut buat order dan bayar via QRIS?"
         keyboard = [
-            [InlineKeyboardButton("✅ Lanjut Bayar", callback_data=f"confirm_buy_{paket_id}")],
-            [InlineKeyboardButton("⬅️ Kembali", callback_data="buy")]
+            [styled_button("✅ Lanjut Bayar", style="success", callback_data=f"confirm_buy_{paket_id}")],
+            [styled_button("⬅️ Kembali", style="primary", callback_data="buy")]
         ]
     else:
         text += "Paket ini sedang tidak bisa dibeli. Silakan pilih paket lain."
-        keyboard = [[InlineKeyboardButton("⬅️ Kembali", callback_data="buy")]]
+        keyboard = [[styled_button("⬅️ Kembali", style="primary", callback_data="buy")]]
 
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
@@ -4361,7 +4423,7 @@ async def _buat_order_baru(update, context, query, user_id, user_name, paket, or
         kb.append([InlineKeyboardButton("🌐 Buka Halaman Pembayaran", url=checkout_url)])
     if sisa_ganti > 0:
         kb.append([InlineKeyboardButton(f"🔄 Ganti Paket (sisa {sisa_ganti}x)", callback_data="ganti_paket_list")])
-    kb.append([InlineKeyboardButton("❌ Batalkan Pesanan", callback_data="cancel_order")])
+    kb.append([styled_button("❌ Batalkan Pesanan", style="danger", callback_data="cancel_order")])
 
     msg = await context.bot.send_photo(
         chat_id=update.effective_chat.id,
@@ -4614,8 +4676,8 @@ async def ganti_paket_konfirm(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     keyboard = [
         [
-            InlineKeyboardButton("✅ Ya, Ganti", callback_data=f"ganti_paket_exec|{new_paket_id}"),
-            InlineKeyboardButton("❌ Batal", callback_data="ganti_paket_batal"),
+            styled_button("✅ Ya, Ganti", style="success", callback_data=f"ganti_paket_exec|{new_paket_id}"),
+            styled_button("❌ Batal", style="danger", callback_data="ganti_paket_batal"),
         ]
     ]
     try:
@@ -4694,10 +4756,10 @@ async def ganti_paket_batal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if sisa_ganti > 0:
         kb = [
             [InlineKeyboardButton(f"🔄 Ganti Paket (sisa {sisa_ganti}x)", callback_data="ganti_paket_list")],
-            [InlineKeyboardButton("❌ Batalkan Pesanan", callback_data="cancel_order")],
+            [styled_button("❌ Batalkan Pesanan", style="danger", callback_data="cancel_order")],
         ]
     else:
-        kb = [[InlineKeyboardButton("❌ Batalkan Pesanan", callback_data="cancel_order")]]
+        kb = [[styled_button("❌ Batalkan Pesanan", style="danger", callback_data="cancel_order")]]
 
     try:
         await query.message.edit_caption(caption_back, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
@@ -5019,8 +5081,8 @@ async def _send_buyer_product_link(bot, user_id: int, order_id: str, paket: dict
         ),
         parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⭐ Beri Ulasan / Testimoni", callback_data=f"rate_start|{order_id}")],
-                [InlineKeyboardButton("🔄 Kirim Ulang Link", callback_data="resend_menu")]
+                [styled_button("⭐ Beri Ulasan / Testimoni", style="primary", callback_data=f"rate_start|{order_id}")],
+                [styled_button("🔄 Kirim Ulang Link", style="success", callback_data="resend_menu")]
             ])
         ),
         label=f"kirim link buyer {order_id}",
@@ -5395,8 +5457,8 @@ async def admin_kirim_link_prereq(update: Update, context: ContextTypes.DEFAULT_
             ),
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⭐ Beri Ulasan / Testimoni", callback_data=f"rate_start|{order_id}")],
-                [InlineKeyboardButton("🔄 Kirim Ulang Link", callback_data="resend_menu")]
+                [styled_button("⭐ Beri Ulasan / Testimoni", style="primary", callback_data=f"rate_start|{order_id}")],
+                [styled_button("🔄 Kirim Ulang Link", style="success", callback_data="resend_menu")]
             ])
         )
         kirim_berhasil = True
@@ -5571,8 +5633,8 @@ async def handle_rate_text_skip(update: Update, context: ContextTypes.DEFAULT_TY
 
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("✅ Setujui & Posting", callback_data=f"adm_testi_approve|{order_id}"),
-            InlineKeyboardButton("❌ Tolak", callback_data=f"adm_testi_reject|{order_id}")
+            styled_button("✅ Setujui & Posting", style="success", callback_data=f"adm_testi_approve|{order_id}"),
+            styled_button("❌ Tolak", style="danger", callback_data=f"adm_testi_reject|{order_id}")
         ]
     ])
 
@@ -5636,8 +5698,8 @@ async def handle_rate_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Terima kasih telah berbelanja! 🙏",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⭐ Beri Ulasan / Testimoni", callback_data=f"rate_start|{order_id}")],
-            [InlineKeyboardButton("🔄 Kirim Ulang Link", callback_data="resend_menu")]
+            [styled_button("⭐ Beri Ulasan / Testimoni", style="primary", callback_data=f"rate_start|{order_id}")],
+            [styled_button("🔄 Kirim Ulang Link", style="success", callback_data="resend_menu")]
         ])
     )
 
@@ -5850,7 +5912,7 @@ async def produk_detail(update: Update, context: ContextTypes.DEFAULT_TYPE, pake
             callback_data=f"pd_toggle_{paket_id}"
         )],
         [InlineKeyboardButton("🗑️ Hapus Produk", callback_data=f"pd_hapus_{paket_id}")],
-        [InlineKeyboardButton("⬅️ Kembali",       callback_data="pd_back")],
+        [styled_button("⬅️ Kembali", style="primary",       callback_data="pd_back")],
     ]
 
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
@@ -6031,7 +6093,7 @@ async def produk_hapus_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
         reply_markup=InlineKeyboardMarkup([
             [
                 InlineKeyboardButton("✅ Ya, Hapus", callback_data=f"pd_hapus_ok_{paket_id}"),
-                InlineKeyboardButton("❌ Batal",     callback_data=f"pd_detail_{paket_id}"),
+                styled_button("❌ Batal", style="danger",     callback_data=f"pd_detail_{paket_id}"),
             ]
         ])
     )
@@ -6161,7 +6223,7 @@ async def _build_pending_orders_text_and_keyboard(page: int = 0, back_callback: 
     nav = _pagination_row("admpanel_orders_pending", page, total, ADMIN_ORDER_PAGE_SIZE)
     if nav:
         keyboard.append(nav)
-    keyboard.append([InlineKeyboardButton("⬅️ Kembali", callback_data=back_callback)])
+    keyboard.append([styled_button("⬅️ Kembali", style="primary", callback_data=back_callback)])
     return text, keyboard
 
 async def cmd_aktif(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6178,7 +6240,7 @@ async def cmd_aktif(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    keyboard.append([InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_orders")])
+    keyboard.append([styled_button("⬅️ Kembali", style="primary", callback_data="admpanel_orders")])
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
 def _check_waiting_order_sync(order_id):
@@ -6534,7 +6596,7 @@ async def cmd_riwayat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         text, parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("🔄 Kirim Ulang Link", callback_data="resend_menu")
+            styled_button("🔄 Kirim Ulang Link", style="success", callback_data="resend_menu")
         ]])
     )
 
@@ -7451,13 +7513,13 @@ def _blast_panel(job):
         text += '\n\nHasil belum pasti tidak dikirim ulang otomatis untuk mencegah pesan dobel.'
     buttons = []
     if job['status']=='running':
-        buttons.append(InlineKeyboardButton('⏸ Jeda',callback_data=f"blastctl|pause|{job['id']}"))
+        buttons.append(styled_button('⏸ Jeda',style='primary',callback_data=f"blastctl|pause|{job['id']}"))
     if job['status']=='paused' and not job.get('lease_live'):
-        buttons.append(InlineKeyboardButton('▶️ Lanjutkan',callback_data=f"blastctl|resume|{job['id']}"))
+        buttons.append(styled_button('▶️ Lanjutkan',style='success',callback_data=f"blastctl|resume|{job['id']}"))
     if job['status'] in ('running','paused'):
-        buttons.append(InlineKeyboardButton('⛔ Batalkan',callback_data=f"blastctl|cancel|{job['id']}"))
+        buttons.append(styled_button('⛔ Batalkan',style='danger',callback_data=f"blastctl|cancel|{job['id']}"))
     keyboard = [buttons] if buttons else []
-    keyboard.append([InlineKeyboardButton('🔄 Refresh Status',callback_data=f"blastctl|refresh|{job['id']}")])
+    keyboard.append([styled_button('🔄 Refresh Status',style='primary',callback_data=f"blastctl|refresh|{job['id']}")])
     if job['status'] in ('completed','cancelled'):
         keyboard.append([InlineKeyboardButton('📢 Blast Baru', callback_data='admpanel_blast')])
     keyboard.append([InlineKeyboardButton('⬅️ Panel Admin',callback_data='admpanel_back')])
@@ -7805,8 +7867,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         keyboard = InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("✅ Setujui & Posting", callback_data=f"adm_testi_approve|{order_id}"),
-                InlineKeyboardButton("❌ Tolak", callback_data=f"adm_testi_reject|{order_id}")
+                styled_button("✅ Setujui & Posting", style="success", callback_data=f"adm_testi_approve|{order_id}"),
+                styled_button("❌ Tolak", style="danger", callback_data=f"adm_testi_reject|{order_id}")
             ]
         ])
 
@@ -7899,7 +7961,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "<i>Coba cari ulang atau periksa ejaan.</i>",
                     parse_mode="HTML",
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Cari Lagi", callback_data="kick_cek_user"),
-                                                        InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_kick")]])
+                                                        styled_button("⬅️ Kembali", style="primary", callback_data="admpanel_kick")]])
                 )
                 return
             buttons = []
@@ -7910,7 +7972,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     callback_data=f"kick_select|{r['user_id']}"
                 )])
             buttons.append([InlineKeyboardButton("🔄 Cari Lagi", callback_data="kick_cek_user"),
-                            InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_kick")])
+                            styled_button("⬅️ Kembali", style="primary", callback_data="admpanel_kick")])
             await update.message.reply_text(
                 f"🔍 <b>Hasil Pencarian: \"{esc(query_str)}\"</b>\n"
                 f"========================\n\n"
@@ -8252,9 +8314,9 @@ async def admin_proses_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
     keyboard = [
         [
             InlineKeyboardButton("✅ Konfirmasi", callback_data=f"confirm_{user_id}"),
-            InlineKeyboardButton("❌ Tolak",      callback_data=f"reject_{user_id}"),
+            styled_button("❌ Tolak", style="danger",      callback_data=f"reject_{user_id}"),
         ],
-        [InlineKeyboardButton("⬅️ Kembali", callback_data="back_orders")]
+        [styled_button("⬅️ Kembali", style="primary", callback_data="back_orders")]
     ]
 
     # Satu edit lebih cepat daripada delete + send (dua round-trip Telegram).
@@ -8446,7 +8508,7 @@ async def admpanel_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("🔄 Order Pending", callback_data="admpanel_orders_pending"),
         ],
         [InlineKeyboardButton("🔍 Cari Order",    callback_data="admpanel_orders_cari")],
-        [InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_back")],
+        [styled_button("⬅️ Kembali", style="primary", callback_data="admpanel_back")],
     ])
     await query.edit_message_text(
         "<b>📋 ORDERS</b>\n"
@@ -8466,11 +8528,11 @@ async def admpanel_orders_aktif(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(
             "<b>✅ TIDAK ADA ORDER AKTIF</b>\n========================\n\nTidak ada buyer yang sedang menunggu membayar.",
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_orders")]])
+            reply_markup=InlineKeyboardMarkup([[styled_button("⬅️ Kembali", style="primary", callback_data="admpanel_orders")]])
         )
         return
 
-    keyboard.append([InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_orders")])
+    keyboard.append([styled_button("⬅️ Kembali", style="primary", callback_data="admpanel_orders")])
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def admpanel_orders_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8483,7 +8545,7 @@ async def admpanel_orders_pending(update: Update, context: ContextTypes.DEFAULT_
         await query.edit_message_text(
             "<b>✅ TIDAK ADA ORDER PENDING</b>\n========================",
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_orders")]])
+            reply_markup=InlineKeyboardMarkup([[styled_button("⬅️ Kembali", style="primary", callback_data="admpanel_orders")]])
         )
         return
 
@@ -8499,7 +8561,7 @@ async def admpanel_orders_cari(update: Update, context: ContextTypes.DEFAULT_TYP
         "Kirim <b>Order ID</b> yang ingin dicari.\n"
         "Contoh: <code>HFB-123456789-20240101120000-ABCD</code>",
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Batal", callback_data="admpanel_orders")]])
+        reply_markup=InlineKeyboardMarkup([[styled_button("❌ Batal", style="danger", callback_data="admpanel_orders")]])
     )
 
 async def admpanel_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8512,11 +8574,11 @@ async def admpanel_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = _build_stats_text(s, now)
     try:
         await query.edit_message_text(text, parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_back")]]))
+            reply_markup=InlineKeyboardMarkup([[styled_button("⬅️ Kembali", style="primary", callback_data="admpanel_back")]]))
     except Exception as e:
         logger.debug(f"Gagal mengedit stats di panel: {e}")
         await context.bot.send_message(chat_id=query.from_user.id, text=text, parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_back")]]))
+            reply_markup=InlineKeyboardMarkup([[styled_button("⬅️ Kembali", style="primary", callback_data="admpanel_back")]]))
 
 async def admpanel_blast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cmd_blast(update, context)
@@ -8545,7 +8607,7 @@ async def admpanel_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ],
         [InlineKeyboardButton("📥 Import JSON",    callback_data="admpanel_data_import")],
         [InlineKeyboardButton("🔗 Info Link Produk", callback_data="admpanel_data_link")],
-        [InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_back")],
+        [styled_button("⬅️ Kembali", style="primary", callback_data="admpanel_back")],
     ])
     await query.edit_message_text(
         "<b>💾 DATA &amp; BACKUP</b>\n"
@@ -8561,7 +8623,7 @@ async def admpanel_data_backup(update: Update, context: ContextTypes.DEFAULT_TYP
     await _kirim_backup(context.bot)
     await query.edit_message_text(
         "✅ Backup berhasil dikirim ke DM kamu.",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_data")]])
+        reply_markup=InlineKeyboardMarkup([[styled_button("⬅️ Kembali", style="primary", callback_data="admpanel_data")]])
     )
 
 async def admpanel_data_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8587,13 +8649,13 @@ async def admpanel_data_export(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         await query.edit_message_text(
             "✅ File export berhasil dikirim.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_data")]])
+            reply_markup=InlineKeyboardMarkup([[styled_button("⬅️ Kembali", style="primary", callback_data="admpanel_data")]])
         )
     except Exception as e:
         await query.edit_message_text(
             f"❌ Gagal export: {esc(str(e))}",
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_data")]])
+            reply_markup=InlineKeyboardMarkup([[styled_button("⬅️ Kembali", style="primary", callback_data="admpanel_data")]])
         )
 
 async def admpanel_data_import(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8606,7 +8668,7 @@ async def admpanel_data_import(update: Update, context: ContextTypes.DEFAULT_TYP
         "Kirim file <code>.json</code> yang didapat dari Export.\n\n"
         "⚠️ Data yang sudah ada <b>tidak akan dihapus</b>.",
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Batal", callback_data="admpanel_data")]])
+        reply_markup=InlineKeyboardMarkup([[styled_button("❌ Batal", style="danger", callback_data="admpanel_data")]])
     )
 
 async def admpanel_data_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8622,7 +8684,7 @@ async def admpanel_data_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
             text += f"{esc(p['emoji'])} <b>{esc(p['nama'])}</b>\n- <code>{esc(p['link'])}</code>\n\n"
     await query.edit_message_text(
         text, parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_data")]])
+        reply_markup=InlineKeyboardMarkup([[styled_button("⬅️ Kembali", style="primary", callback_data="admpanel_data")]])
     )
 
 async def admpanel_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8634,7 +8696,7 @@ async def admpanel_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("✅ Unban User",    callback_data="admpanel_user_unban"),
         ],
         [InlineKeyboardButton("📋 Daftar Ban",    callback_data="admpanel_user_daftar")],
-        [InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_back")],
+        [styled_button("⬅️ Kembali", style="primary", callback_data="admpanel_back")],
     ])
     await query.edit_message_text(
         "<b>🚫 KELOLA USER</b>\n"
@@ -8680,7 +8742,7 @@ async def admpanel_user_daftar(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text(
             "<b>🚫 DAFTAR BAN</b>\n========================\n\nBelum ada user yang dibanned.",
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_user")]])
+            reply_markup=InlineKeyboardMarkup([[styled_button("⬅️ Kembali", style="primary", callback_data="admpanel_user")]])
         )
         return
     total_pages = max(1, (total + ADMIN_LIST_PAGE_SIZE - 1) // ADMIN_LIST_PAGE_SIZE)
@@ -8695,7 +8757,7 @@ async def admpanel_user_daftar(update: Update, context: ContextTypes.DEFAULT_TYP
     nav = _pagination_row("admpanel_user_daftar", page, total, ADMIN_LIST_PAGE_SIZE)
     if nav:
         keyboard.append(nav)
-    keyboard.append([InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_user")])
+    keyboard.append([styled_button("⬅️ Kembali", style="primary", callback_data="admpanel_user")])
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
 # =================== ADMIN: CEK & KICK USER DI GRUP ===================
@@ -8732,7 +8794,7 @@ async def admpanel_kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("➕ Tambah Grup",      callback_data="kick_add_group"),
         ],
         [InlineKeyboardButton("🗑️ Hapus Grup",          callback_data="kick_del_group")],
-        [InlineKeyboardButton("⬅️ Kembali",              callback_data="admpanel_back")],
+        [styled_button("⬅️ Kembali", style="primary",              callback_data="admpanel_back")],
     ])
 
     await query.edit_message_text(
@@ -8756,7 +8818,7 @@ async def kick_cek_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Kirim <b>nama</b> atau <b>User ID</b> yang ingin dicek.\n\n"
         "<i>Contoh nama: Budi  ·  Contoh ID: 123456789</i>",
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Batal", callback_data="admpanel_kick")]])
+        reply_markup=InlineKeyboardMarkup([[styled_button("❌ Batal", style="danger", callback_data="admpanel_kick")]])
     )
 
 async def kick_select_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8813,7 +8875,7 @@ async def kick_select_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         + "\n\n<i>Pilih aksi di bawah:</i>"
     )
     buttons.append([InlineKeyboardButton(f"👢 Kick dari Semua Grup + Ban", callback_data=f"kick_do_kick|{target_id}")])
-    buttons.append([InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_kick")])
+    buttons.append([styled_button("⬅️ Kembali", style="primary", callback_data="admpanel_kick")])
     await query.edit_message_text(result_text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
 
 async def kick_one(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8849,7 +8911,7 @@ async def kick_add_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Kirim <b>Chat ID grup</b> yang ingin ditambahkan.\n"
         "Contoh: <code>-1001234567890</code>",
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Batal", callback_data="admpanel_kick")]])
+        reply_markup=InlineKeyboardMarkup([[styled_button("❌ Batal", style="danger", callback_data="admpanel_kick")]])
     )
 
 async def kick_del_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8868,7 +8930,7 @@ async def kick_del_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.debug(f"Gagal mengambil info chat {gid}: {e}")
             label = f"🗑️ {gid}"
         buttons.append([InlineKeyboardButton(label, callback_data=f"kick_del_confirm|{gid}")])
-    buttons.append([InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_kick")])
+    buttons.append([styled_button("⬅️ Kembali", style="primary", callback_data="admpanel_kick")])
     await query.edit_message_text(
         "<b>🗑️ HAPUS GRUP</b>\n========================\n\nPilih grup yang ingin dihapus:",
         parse_mode="HTML",
@@ -8937,7 +8999,7 @@ async def kick_do_kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result_text += "\n\n🚫 User sudah di-ban dari bot dan menerima notifikasi."
     await query.edit_message_text(
         result_text, parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_kick")]])
+        reply_markup=InlineKeyboardMarkup([[styled_button("⬅️ Kembali", style="primary", callback_data="admpanel_kick")]])
     )
 
 # =================== ADMIN: PENGATURAN ===================
@@ -8990,7 +9052,7 @@ async def admpanel_setting(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("⭐ Ubah Link Testimoni", callback_data="admpanel_setting_link_testi"),
             InlineKeyboardButton("💬 Ubah Link Admin/CS",  callback_data="admpanel_setting_link_admin"),
         ],
-        [InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_back")],
+        [styled_button("⬅️ Kembali", style="primary", callback_data="admpanel_back")],
     ])
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
 
@@ -9212,7 +9274,7 @@ async def admpanel_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Tambah Admin", callback_data="admpanel_admin_add")],
         [InlineKeyboardButton("➖ Hapus Admin",  callback_data="admpanel_admin_remove")],
-        [InlineKeyboardButton("⬅️ Kembali",       callback_data="admpanel_back")],
+        [styled_button("⬅️ Kembali", style="primary",       callback_data="admpanel_back")],
     ])
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
 
@@ -9244,7 +9306,7 @@ async def admpanel_admin_remove(update: Update, context: ContextTypes.DEFAULT_TY
     if not admins:
         await query.edit_message_text(
             "ℹ️ Belum ada admin tambahan yang bisa dihapus.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_admins")]])
+            reply_markup=InlineKeyboardMarkup([[styled_button("⬅️ Kembali", style="primary", callback_data="admpanel_admins")]])
         )
         return
 
@@ -9254,7 +9316,7 @@ async def admpanel_admin_remove(update: Update, context: ContextTypes.DEFAULT_TY
             f"🗑️ {a['nama']} ({a['user_id']})",
             callback_data=f"admpanel_admin_del_{a['user_id']}"
         )])
-    buttons.append([InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_admins")])
+    buttons.append([styled_button("⬅️ Kembali", style="primary", callback_data="admpanel_admins")])
     await query.edit_message_text(
         "<b>➖ HAPUS ADMIN</b>\n========================\n\nPilih admin yang ingin dihapus:",
         parse_mode="HTML",
@@ -9279,7 +9341,7 @@ async def admpanel_admin_del(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.edit_message_text(
         f"✅ Admin <code>{target_id}</code> berhasil dihapus.",
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_admins")]])
+        reply_markup=InlineKeyboardMarkup([[styled_button("⬅️ Kembali", style="primary", callback_data="admpanel_admins")]])
     )
 
 # =================== GLOBAL ERROR HANDLER ===================
@@ -9348,6 +9410,7 @@ def main():
     app.add_handler(CommandHandler("riwayat", cmd_riwayat))
     app.add_handler(CommandHandler("resend", show_resend_menu))
     app.add_handler(CommandHandler("blast_status", cmd_blast_status))
+    app.add_handler(CommandHandler("emojiid", cmd_emojiid))
     app.add_handler(CallbackQueryHandler(cmd_blast_status, pattern="^admpanel_blast_status$"))
 
     # Admin Commands

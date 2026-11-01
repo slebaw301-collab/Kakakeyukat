@@ -17,6 +17,7 @@ import urllib.parse
 import time as _time
 import copy
 import uuid
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 from aiohttp import web as aio_web
@@ -37,7 +38,7 @@ from psycopg2.extras import RealDictCursor
 from psycopg2.pool import ThreadedConnectionPool
 from io import BytesIO
 from datetime import datetime, timedelta, timezone
-from contextlib import contextmanager
+from contextlib import contextmanager, AsyncExitStack
 import telegram.error
 from telegram import (
     Update, BotCommand, BotCommandScopeChat, BotCommandScopeDefault,
@@ -52,6 +53,11 @@ try:
     from telegram.ext import AIORateLimiter
 except Exception:
     AIORateLimiter = None
+
+try:
+    from telegram.ext import BaseRateLimiter
+except ImportError:
+    BaseRateLimiter = None
 
 try:
     # Tersedia mulai python-telegram-bot 20.4.
@@ -289,7 +295,7 @@ SHOPEEPAY_FALLBACK_ENABLED = (
 BOT_CONCURRENT_UPDATES = _env_int("BOT_CONCURRENT_UPDATES", 24, 4, 128)
 TELEGRAM_CONNECTION_POOL_SIZE = _env_int("TELEGRAM_CONNECTION_POOL_SIZE", 64, 16, 256)
 TELEGRAM_POOL_TIMEOUT_SECONDS = _env_float("TELEGRAM_POOL_TIMEOUT_SECONDS", 15.0, 1.0, 60.0)
-DB_POOL_MIN = _env_int("DB_POOL_MIN", 2, 1, 10)
+DB_POOL_MIN = _env_int("DB_POOL_MIN", 4, 1, 10)
 DB_POOL_MAX = _env_int("DB_POOL_MAX", 20, DB_POOL_MIN, 50)
 # Jalur DB admin/background dibatasi agar query berat tidak menghabiskan semua worker buyer.
 DB_ADMIN_THREAD_WORKERS = _env_int("DB_ADMIN_THREAD_WORKERS", 2, 1, 6)
@@ -303,6 +309,8 @@ DB_THREAD_WORKERS = _env_int(
 )
 CPU_THREAD_WORKERS = _env_int("CPU_THREAD_WORKERS", 4, 2, 12)
 ASYNCPG_POOL_MAX = _env_int("ASYNCPG_POOL_MAX", 4, 1, 12)
+ASYNCPG_ACQUIRE_TIMEOUT_SECONDS = _env_float("ASYNCPG_ACQUIRE_TIMEOUT_SECONDS", 2.0, 0.5, 10.0)
+ASYNCPG_READ_TIMEOUT_SECONDS = _env_float("ASYNCPG_READ_TIMEOUT_SECONDS", 4.0, 1.0, 15.0)
 DB_STATEMENT_TIMEOUT_MS = _env_int("DB_STATEMENT_TIMEOUT_MS", 8000, 1000, 60000)
 ACTIVE_ORDER_CACHE_TTL_SECONDS = _env_float("ACTIVE_ORDER_CACHE_TTL_SECONDS", 2.5, 0.5, 10.0)
 WAITING_ORDERS_CACHE_TTL_SECONDS = _env_float("WAITING_ORDERS_CACHE_TTL_SECONDS", 3.0, 0.5, 15.0)
@@ -370,8 +378,13 @@ def _get_user_notice_lock(user_id: int) -> asyncio.Lock:
     """Serialisasi notifikasi status per buyer agar spam command tidak membuat duplikat."""
     global _user_notice_locks
     if _user_notice_locks is None:
-        _user_notice_locks = [asyncio.Lock() for _ in range(64)]
-    return _user_notice_locks[int(user_id) % len(_user_notice_locks)]
+        _user_notice_locks = weakref.WeakValueDictionary()
+    uid = int(user_id)
+    lock = _user_notice_locks.get(uid)
+    if lock is None:
+        lock = asyncio.Lock()
+        _user_notice_locks[uid] = lock
+    return lock
 
 
 def claim_invoice_creation(user_id: int) -> bool:
@@ -386,10 +399,22 @@ def release_invoice_creation(user_id: int):
     _invoice_creation_in_progress.discard(user_id)
 
 
+_callback_acks = {}
+
 async def _fast_callback_ack(query, text: str = None):
     """Hentikan spinner callback Telegram sedini mungkin tanpa menggagalkan handler jika jaringan sedang fluktuatif."""
     try:
+        query_id = getattr(query, 'id', None)
+        now_mono = _time.monotonic()
+        if text is None and query_id and _callback_acks.get(query_id, 0) > now_mono:
+            return
         await query.answer(text=text)
+        if query_id:
+            _callback_acks[query_id] = now_mono + 60
+            if len(_callback_acks) > 4096:
+                for old_id, expires_at in list(_callback_acks.items()):
+                    if expires_at <= now_mono or len(_callback_acks) > 4096:
+                        _callback_acks.pop(old_id, None)
     except Exception as exc:
         logger.debug(f"[CALLBACK] ACK gagal/terlambat: {exc}")
 
@@ -581,18 +606,170 @@ def spawn_background(coro, *, name: str = None):
     return task
 
 
+# Request buyer didahulukan; blast/cleanup tetap memakai batas Telegram yang sama.
+if BaseRateLimiter is not None:
+    class BuyerPriorityRateLimiter(BaseRateLimiter):
+        def __init__(self, overall_max_rate=28, overall_time_period=1.0,
+                     background_max_rate=18, group_max_rate=20, group_time_period=60.0):
+            self._overall_rate = overall_max_rate
+            self._period = overall_time_period
+            self._background_rate = min(background_max_rate, overall_max_rate)
+            self._group_rate = group_max_rate
+            self._group_period = group_time_period
+            self._sent = deque()
+            self._background_sent = deque()
+            self._groups = {}
+            self._waiting = {}
+            self._sequence = 0
+            self._condition = None
+            self._blocked_until = 0.0
+            self._closed = False
+
+        async def initialize(self):
+            self._condition = asyncio.Condition()
+            self._closed = False
+
+        async def shutdown(self):
+            if self._condition is not None:
+                async with self._condition:
+                    self._closed = True
+                    self._condition.notify_all()
+
+        @staticmethod
+        def _group_id(chat_id):
+            if chat_id is None:
+                return None
+            try:
+                return str(chat_id) if int(chat_id) < 0 else None
+            except (TypeError, ValueError):
+                return str(chat_id) if str(chat_id).startswith('@') else None
+
+        def _delay(self, item, now_mono):
+            _, _, counted, background, group_id = item
+            delay = max(0.0, self._blocked_until - now_mono)
+            if counted and len(self._sent) >= self._overall_rate:
+                delay = max(delay, self._sent[0] + self._period - now_mono)
+            if counted and background and len(self._background_sent) >= self._background_rate:
+                delay = max(delay, self._background_sent[0] + self._period - now_mono)
+            history = self._groups.get(group_id)
+            if group_id is not None and history and len(history) >= self._group_rate:
+                delay = max(delay, history[0] + self._group_period - now_mono)
+            return delay
+
+        async def _acquire(self, endpoint, data, background):
+            if self._condition is None:
+                await self.initialize()
+            counted = data.get('chat_id') is not None
+            group_id = self._group_id(data.get('chat_id'))
+            priority = 0 if endpoint == 'answerCallbackQuery' else (2 if background else 1)
+            token = object()
+            started = _time.monotonic()
+            async with self._condition:
+                self._sequence += 1
+                self._waiting[token] = (priority, self._sequence, counted, background, group_id)
+                self._condition.notify_all()
+                try:
+                    while True:
+                        if self._closed:
+                            raise RuntimeError('Telegram request limiter is shutting down')
+                        now_mono = _time.monotonic()
+                        for history in (self._sent, self._background_sent):
+                            while history and history[0] <= now_mono - self._period:
+                                history.popleft()
+                        for key, history in list(self._groups.items()):
+                            while history and history[0] <= now_mono - self._group_period:
+                                history.popleft()
+                            if not history:
+                                self._groups.pop(key, None)
+                        eligible = [
+                            (item[0], item[1], key) for key, item in self._waiting.items()
+                            if self._delay(item, now_mono) <= 0
+                        ]
+                        if eligible and min(eligible, key=lambda row: row[:2])[2] is token:
+                            if counted:
+                                self._sent.append(now_mono)
+                                if background:
+                                    self._background_sent.append(now_mono)
+                            if group_id is not None:
+                                self._groups.setdefault(group_id, deque()).append(now_mono)
+                            _record_latency('telegram-limiter-wait', now_mono - started)
+                            return
+                        delays = [self._delay(item, now_mono) for item in self._waiting.values()]
+                        positive = [d for d in delays if d > 0]
+                        timeout = max(0.001, min(positive)) if positive else 0.05
+                        try:
+                            await asyncio.wait_for(self._condition.wait(), timeout=timeout)
+                        except asyncio.TimeoutError:
+                            pass
+                finally:
+                    self._waiting.pop(token, None)
+                    self._condition.notify_all()
+
+        async def process_request(self, callback, args, kwargs, endpoint, data, rate_limit_args):
+            options = rate_limit_args if isinstance(rate_limit_args, dict) else {}
+            # Legacy rate_limit_args=0 digunakan oleh durable blast: nol retry, bukan bypass.
+            background = (options.get('priority') == 'background' or rate_limit_args == 0
+                          or endpoint in {'deleteMessage', 'deleteMessages', 'sendDocument'}
+                          or self._group_id(data.get('chat_id')) is not None)
+            retries = options.get('max_retries', rate_limit_args if type(rate_limit_args) is int else 1)
+            retries = max(0, min(3, int(retries)))
+            for attempt in range(retries + 1):
+                await self._acquire(endpoint, data, background)
+                started = _time.monotonic()
+                try:
+                    return await callback(*args, **kwargs)
+                except telegram.error.RetryAfter as exc:
+                    delay = exc.retry_after.total_seconds() if isinstance(exc.retry_after, timedelta) else float(exc.retry_after)
+                    # Hormati cooldown Telegram. Tidak menghindari limit dengan bot/client lain.
+                    async with self._condition:
+                        self._blocked_until = max(self._blocked_until, _time.monotonic() + max(0, delay) + 0.1)
+                        self._condition.notify_all()
+                    if attempt >= retries:
+                        raise
+                finally:
+                    _record_latency('telegram-api:' + endpoint, _time.monotonic() - started)
+else:
+    BuyerPriorityRateLimiter = None
+
+
+def _telegram_background_options(bot, *, retries=0):
+    limiter = getattr(bot, 'rate_limiter', None)
+    if BuyerPriorityRateLimiter is not None and isinstance(limiter, BuyerPriorityRateLimiter):
+        return {'rate_limit_args': {'priority': 'background', 'max_retries': retries}}
+    if limiter is not None:
+        return {'rate_limit_args': retries}
+    return {}
+
+
+# Hanya navigasi yang tidak mengubah transaksi yang boleh digabung.
+def _navigation_key(update):
+    query = getattr(update, 'callback_query', None)
+    if query is not None:
+        data = str(query.data or '')
+        if (data in {'buy', 'back_to_menu', 'buyer_how', 'buyer_history', 'resend_menu'}
+                or data.startswith(('buy|', 'pilih_', 'resend_menu|'))):
+            return ('menu', getattr(getattr(query, 'message', None), 'message_id', None))
+    message = getattr(update, 'message', None)
+    if message is not None and re.fullmatch(r'/start(?:@\w+)?(?:\s.*)?', message.text or ''):
+        return ('start',)
+    return None
+
+
 if BaseUpdateProcessor is not None:
     class _PerChatLockEntry:
-        __slots__ = ("lock", "users")
+        __slots__ = ("lock", "users", "navigation")
         def __init__(self):
             self.lock = asyncio.Lock()
             self.users = 0
+            self.navigation = {}
 
     class PerChatUpdateProcessor(BaseUpdateProcessor):
-        """Paralel antar-chat, serial di chat yang sama tanpa menyimpan lock selamanya."""
-
+        """Slot eksekusi diambil setelah antrean chat; chat sibuk tidak memonopoli slot."""
         def __init__(self, max_concurrent_updates: int):
-            super().__init__(max_concurrent_updates)
+            # Base semaphore tidak dipakai untuk membatasi task yang hanya menunggu chat.
+            # Batas kerja aktif yang sebenarnya dijaga _execution_slots di bawah.
+            super().__init__(2 ** 31 - 1)
+            self._execution_slots = asyncio.Semaphore(max_concurrent_updates)
             self._chat_locks = {}
             self._locks_guard = None
 
@@ -614,8 +791,6 @@ if BaseUpdateProcessor is not None:
                 return entry
 
         async def _release_entry(self, key, entry):
-            if self._locks_guard is None:
-                return
             async with self._locks_guard:
                 entry.users = max(0, entry.users - 1)
                 if entry.users == 0 and self._chat_locks.get(key) is entry:
@@ -624,25 +799,42 @@ if BaseUpdateProcessor is not None:
         async def do_process_update(self, update, coroutine):
             chat = getattr(update, "effective_chat", None)
             user = getattr(update, "effective_user", None)
-            key = (
-                ("chat", chat.id) if chat is not None
-                else ("user", user.id) if user is not None
-                else ("update", getattr(update, "update_id", id(update)))
-            )
+            key = (("chat", chat.id) if chat is not None else ("user", user.id) if user is not None
+                   else ("update", getattr(update, "update_id", id(update))))
             entry = await self._get_entry(key)
+            nav_key = _navigation_key(update)
+            token = object()
+            if nav_key is not None:
+                entry.navigation[nav_key] = token
             started = _time.monotonic()
+            executed = False
             try:
+                query = getattr(update, 'callback_query', None)
+                if nav_key is not None and query is not None:
+                    try:
+                        await asyncio.wait_for(_fast_callback_ack(query), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        pass
                 async with entry.lock:
-                    await coroutine
+                    if nav_key is not None and entry.navigation.get(nav_key) is not token:
+                        return
+                    async with self._execution_slots:
+                        if nav_key is not None and entry.navigation.get(nav_key) is not token:
+                            return
+                        waited = _time.monotonic() - started
+                        _record_latency("update-queue-wait", waited)
+                        executed = True
+                        await coroutine
             finally:
+                if not executed and hasattr(coroutine, 'close'):
+                    coroutine.close()
+                if nav_key is not None and entry.navigation.get(nav_key) is token:
+                    entry.navigation.pop(nav_key, None)
                 elapsed = _time.monotonic() - started
                 _record_latency("telegram-update", elapsed)
                 await self._release_entry(key, entry)
                 if elapsed >= SLOW_UPDATE_THRESHOLD_SECONDS:
-                    logger.warning(
-                        f"[SLOW UPDATE] key={key} update_id={getattr(update, 'update_id', '-')} "
-                        f"durasi={elapsed:.2f}s"
-                    )
+                    logger.warning(f"[SLOW UPDATE] key={key} update_id={getattr(update, 'update_id', '-')} durasi={elapsed:.2f}s")
 else:
     PerChatUpdateProcessor = None
 
@@ -1145,6 +1337,8 @@ def generate_qr_image(qris_string):
 
 _pool: ThreadedConnectionPool = None
 _async_db_pool = None
+_async_db_failures = 0
+_async_db_backoff_until = 0.0
 
 
 async def init_async_db_pool():
@@ -1168,26 +1362,37 @@ async def init_async_db_pool():
         return False
 
 
-async def _asyncpg_fetchrow(query: str, *args):
-    if _async_db_pool is None:
+async def _asyncpg_read(method, query, args):
+    global _async_db_failures, _async_db_backoff_until
+    if _async_db_pool is None or _time.monotonic() < _async_db_backoff_until:
         return None, False
+    started = _time.monotonic()
     try:
-        row = await _async_db_pool.fetchrow(query, *args)
-        return (dict(row) if row else None), True
+        async with _async_db_pool.acquire(timeout=ASYNCPG_ACQUIRE_TIMEOUT_SECONDS) as conn:
+            _record_latency('db-acquire', _time.monotonic() - started)
+            query_started = _time.monotonic()
+            try:
+                result = await getattr(conn, method)(query, *args, timeout=ASYNCPG_READ_TIMEOUT_SECONDS)
+            finally:
+                _record_latency('db-query', _time.monotonic() - query_started)
+        _async_db_failures = 0
+        if method == 'fetch':
+            return [dict(row) for row in result], True
+        return (dict(result) if result else None), True
     except Exception as exc:
-        logger.debug(f"[DB ASYNC] fetchrow fallback ke psycopg2: {exc}")
+        _async_db_failures += 1
+        if _async_db_failures >= 2:
+            _async_db_backoff_until = _time.monotonic() + 10.0
+        logger.warning('[DB ASYNC] Read fallback (%s); failures=%s', type(exc).__name__, _async_db_failures)
         return None, False
+
+
+async def _asyncpg_fetchrow(query: str, *args):
+    return await _asyncpg_read('fetchrow', query, args)
 
 
 async def _asyncpg_fetch(query: str, *args):
-    if _async_db_pool is None:
-        return None, False
-    try:
-        rows = await _async_db_pool.fetch(query, *args)
-        return [dict(row) for row in rows], True
-    except Exception as exc:
-        logger.debug(f"[DB ASYNC] fetch fallback ke psycopg2: {exc}")
-        return None, False
+    return await _asyncpg_read('fetch', query, args)
 
 
 def init_pool():
@@ -1616,6 +1821,7 @@ _waiting_orders_cache_lock: asyncio.Lock = None
 _waiting_orders_cache_generation = 0
 _start_snapshot_cache: dict = {}
 _start_snapshot_cache_locks = None
+_start_snapshot_versions = [0] * 256
 START_SNAPSHOT_CACHE_TTL_SECONDS = _env_float("START_SNAPSHOT_CACHE_TTL_SECONDS", 2.0, 0.5, 10.0)
 
 def _get_active_cache_lock(user_id: int) -> asyncio.Lock:
@@ -1701,8 +1907,17 @@ async def get_active_order(user_id):
 def _get_start_snapshot_lock(user_id: int) -> asyncio.Lock:
     global _start_snapshot_cache_locks
     if _start_snapshot_cache_locks is None:
-        _start_snapshot_cache_locks = [asyncio.Lock() for _ in range(64)]
-    return _start_snapshot_cache_locks[int(user_id) % len(_start_snapshot_cache_locks)]
+        _start_snapshot_cache_locks = weakref.WeakValueDictionary()
+    uid = int(user_id)
+    lock = _start_snapshot_cache_locks.get(uid)
+    if lock is None:
+        lock = asyncio.Lock()
+        _start_snapshot_cache_locks[uid] = lock
+    return lock
+
+
+def _start_snapshot_version(user_id):
+    return _start_snapshot_versions[int(user_id) % len(_start_snapshot_versions)]
 
 
 def _start_snapshot_cache_get(user_id: int):
@@ -1730,9 +1945,13 @@ def _start_snapshot_cache_set(user_id: int, snapshot: dict):
 
 def _invalidate_start_snapshot_cache(user_id=None):
     if user_id is None:
+        for index in range(len(_start_snapshot_versions)):
+            _start_snapshot_versions[index] += 1
         _start_snapshot_cache.clear()
     else:
-        _start_snapshot_cache.pop(int(user_id), None)
+        uid = int(user_id)
+        _start_snapshot_versions[uid % len(_start_snapshot_versions)] += 1
+        _start_snapshot_cache.pop(uid, None)
 
 
 _START_SNAPSHOT_SQL = """
@@ -1840,14 +2059,17 @@ async def get_start_snapshot(user_id: int):
         if hit:
             _prime_start_related_caches(int(user_id), value)
             return value
-        row, used_async = await _asyncpg_fetchrow(_START_SNAPSHOT_SQL, int(user_id))
-        if used_async:
-            value = _decode_start_snapshot(row)
-        else:
-            value = await run_db(_get_start_snapshot_sync, int(user_id))
-        _prime_start_related_caches(int(user_id), value)
-        _start_snapshot_cache_set(user_id, value)
-        return copy.deepcopy(value)
+        while True:
+            version = _start_snapshot_version(user_id)
+            row, used_async = await _asyncpg_fetchrow(_START_SNAPSHOT_SQL, int(user_id))
+            if used_async:
+                value = _decode_start_snapshot(row)
+            else:
+                value = await run_db(_get_start_snapshot_sync, int(user_id))
+            if version == _start_snapshot_version(user_id):
+                _prime_start_related_caches(int(user_id), value)
+                _start_snapshot_cache_set(user_id, value)
+                return copy.deepcopy(value)
 
 @async_wrap_admin
 def get_all_pending():
@@ -2711,6 +2933,41 @@ async def get_setting(key, default=None):
                 _settings_cache_set(key, val)
                 return val if val is not None else default
 
+
+def _get_settings_sync(keys):
+    with db_session_safe() as conn:
+        with conn.cursor() as c:
+            c.execute('SELECT key, value FROM settings WHERE key = ANY(%s)', (list(keys),))
+            return [dict(row) for row in c.fetchall()]
+
+
+async def get_settings(defaults):
+    """Baca beberapa setting dalam satu query; cache dan lock sama dengan get_setting."""
+    missing = [key for key in defaults if not _settings_cache_get(key)[0]]
+    if missing:
+        async with AsyncExitStack() as stack:
+            for key in sorted(missing):
+                await stack.enter_async_context(_setting_lock(key))
+            missing = [key for key in missing if not _settings_cache_get(key)[0]]
+            if missing:
+                while True:
+                    versions = {key: _settings_cache_versions.get(key, 0) for key in missing}
+                    rows, used_async = await _asyncpg_fetch(
+                        'SELECT key, value FROM settings WHERE key = ANY($1::text[])', missing)
+                    if not used_async:
+                        rows = await run_db(_get_settings_sync, missing)
+                    if all(versions[key] == _settings_cache_versions.get(key, 0) for key in missing):
+                        values = {row['key']: row['value'] for row in rows}
+                        for key in missing:
+                            _settings_cache_set(key, _normalize_setting_value(key, values.get(key)))
+                        break
+    result = {}
+    for key, default in defaults.items():
+        hit, value = _settings_cache_get(key)
+        # Tanggal kedaluwarsa dapat lewat saat menunggu query lain.
+        result[key] = value if hit and value is not None else (default if hit else await get_setting(key, default))
+    return result
+
 def _set_setting_sync(key, value):
     with db_session_safe() as conn:
         with conn.cursor() as c:
@@ -3183,7 +3440,8 @@ async def kirim_notif(bot, text: str, reply_markup=None):
     target = int(channel_id) if channel_id else ADMIN_ID
     try:
         msg = await telegram_send_rate_retry(
-            lambda: bot.send_message(chat_id=target, text=text, parse_mode="HTML", reply_markup=reply_markup),
+            lambda: bot.send_message(chat_id=target, text=text, parse_mode="HTML", reply_markup=reply_markup,
+                                     **_telegram_background_options(bot)),
             label=f"notif admin {target}",
         )
         return msg.message_id
@@ -3192,7 +3450,8 @@ async def kirim_notif(bot, text: str, reply_markup=None):
         if target != ADMIN_ID:
             try:
                 msg = await telegram_send_rate_retry(
-                    lambda: bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="HTML", reply_markup=reply_markup),
+                    lambda: bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="HTML", reply_markup=reply_markup,
+                                             **_telegram_background_options(bot)),
                     label="notif admin fallback",
                 )
                 return msg.message_id
@@ -3234,21 +3493,49 @@ _MENU_PHOTO_BASE64 = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAUDBAQEAwUEBAQFBQUGBwwIBw
 _MENU_PHOTO_FILE_ID = None
 _MENU_PHOTO_SETTING = "main_menu_photo_" + hashlib.sha256(_MENU_PHOTO_BASE64.encode("ascii")).hexdigest()[:16]
 
+def _menu_setting_defaults():
+    return {
+        'link_testimoni': 'https://t.me/+7zsdSrwYIG8wOTg1',
+        'link_admin': ADMIN_URL,
+        'main_group_button_name': '👥 Grup Hyper Family',
+        'main_group_button_link': '',
+        'maintenance': 'off',
+        _MENU_PHOTO_SETTING: '',
+    }
+
 async def _render_buyer_menu(query, text, reply_markup):
     """Edit caption untuk menu bergambar; tetap dukung pesan teks lama."""
+    started = _time.monotonic()
     try:
+        message = query.message
+        current_html = getattr(message, 'caption_html', None) if getattr(message, 'photo', None) else getattr(message, 'text_html', None)
+        if current_html == text and getattr(message, 'reply_markup', None) == reply_markup:
+            return message
         if query.message and query.message.photo:
             return await query.edit_message_caption(caption=text, parse_mode="HTML", reply_markup=reply_markup)
         return await query.edit_message_text(text=text, parse_mode="HTML", reply_markup=reply_markup)
     except telegram.error.BadRequest as exc:
         if 'message is not modified' not in str(exc).lower():
             raise
+    finally:
+        _record_latency('buyer-menu-render', _time.monotonic() - started)
 
-async def _send_main_menu_photo(context, user_id, text, markup):
+async def _send_main_menu_photo(context, user_id, text, markup, *, reuse_recent=False, photo_id=None):
     global _MENU_PHOTO_FILE_ID
     async with _get_user_notice_lock(user_id):
+        previous_id = context.user_data.get('_home_photo_id')
+        if reuse_recent and previous_id and _time.monotonic() - context.user_data.get('_home_photo_at', 0) < 1.5:
+            try:
+                await context.bot.edit_message_caption(chat_id=user_id, message_id=previous_id,
+                                                      caption=text, parse_mode='HTML', reply_markup=markup)
+                return
+            except telegram.error.BadRequest as exc:
+                if 'message is not modified' in str(exc).lower():
+                    return
+                if 'message to edit not found' not in str(exc).lower():
+                    raise
         if not _MENU_PHOTO_FILE_ID:
-            _MENU_PHOTO_FILE_ID = await get_setting(_MENU_PHOTO_SETTING, '') or None
+            _MENU_PHOTO_FILE_ID = (photo_id if photo_id is not None else await get_setting(_MENU_PHOTO_SETTING, '')) or None
         previous_photo_id = _MENU_PHOTO_FILE_ID
         try:
             photo = _MENU_PHOTO_FILE_ID or BytesIO(base64.b64decode(_MENU_PHOTO_BASE64))
@@ -3265,16 +3552,18 @@ async def _send_main_menu_photo(context, user_id, text, markup):
             if _MENU_PHOTO_FILE_ID != previous_photo_id:
                 spawn_background(set_setting(_MENU_PHOTO_SETTING, _MENU_PHOTO_FILE_ID), name="save-menu-photo-id")
         simpan_msg_user(context, user_id, msg.message_id)
+        context.user_data['_home_photo_id'] = msg.message_id
+        context.user_data['_home_photo_at'] = _time.monotonic()
         await hapus_msg_user_lama(context, user_id, keep_last=1)
         return msg
 
-async def build_main_menu_parts(name=None):
-    link_testi, link_cs, group_button_name, group_button_link = await asyncio.gather(
-        get_setting('link_testimoni', 'https://t.me/+7zsdSrwYIG8wOTg1'),
-        get_setting('link_admin', ADMIN_URL),
-        get_setting('main_group_button_name', '👥 Grup Hyper Family'),
-        get_setting('main_group_button_link', ''),
-    )
+async def build_main_menu_parts(name=None, settings=None):
+    if settings is None:
+        settings = await get_settings(_menu_setting_defaults())
+    link_testi = settings['link_testimoni']
+    link_cs = settings['link_admin']
+    group_button_name = settings['main_group_button_name']
+    group_button_link = settings['main_group_button_link']
     greeting = f"👋 Halo, <b>{esc(name)}</b>!\n\n" if name else "👋 Halo!\n\n"
     text = (greeting + "🛍️ Selamat datang di <b>HYPER FAMILY STORE</b>!\n\n"
         "✨ <b>Kenapa pilih kami?</b>\n\n"
@@ -3377,7 +3666,7 @@ async def _safe_delete_chat_message(bot, chat_id, message_id, label="pesan"):
     if not chat_id or not message_id:
         return
     try:
-        await bot.delete_message(chat_id=chat_id, message_id=int(message_id))
+        await bot.delete_message(chat_id=chat_id, message_id=int(message_id), **_telegram_background_options(bot))
     except Exception as e:
         logger.debug(f"Gagal hapus {label}: {e}")
 
@@ -3709,16 +3998,9 @@ async def _event_loop_lag_monitor():
 
 
 async def _prewarm_hot_settings():
-    await asyncio.gather(
-        get_setting('link_testimoni', 'https://t.me/+7zsdSrwYIG8wOTg1'),
-        get_setting('link_admin', ADMIN_URL),
-        get_setting('main_group_button_name', '👥 Grup Hyper Family'),
-        get_setting('main_group_button_link', ''),
-        get_setting('notif_channel_id', ''),
-        get_setting('maintenance', 'off'),
-        get_setting('testimoni_channel_id', ''),
-        get_setting(_MENU_PHOTO_SETTING, ''),
-    )
+    defaults = _menu_setting_defaults()
+    defaults.update(notif_channel_id='', testimoni_channel_id='')
+    await get_settings(defaults)
 
 async def _post_init_warmup(application: Application):
     """Warmup non-kritis dipisahkan agar polling bisa menerima /start lebih cepat."""
@@ -3909,30 +4191,27 @@ async def _start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, tra
 
     # Admin/maintenance sudah memakai cache; tiga pemeriksaan buyer digabung
     # menjadi satu snapshot DB agar cache miss tidak membuat tiga round-trip.
-    is_admin_flag, maint, snapshot, menu_parts, _photo_id = await asyncio.gather(
-        is_admin(user_id, context),
-        is_maintenance(),
+    snapshot, settings = await asyncio.gather(
         get_start_snapshot(user_id),
-        build_main_menu_parts(update.effective_user.full_name),
-        get_setting(_MENU_PHOTO_SETTING, ''),
+        get_settings(_menu_setting_defaults()),
     )
+    maint = settings['maintenance'] == '1'
     banned = snapshot['banned']
     sisa = snapshot['cooldown_minutes']
     active = snapshot['active']
     if trace:
         trace.mark("buyer-checks")
 
-    if not is_admin_flag and maint and not active:
+    if maint and not active and not await is_admin(user_id, context):
         await _send_single_maintenance_notice(update, context, user_id)
         return
 
     # Setelah maintenance selesai, atau saat ada invoice lama yang harus
     # dilanjutkan, bersihkan notice maintenance yang tersimpan.
-    if is_admin_flag or not maint or active:
-        notice_id = context.user_data.pop('_maintenance_notice_msg_id', None)
-        if notice_id:
-            spawn_background(_safe_delete_chat_message(context.bot, user_id, notice_id, "pesan maintenance lama"),
-                             name=f"start-clean-notice-{user_id}")
+    notice_id = context.user_data.pop('_maintenance_notice_msg_id', None)
+    if notice_id:
+        spawn_background(_safe_delete_chat_message(context.bot, user_id, notice_id, "pesan maintenance lama"),
+                         name=f"start-clean-notice-{user_id}")
 
     if banned:
         await update.message.reply_text(
@@ -3992,10 +4271,11 @@ async def _start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, tra
             trace.mark("active-order-send")
         return
 
-    menu_text, menu_keyboard = menu_parts
+    menu_text, menu_keyboard = await build_main_menu_parts(update.effective_user.full_name, settings=settings)
     if trace:
         trace.mark("menu-built")
-    await _send_main_menu_photo(context, user_id, menu_text, InlineKeyboardMarkup(menu_keyboard))
+    await _send_main_menu_photo(context, user_id, menu_text, InlineKeyboardMarkup(menu_keyboard),
+                               reuse_recent=True, photo_id=settings[_MENU_PHOTO_SETTING])
     if trace:
         trace.mark("menu-send")
 
@@ -9576,7 +9856,10 @@ def main():
     )
     if hasattr(builder, 'post_stop'):
         builder = builder.post_stop(_stop_blast_before_shutdown)
-    if AIORateLimiter is not None:
+    if BuyerPriorityRateLimiter is not None:
+        builder = builder.rate_limiter(BuyerPriorityRateLimiter())
+        logger.info('[TELEGRAM] Limiter aktif: buyer priority, background dibatasi.')
+    elif AIORateLimiter is not None:
         try:
             builder = builder.rate_limiter(
                 AIORateLimiter(overall_max_rate=28, overall_time_period=1, max_retries=1)

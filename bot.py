@@ -1467,7 +1467,7 @@ def get_testimonial_by_order(order_id):
 # In-memory TTL cache: cache hit dibaca langsung dari event loop tanpa antre executor DB.
 _settings_cache: dict = {}
 _SETTINGS_TTL = 60
-_settings_cache_lock: asyncio.Lock = None
+_settings_cache_locks: dict = {}
 _products_cache: tuple = None
 _products_by_id_cache: tuple = None
 _PRODUCTS_TTL = 30
@@ -2681,14 +2681,21 @@ def _normalize_setting_value(key, value):
         return ADMIN_URL
     return value
 
+def _setting_lock(key):
+    """Single-flight per setting agar pembacaan key berbeda dapat paralel."""
+    key = str(key)
+    lock = _settings_cache_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _settings_cache_locks[key] = lock
+    return lock
+
 async def get_setting(key, default=None):
-    global _settings_cache_lock
+    key = str(key)
     hit, cached_val = _settings_cache_get(key)
     if hit:
         return cached_val if cached_val is not None else default
-    if _settings_cache_lock is None:
-        _settings_cache_lock = asyncio.Lock()
-    async with _settings_cache_lock:
+    async with _setting_lock(key):
         hit, cached_val = _settings_cache_get(key)
         if hit:
             return cached_val if cached_val is not None else default
@@ -2717,10 +2724,8 @@ def _set_setting_sync(key, value):
                 )
 
 async def set_setting(key, value):
-    global _settings_cache_lock
-    if _settings_cache_lock is None:
-        _settings_cache_lock = asyncio.Lock()
-    async with _settings_cache_lock:
+    key = str(key)
+    async with _setting_lock(key):
         await run_db_admin(_set_setting_sync, key, value)
         _settings_cache_del(key)
 
@@ -3279,7 +3284,7 @@ async def build_main_menu_parts(name=None):
         "🔄 Update konten sesuai paket\n\n"
         "📞 <b>Butuh bantuan?</b>\nTekan tombol Hubungi Admin di bawah.")
     keyboard = [
-        [styled_button("🛒 Daftar Paket", callback_data="buy", style="primary", icon_custom_emoji_id=os.environ.get("BTN_EMOJI_BUY_ID"))],
+        [styled_button("🛒 Daftar Paket", callback_data="buy", style="success", icon_custom_emoji_id=os.environ.get("BTN_EMOJI_BUY_ID"))],
         [styled_button("📖 Cara Order", callback_data="buyer_how"),
          styled_button("⭐ Testimoni", url=link_testi, icon_custom_emoji_id=os.environ.get("BTN_EMOJI_TESTIMONI_ID"))],
         [styled_button("📜 Riwayat", callback_data="buyer_history"),
@@ -3924,9 +3929,10 @@ async def _start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, tra
     # Setelah maintenance selesai, atau saat ada invoice lama yang harus
     # dilanjutkan, bersihkan notice maintenance yang tersimpan.
     if is_admin_flag or not maint or active:
-        await _clear_user_notice(
-            context, user_id, '_maintenance_notice_msg_id', "pesan maintenance lama"
-        )
+        notice_id = context.user_data.pop('_maintenance_notice_msg_id', None)
+        if notice_id:
+            spawn_background(_safe_delete_chat_message(context.bot, user_id, notice_id, "pesan maintenance lama"),
+                             name=f"start-clean-notice-{user_id}")
 
     if banned:
         await update.message.reply_text(
@@ -3990,6 +3996,8 @@ async def _start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, tra
     if trace:
         trace.mark("menu-built")
     await _send_main_menu_photo(context, user_id, menu_text, InlineKeyboardMarkup(menu_keyboard))
+    if trace:
+        trace.mark("menu-send")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4133,11 +4141,14 @@ async def pilih_paket(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(detail_desc) > 300:
         detail_desc = detail_desc[:297] + '...'
     text = (
-        f"{esc(paket.get('emoji', '📦'))} <b>DETAIL PAKET</b>\n\n"
-        f"📦 <b>{esc(str(paket.get('nama') or 'Produk')[:60])}</b>\n\n"
-        f"📝 <b>Keterangan</b>\n<blockquote>{esc(detail_desc)}</blockquote>\n"
+        f"📦 <b>DETAIL PAKET</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"<blockquote>"
+        f"{esc(paket.get('emoji') or '📦')} Paket: <b>{esc(str(paket.get('nama') or 'Produk')[:60])}</b>\n"
+        f"🎬 Isi: {esc(detail_desc)}\n"
         f"💰 Harga: <b>{format_harga(paket.get('harga', 0))}</b>\n"
-        f"♾️ Status: {status_text}\n\n"
+        f"♾️ Status: {status_text}"
+        f"</blockquote>\n"
     )
 
     if paket.get('aktif', True):

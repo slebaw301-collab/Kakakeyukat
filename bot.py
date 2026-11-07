@@ -281,7 +281,7 @@ TOKEN = os.environ.get("BOT_TOKEN")
 _ADMIN_ID_RAW = os.environ.get("ADMIN_ID", "")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 APP_ENV = os.environ.get("APP_ENV") or os.environ.get("ENV") or "development"
-BOT_RELEASE = "2026-11-07-catalog-history"
+BOT_RELEASE = "2026-11-08-testimonial-style"
 
 # AutoGoPay gateway: GoPay utama, ShopeePay merchant sebagai cadangan.
 AUTOGOPAY_API_KEY = (os.environ.get("AUTOGOPAY_API_KEY") or "").strip()
@@ -3765,23 +3765,29 @@ def _default_order_note(judul: str) -> str:
 def _format_order_notif(judul: str, user_name: str, user_id: int,
                          paket: dict, order_id: str,
                          amount: int = None, extra: str = None) -> str:
-    """Format notif admin compact, tetap rapi dan buyer clickable."""
+    """Kartu transaksi Hyper Family; status dan detail asli dipertahankan."""
     lines = [
+        "💠 <b>HYPER FAMILY STORE</b>",
+        "<i>Catatan transaksi · Hyper Family</i>",
+        "━━━━━━━━━━━━━━━━━━",
         judul,
-        "━━━━━━━━━━━━━━━━━━━━",
-        f"👤 Buyer   : {tg_user_link(user_id, user_name)} · <code>{esc(user_id)}</code>",
-        f"📦 Paket   : {esc(paket.get('emoji','📦'))} {esc(paket.get('nama','?'))}",
+        "",
+        f"{esc(paket.get('emoji','📦'))} <b>{esc(paket.get('nama','?'))}</b>",
+        f"👤 Buyer: {tg_user_link(user_id, user_name)}",
+        f"ID buyer: <code>{esc(user_id)}</code>",
     ]
     if amount is not None:
-        lines.append(f"💰 Total   : {format_harga(amount)}")
+        lines.append(f"💳 Total: <b>{format_harga(amount)}</b>")
     lines.extend([
-        f"🧾 Order   : <code>{esc(order_id)}</code>",
-        f"🕒 Waktu   : {_compact_waktu()}",
+        "",
+        "<b>REFERENSI PESANAN</b>",
+        f"🧾 <code>{esc(order_id)}</code>",
+        f"🕒 {_compact_waktu()} WIB",
     ])
 
     note = str(extra).strip() if extra else _default_order_note(judul)
     if note:
-        lines.extend(["", note])
+        lines.extend(["", "<b>CATATAN TRANSAKSI</b>", note])
     return "\n".join(lines)
 
 async def build_order_detail_text(order: dict, paket: dict) -> str:
@@ -6706,15 +6712,18 @@ async def admin_testi_approve(update: Update, context: ContextTypes.DEFAULT_TYPE
     bintang_kosong = '☆' * (5 - testi['rating'])
 
     channel_msg = (
-        f"⭐ <b>TESTIMONI PELANGGAN</b>\n"
-        f"========================\n\n"
-        f"📦 <b>Produk:</b> {esc(paket_emoji)} {esc(paket_nama)}\n"
-        f"👤 <b>Pembeli:</b> {esc(nama_sensor)}\n"
-        f"🌟 <b>Rating:</b> {bintang_penuh}{bintang_kosong}  <b>{testi['rating']}/5</b>\n\n"
-        f"💬 <i>'{esc(testi['review'])}'</i>\n\n"
-        f"========================\n"
-        f"✅ <b>Transaksi Terverifikasi</b>\n"
-        f"🛒 Order otomatis via @{context.bot.username}"
+        f"💠 <b>HYPER FAMILY STORE</b>\n"
+        f"<i>Cerita dari keluarga Hyper</i>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"⭐ <b>ULASAN BUYER</b>\n"
+        f"{bintang_penuh}{bintang_kosong} · <b>{testi['rating']}/5</b>\n\n"
+        f"{esc(paket_emoji)} <b>{esc(paket_nama)}</b>\n"
+        f"👤 {esc(nama_sensor)}\n\n"
+        f"<b>KATA BUYER</b>\n"
+        f"💬 <i>“{esc(testi['review'])}”</i>\n\n"
+        f"✅ <b>Transaksi terverifikasi</b>\n"
+        f"Terima kasih sudah menjadi bagian dari Hyper Family.\n"
+        f"🛍️ Order otomatis via @{context.bot.username}"
     )
 
     back_kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali ke Panel", callback_data="admpanel_back")]])

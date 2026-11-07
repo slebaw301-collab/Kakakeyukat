@@ -281,7 +281,7 @@ TOKEN = os.environ.get("BOT_TOKEN")
 _ADMIN_ID_RAW = os.environ.get("ADMIN_ID", "")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 APP_ENV = os.environ.get("APP_ENV") or os.environ.get("ENV") or "development"
-BOT_RELEASE = "2026-11-07-start-visible"
+BOT_RELEASE = "2026-11-07-catalog-history"
 
 # AutoGoPay gateway: GoPay utama, ShopeePay merchant sebagai cadangan.
 AUTOGOPAY_API_KEY = (os.environ.get("AUTOGOPAY_API_KEY") or "").strip()
@@ -4057,10 +4057,11 @@ async def _send_main_menu_photo(context, user_id, text, markup, *, reuse_recent=
         while len(_catalog_photo_messages)>4096:
             _catalog_photo_messages.popitem(last=False)
         logger.info('[CATALOG MEDIA] action=send source=%s identity=%s',source,_menu_photo_identity(msg))
-        simpan_msg_user(context, user_id, msg.message_id)
+        # Keep catalog photos in chat history. They must not enter the transient
+        # message cleanup list, which still removes old notices/invoices normally.
         context.user_data['_home_photo_id'] = msg.message_id
         context.user_data['_home_photo_at'] = _time.monotonic()
-        await hapus_msg_user_lama(context, user_id, keep_last=1)
+        await hapus_msg_user_lama(context, user_id, keep_last=0)
         if persist_id:
             try:
                 await set_setting(_MENU_PHOTO_SETTING,persist_id)

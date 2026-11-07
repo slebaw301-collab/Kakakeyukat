@@ -281,7 +281,7 @@ TOKEN = os.environ.get("BOT_TOKEN")
 _ADMIN_ID_RAW = os.environ.get("ADMIN_ID", "")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 APP_ENV = os.environ.get("APP_ENV") or os.environ.get("ENV") or "development"
-BOT_RELEASE = "2026-11-07-media-tail"
+BOT_RELEASE = "2026-11-07-start-visible"
 
 # AutoGoPay gateway: GoPay utama, ShopeePay merchant sebagai cadangan.
 AUTOGOPAY_API_KEY = (os.environ.get("AUTOGOPAY_API_KEY") or "").strip()
@@ -4783,8 +4783,10 @@ async def _start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, tra
     menu_text, menu_keyboard = await build_main_menu_parts(update.effective_user.full_name, settings=settings)
     if trace:
         trace.mark("menu-built")
+    # An explicit /start must place a visible reply after the user's command.
+    # Reuse Telegram's file_id, not an older message that may be off-screen.
     await _send_main_menu_photo(context, user_id, menu_text, InlineKeyboardMarkup(menu_keyboard),
-                               reuse_recent=True, photo_id=settings[_MENU_PHOTO_SETTING])
+                               photo_id=settings[_MENU_PHOTO_SETTING])
     if trace:
         trace.mark("menu-send")
 

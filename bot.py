@@ -19,7 +19,7 @@ import copy
 import uuid
 import weakref
 from concurrent.futures import ThreadPoolExecutor
-from collections import deque
+from collections import deque, OrderedDict
 from aiohttp import web as aio_web
 import aiohttp
 import qrcode
@@ -278,6 +278,7 @@ TOKEN = os.environ.get("BOT_TOKEN")
 _ADMIN_ID_RAW = os.environ.get("ADMIN_ID", "")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 APP_ENV = os.environ.get("APP_ENV") or os.environ.get("ENV") or "development"
+BOT_RELEASE = "2026-11-07-perf-v3"
 
 # AutoGoPay gateway: GoPay utama, ShopeePay merchant sebagai cadangan.
 AUTOGOPAY_API_KEY = (os.environ.get("AUTOGOPAY_API_KEY") or "").strip()
@@ -400,11 +401,16 @@ def release_invoice_creation(user_id: int):
 
 
 _callback_acks = {}
+_callback_ack_tasks = {}
 
 async def _fast_callback_ack(query, text: str = None):
     """Hentikan spinner callback Telegram sedini mungkin tanpa menggagalkan handler jika jaringan sedang fluktuatif."""
     try:
         query_id = getattr(query, 'id', None)
+        pending = _callback_ack_tasks.get(query_id)
+        # Menu ACK is already in flight; rendering must not wait for its RTT.
+        if text is None and pending is not None and pending is not asyncio.current_task():
+            return
         now_mono = _time.monotonic()
         if text is None and query_id and _callback_acks.get(query_id, 0) > now_mono:
             return
@@ -417,6 +423,21 @@ async def _fast_callback_ack(query, text: str = None):
                         _callback_acks.pop(old_id, None)
     except Exception as exc:
         logger.debug(f"[CALLBACK] ACK gagal/terlambat: {exc}")
+
+
+def _schedule_navigation_ack(query):
+    query_id = getattr(query, 'id', None)
+    if not query_id or query_id in _callback_ack_tasks:
+        return
+    if _callback_acks.get(query_id, 0) > _time.monotonic():
+        return
+    task = spawn_background(_fast_callback_ack(query), name="menu-callback-ack")
+    _callback_ack_tasks[query_id] = task
+
+    def done(completed):
+        if _callback_ack_tasks.get(query_id) is completed:
+            _callback_ack_tasks.pop(query_id, None)
+    task.add_done_callback(done)
 
 
 async def _callback_feedback(query, context, text: str):
@@ -454,10 +475,36 @@ _cpu_executor = ThreadPoolExecutor(
 )
 
 
+_executor_admission = {}
+_executor_limits = {_db_executor: DB_THREAD_WORKERS,
+                    _db_admin_executor: DB_ADMIN_THREAD_WORKERS,
+                    _cpu_executor: CPU_THREAD_WORKERS}
+
 async def _run_executor(executor, func, *args, **kwargs):
     loop = asyncio.get_running_loop()
-    call = functools.partial(func, *args, **kwargs)
-    return await loop.run_in_executor(executor, call)
+    slots = _executor_admission.get(executor)
+    if slots is None:
+        slots = asyncio.BoundedSemaphore(_executor_limits[executor])
+        _executor_admission[executor] = slots
+    label = ('db-admin' if executor is _db_admin_executor else
+             'db-buyer' if executor is _db_executor else 'cpu')
+    queued_at = _time.monotonic()
+    await slots.acquire()
+    _record_latency(label + '-queue', _time.monotonic() - queued_at)
+    try:
+        future = loop.run_in_executor(executor, functools.partial(func, *args, **kwargs))
+    except BaseException:
+        slots.release()
+        raise
+    started = _time.monotonic()
+    def completed(done):
+        slots.release()
+        _record_latency(label + '-work', _time.monotonic() - started)
+        # Retrieve exceptions even when the caller stopped awaiting a running thread.
+        if not done.cancelled():
+            done.exception()
+    future.add_done_callback(completed)
+    return await asyncio.shield(future)
 
 
 async def run_db(func, *args, **kwargs):
@@ -498,8 +545,9 @@ async def _latency_reporter_loop():
             if not samples:
                 continue
             values = list(samples)
+            samples.clear()
             logger.info(
-                f"[LATENCY] {label} n={len(values)} "
+                f"[LATENCY] {label} n={len(values)} mean={sum(values)/len(values):.3f}s "
                 f"p50={_percentile(values, 50):.3f}s "
                 f"p95={_percentile(values, 95):.3f}s "
                 f"p99={_percentile(values, 99):.3f}s"
@@ -770,6 +818,9 @@ if BaseUpdateProcessor is not None:
             # Batas kerja aktif yang sebenarnya dijaga _execution_slots di bawah.
             super().__init__(2 ** 31 - 1)
             self._execution_slots = asyncio.Semaphore(max_concurrent_updates)
+            # Reserve a quarter of active slots for menus during slow provider/admin work.
+            reserved = max(1, max_concurrent_updates // 4)
+            self._non_navigation_slots = asyncio.Semaphore(max(1, max_concurrent_updates - reserved))
             self._chat_locks = {}
             self._locks_guard = None
 
@@ -803,6 +854,9 @@ if BaseUpdateProcessor is not None:
                    else ("update", getattr(update, "update_id", id(update))))
             entry = await self._get_entry(key)
             nav_key = _navigation_key(update)
+            query = getattr(update, 'callback_query', None)
+            if query is not None and nav_key is None and not str(query.data or '').startswith('confirm_buy_'):
+                _forget_menu_render(query)
             token = object()
             if nav_key is not None:
                 entry.navigation[nav_key] = token
@@ -811,14 +865,14 @@ if BaseUpdateProcessor is not None:
             try:
                 query = getattr(update, 'callback_query', None)
                 if nav_key is not None and query is not None:
-                    try:
-                        await asyncio.wait_for(_fast_callback_ack(query), timeout=1.0)
-                    except asyncio.TimeoutError:
-                        pass
+                    _schedule_navigation_ack(query)
                 async with entry.lock:
                     if nav_key is not None and entry.navigation.get(nav_key) is not token:
                         return
-                    async with self._execution_slots:
+                    async with AsyncExitStack() as admission:
+                        if nav_key is None:
+                            await admission.enter_async_context(self._non_navigation_slots)
+                        await admission.enter_async_context(self._execution_slots)
                         if nav_key is not None and entry.navigation.get(nav_key) is not token:
                             return
                         waited = _time.monotonic() - started
@@ -831,7 +885,7 @@ if BaseUpdateProcessor is not None:
                 if nav_key is not None and entry.navigation.get(nav_key) is token:
                     entry.navigation.pop(nav_key, None)
                 elapsed = _time.monotonic() - started
-                _record_latency("telegram-update", elapsed)
+                _record_latency("telegram-update" if executed else "navigation-coalesced", elapsed)
                 await self._release_entry(key, entry)
                 if elapsed >= SLOW_UPDATE_THRESHOLD_SECONDS:
                     logger.warning(f"[SLOW UPDATE] key={key} update_id={getattr(update, 'update_id', '-')} durasi={elapsed:.2f}s")
@@ -1217,7 +1271,20 @@ async def _autogopay_get_status(transaction_id: str, fallback_amount: int = 0):
                     logger.warning(f"[AUTOGOPAY] Gagal cek status HTTP {response.status}: {result}")
                     return None
                 data = _extract_autogopay_data(result)
+                response_id = data.get("transaction_id") or data.get("id")
+                if response_id is not None and str(response_id) != str(transaction_id):
+                    logger.error("[AUTOGOPAY] ID status tidak cocok; respons ditolak.")
+                    return None
                 normalized = _normalize_autogopay_transaction(data, fallback_amount)
+                # The status docs do not require an amount field. Preserve the
+                # authenticated transaction lookup contract when it is absent;
+                # an explicit amount must still match the persisted invoice.
+                if normalized["status"] == "completed" and (
+                    _safe_int(fallback_amount) <= 0 or
+                    ("amount" in data and _safe_int(data.get("amount"), -1) != _safe_int(fallback_amount))
+                ):
+                    logger.error("[AUTOGOPAY] Nominal status tidak cocok; respons ditolak.")
+                    return None
                 normalized["provider_transaction_id"] = normalized.get("provider_transaction_id") or transaction_id
                 _autogopay_record_success()
                 return normalized
@@ -2541,30 +2608,35 @@ def _update_order_status_sync(order_id, status):
     with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute(
-                "UPDATE orders SET status=%s WHERE order_id=%s RETURNING user_id",
+                "UPDATE orders SET status=%s WHERE order_id=%s AND status IN ('waiting','pending') RETURNING user_id",
                 (status, order_id),
             )
             row = c.fetchone()
             return row.get('user_id') if row else None
 
 async def update_order_status(order_id, status):
+    if status not in {'cancelled', 'expired', 'rejected'}:
+        raise ValueError("Transisi status harus memakai helper yang sesuai")
     user_id = await run_db(_update_order_status_sync, order_id, status)
-    _invalidate_order_caches(user_id)
+    if user_id is not None:
+        _invalidate_order_caches(user_id)
     return user_id
 
-def _mark_order_completed_sync(order_id):
+def _mark_order_completed_sync(order_id, expected_status="waiting"):
     """Atomic: completed hanya jika masih waiting; None berarti tidak ada row yang berubah."""
     with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute(
-                "UPDATE orders SET status='completed' WHERE order_id=%s AND status='waiting' RETURNING id, user_id",
-                (order_id,)
+                "UPDATE orders SET status='completed' WHERE order_id=%s AND status=%s RETURNING id, user_id",
+                (order_id, expected_status)
             )
             row = c.fetchone()
             return dict(row) if row else None
 
-async def mark_order_completed(order_id) -> bool:
-    updated = await run_db(_mark_order_completed_sync, order_id)
+async def mark_order_completed(order_id, *, expected_status="waiting") -> bool:
+    if expected_status not in {'waiting', 'pending'}:
+        raise ValueError("Status awal pembayaran tidak valid")
+    updated = await run_db(_mark_order_completed_sync, order_id, expected_status)
     if not updated:
         return False
     _invalidate_order_caches(updated.get('user_id'))
@@ -2608,8 +2680,8 @@ def update_order_provider_status(order_id: str, provider_status: str):
     with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute(
-                "UPDATE orders SET provider_status=%s WHERE order_id=%s",
-                (str(provider_status).lower(), order_id)
+                "UPDATE orders SET provider_status=%s WHERE order_id=%s AND provider_status IS DISTINCT FROM %s",
+                (str(provider_status).lower(), order_id, str(provider_status).lower())
             )
 
 @async_wrap
@@ -2726,21 +2798,13 @@ def get_completed_no_link_orders(user_id: int) -> list:
 
 @async_wrap
 def atomic_claim_for_delivery(order_id: str) -> bool:
-    """Secara atomik mengklaim order untuk pengiriman guna mencegah race condition."""
     with db_session_safe() as conn:
         with conn.cursor() as c:
-            c.execute(
-                """UPDATE orders
-                   SET sent_link='pending', delivery_status='pending', delivery_error=NULL
-                   WHERE order_id=%s
-                   AND (
-                        delivery_status IS NULL
-                        OR delivery_status IN ('not_sent', 'failed', 'held')
-                        OR sent_link IS NULL
-                        OR sent_link=''
-                   )""",
-                (order_id,)
-            )
+            c.execute("""UPDATE orders
+                SET sent_link='pending', delivery_status='pending', delivery_error=NULL
+                WHERE order_id=%s AND status='completed'
+                  AND COALESCE(delivery_status, 'not_sent') IN ('not_sent', 'failed', 'held')
+                  AND COALESCE(sent_link, '')=''""", (order_id,))
             return c.rowcount > 0
 
 def _save_order_sync(user_id, user_name, paket_id, order_id, harga_dibayar=0, order_changes=0,
@@ -3233,6 +3297,22 @@ def invalidate_admin_cache(context, user_id: int = None):
 def is_super_admin(user_id: int) -> bool:
     return user_id == ADMIN_ID
 
+def admin_callback(handler):
+    @functools.wraps(handler)
+    async def guarded(update, context, *args, **kwargs):
+        user = getattr(update, 'effective_user', None)
+        if user is None or not await is_admin(user.id, context):
+            query = getattr(update, 'callback_query', None)
+            if query is not None:
+                try:
+                    await query.answer("⛔ Akses ditolak.", show_alert=True)
+                except telegram.error.TelegramError:
+                    pass
+            return
+        return await handler(update, context, *args, **kwargs)
+    return guarded
+
+
 # =================== HELPERS ===================
 
 def format_harga(harga):
@@ -3503,17 +3583,47 @@ def _menu_setting_defaults():
         _MENU_PHOTO_SETTING: '',
     }
 
+_menu_render_cache = OrderedDict()
+
+def _menu_render_key(query):
+    message = getattr(query, 'message', None)
+    mid = getattr(message, 'message_id', None)
+    chat_id = getattr(message, 'chat_id', None) or getattr(getattr(query, 'from_user', None), 'id', None)
+    return (chat_id, mid) if chat_id is not None and mid is not None else None
+
+def _forget_menu_render(query):
+    _menu_render_cache.pop(_menu_render_key(query), None)
+
 async def _render_buyer_menu(query, text, reply_markup):
     """Edit caption untuk menu bergambar; tetap dukung pesan teks lama."""
     started = _time.monotonic()
+    key = _menu_render_key(query)
+    cached = _menu_render_cache.get(key)
+    # Keep only a digest, not the full keyboard graph, in the bounded render cache.
+    # Include API extension fields (style/custom emoji), which PTB equality ignores.
+    markup_data = reply_markup.to_dict() if reply_markup is not None else None
+    signature = hashlib.sha256(json.dumps(
+        (text, markup_data), sort_keys=True, ensure_ascii=False, separators=(',', ':')
+    ).encode('utf-8')).digest()
+    cache_fresh = cached is not None and started < cached[1]
+    if cache_fresh and cached[0] == signature:
+        _record_latency('buyer-menu-deduplicated', 0)
+        return query.message
     try:
         message = query.message
         current_html = getattr(message, 'caption_html', None) if getattr(message, 'photo', None) else getattr(message, 'text_html', None)
-        if current_html == text and getattr(message, 'reply_markup', None) == reply_markup:
+        if not cache_fresh and current_html == text and getattr(message, 'reply_markup', None) == reply_markup:
             return message
         if query.message and query.message.photo:
-            return await query.edit_message_caption(caption=text, parse_mode="HTML", reply_markup=reply_markup)
-        return await query.edit_message_text(text=text, parse_mode="HTML", reply_markup=reply_markup)
+            result = await query.edit_message_caption(caption=text, parse_mode="HTML", reply_markup=reply_markup)
+        else:
+            result = await query.edit_message_text(text=text, parse_mode="HTML", reply_markup=reply_markup)
+        if key is not None:
+            _menu_render_cache[key] = (signature, _time.monotonic() + 2.5)
+            _menu_render_cache.move_to_end(key)
+            while len(_menu_render_cache) > 4096:
+                _menu_render_cache.popitem(last=False)
+        return result
     except telegram.error.BadRequest as exc:
         if 'message is not modified' not in str(exc).lower():
             raise
@@ -3886,8 +3996,6 @@ async def autogopay_webhook_handler(request: aio_web.Request) -> aio_web.Respons
         )
         return aio_web.Response(status=404, text="order not found")
 
-    await update_order_provider_status(order["order_id"], provider_status)
-
     # Event non-settlement cukup dicatat. Polling tetap menjadi fallback status.
     is_paid = (
         provider_status in {"settlement", "success", "paid"}
@@ -3900,6 +4008,7 @@ async def autogopay_webhook_handler(request: aio_web.Request) -> aio_web.Respons
         if "order_status" in transaction and _safe_int(transaction.get("order_status"), 0) != 1:
             is_paid = False
     if not is_paid:
+        await update_order_provider_status(order["order_id"], provider_status)
         return aio_web.json_response({"success": True, "ignored": True})
 
     expected_amount = _safe_int(order.get("harga_dibayar"), 0)
@@ -3909,6 +4018,8 @@ async def autogopay_webhook_handler(request: aio_web.Request) -> aio_web.Respons
             f"expected={expected_amount}, received={paid_amount}"
         )
         return aio_web.Response(status=400, text="amount mismatch")
+
+    await update_order_provider_status(order["order_id"], provider_status)
 
     if order.get("status") != "waiting":
         if order.get("status") != "completed":
@@ -3947,14 +4058,15 @@ def _db_ping_sync():
 async def _readiness_handler(request):
     try:
         if _async_db_pool is not None:
-            value = await _async_db_pool.fetchval("SELECT 1")
+            value = await asyncio.wait_for(_async_db_pool.fetchval("SELECT 1"), timeout=2.0)
             db_ok = value == 1
         else:
-            db_ok = await run_db(_db_ping_sync)
+            db_ok = await asyncio.wait_for(run_db(_db_ping_sync), timeout=2.0)
     except Exception:
         db_ok = False
     payload = {
         "ok": bool(db_ok and _current_bot is not None),
+        "release": BOT_RELEASE,
         "db": db_ok,
         "bot_ready": _current_bot is not None,
         "async_db": _async_db_pool is not None,
@@ -4075,6 +4187,7 @@ async def post_init(application: Application):
     global _current_bot
     _current_bot = application.bot
 
+    logger.info("[RELEASE] %s", BOT_RELEASE)
     logger.info(
         f"[PERFORMANCE] Executor aktif: buyer_db={DB_THREAD_WORKERS}, "
         f"admin_db={DB_ADMIN_THREAD_WORKERS}, cpu={CPU_THREAD_WORKERS}"
@@ -4113,6 +4226,7 @@ async def post_shutdown(application: Application):
     if payment_tasks:
         await asyncio.gather(*payment_tasks, return_exceptions=True)
     _payment_tasks.clear()
+    _payment_task_orders.clear()
 
     blast_map = globals().get('_blast_tasks', {})
     blast_tasks = [task for task in list(blast_map.values()) if task and not task.done()]
@@ -4157,34 +4271,17 @@ async def post_shutdown(application: Application):
 # =================== USER HANDLERS ===================
 
 async def _refresh_active_order_status(bot, active: dict, paket: dict, user_name: str):
-    """Refresh status provider di background tanpa menahan respons /start atau tombol beli."""
     try:
         amount = active.get("harga_dibayar") or paket.get("harga", 0)
         trans = await get_transaction_detail(active["order_id"], amount)
         if not trans or trans.get("status") != "completed":
             return
-
-        success = await mark_order_completed(active["order_id"])
-        if not success:
-            return
-
-        await _stop_payment_task(active["user_id"])
-        await _process_completed_order_delivery(
-            bot,
-            order_id=active["order_id"],
-            paket_id=active["paket_id"],
-            user_id=active["user_id"],
-            user_name=user_name,
-            paid_amount=trans.get("amount", amount),
-            source_title="✅ <b>ORDER BERHASIL</b>",
-            paket=paket,
-        )
+        await _handle_payment_success(bot, active["order_id"], active["paket_id"],
+                                      active["user_id"], user_name, amount, trans, paket=paket)
     except asyncio.CancelledError:
         raise
-    except Exception as e:
-        logger.warning(
-            f"[PAYMENT REFRESH] Gagal refresh order {active.get('order_id')}: {e}"
-        )
+    except Exception as exc:
+        logger.warning("[PAYMENT REFRESH] Gagal refresh order %s: %s", active.get('order_id'), type(exc).__name__)
 
 async def _start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, trace=None):
     user_id = update.effective_user.id
@@ -4466,11 +4563,10 @@ async def confirm_buy_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     # Jangan biarkan spinner Telegram menunggu query DB/cooldown.
-    await _fast_callback_ack(query, "⏳ Memproses...")
     trace = PerfTrace("confirm-buy", user_id=user_id, paket_id=paket_id)
-    trace.mark("callback-answer")
-
     try:
+        await _fast_callback_ack(query, "⏳ Memproses...")
+        trace.mark("callback-answer")
         # Pengecekan yang tidak saling bergantung dijalankan bersamaan.
         banned, paket, active, sisa = await asyncio.gather(
             is_banned(user_id),
@@ -4546,11 +4642,10 @@ async def prereq_buy_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await _fast_callback_ack(query, "⏳ Invoice sedang dibuat. Tunggu sebentar.")
         return
 
-    await _fast_callback_ack(query, "⏳ Memproses...")
     trace = PerfTrace("prereq-buy", user_id=user_id, paket_id=prereq_pid)
-    trace.mark("callback-answer")
-
     try:
+        await _fast_callback_ack(query, "⏳ Memproses...")
+        trace.mark("callback-answer")
         banned, paket, active, sisa = await asyncio.gather(
             is_banned(user_id),
             get_product(prereq_pid),
@@ -4567,6 +4662,10 @@ async def prereq_buy_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await _callback_feedback(query, context, "❌ Produk tidak ditemukan.")
             return
 
+        if not paket.get('aktif', True):
+            await _callback_feedback(query, context, "❌ Paket ini sedang tidak tersedia.")
+            return
+
         if active:
             await _callback_feedback(query, context, "⏳ Kamu sudah punya invoice aktif! Batalkan dulu.")
             return
@@ -4580,6 +4679,9 @@ async def prereq_buy_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         if parent_order_id:
             parent_order = await get_order_by_id(parent_order_id)
+            if parent_order and int(parent_order['user_id']) != user_id:
+                await _callback_feedback(query, context, "❌ Pesanan bukan milik kamu.")
+                return
             if parent_order:
                 context.user_data['prereq_ctx'] = {
                     'parent_order_id': parent_order_id,
@@ -4624,6 +4726,9 @@ async def _buat_order_baru(update, context, query, user_id, user_name, paket, or
     if await _reject_new_invoice_during_maintenance(query, context, user_id):
         return False
 
+    # A new invoice may edit this message outside the menu renderer.
+    if query is not None:
+        _forget_menu_render(query)
     # Gunakan pesan callback sebagai indikator loading agar tidak menambah request Telegram.
     loading_msg = None
     if query and not (query.message and query.message.photo):
@@ -4735,75 +4840,75 @@ async def _buat_order_baru(update, context, query, user_id, user_name, paket, or
         )
         return
 
-    qr_buffer = await run_cpu(generate_qr_image, qris_string)
-    if perf_trace:
-        perf_trace.mark("generate-qr")
+    try:
+        qr_buffer = await run_cpu(generate_qr_image, qris_string)
+        if perf_trace:
+            perf_trace.mark("generate-qr")
 
-    sisa_ganti = 1 - order_changes
+        sisa_ganti = 1 - order_changes
 
-    prereq_ctx = context.user_data.get('prereq_ctx') if context else None
-    prereq_note = ""
-    if prereq_ctx:
-        parent_pid = prereq_ctx.get('parent_paket_id')
-        parent_paket = await get_product(parent_pid) if parent_pid else None
-        if parent_paket:
-            prereq_note = (
-                f"\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"📌 <b>Tujuan:</b> Syarat untuk {esc(parent_paket['emoji'])} {esc(parent_paket['nama'])}\n"
-                f"Setelah lunas, link akan <b>otomatis dikirim</b>. 🚀"
-            )
+        prereq_ctx = context.user_data.get('prereq_ctx') if context else None
+        prereq_note = ""
+        if prereq_ctx:
+            parent_pid = prereq_ctx.get('parent_paket_id')
+            parent_paket = await get_product(parent_pid) if parent_pid else None
+            if parent_paket:
+                prereq_note = (
+                    f"\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📌 <b>Tujuan:</b> Syarat untuk {esc(parent_paket['emoji'])} {esc(parent_paket['nama'])}\n"
+                    f"Setelah lunas, link akan <b>otomatis dikirim</b>. 🚀"
+                )
 
-    caption = (
-        f"<b>{esc(paket['emoji'])} {esc(paket['nama']).upper()}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📋 <b>Detail Pembayaran</b>\n"
-        f"- Harga: {format_harga(amount)}\n"
-        f"- Fee: {format_harga(fee)}\n"
-        f"- <b>Total: {format_harga(total_payment)}</b>\n\n"
-        f"📝 Order ID: <code>{esc(order_id)}</code>\n"
-        f"⏰ Berlaku hingga: {expire} WIB\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📱 <b>Scan QRIS di atas untuk membayar</b>\n\n"
-        f"✅ Nominal sudah termasuk fee\n"
-        f"✅ Pembayaran otomatis terverifikasi\n"
-        f"✅ Link produk dikirim otomatis setelah bayar"
-        f"{prereq_note}\n\n"
-        f"⏳ Menunggu pembayaran..."
-    )
+        caption = (
+            f"<b>{esc(paket['emoji'])} {esc(paket['nama']).upper()}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📋 <b>Detail Pembayaran</b>\n"
+            f"- Harga: {format_harga(amount)}\n"
+            f"- Fee: {format_harga(fee)}\n"
+            f"- <b>Total: {format_harga(total_payment)}</b>\n\n"
+            f"📝 Order ID: <code>{esc(order_id)}</code>\n"
+            f"⏰ Berlaku hingga: {expire} WIB\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📱 <b>Scan QRIS di atas untuk membayar</b>\n\n"
+            f"✅ Nominal sudah termasuk fee\n"
+            f"✅ Pembayaran otomatis terverifikasi\n"
+            f"✅ Link produk dikirim otomatis setelah bayar"
+            f"{prereq_note}\n\n"
+            f"⏳ Menunggu pembayaran..."
+        )
 
-    kb = []
-    checkout_url = str(trans_data.get('checkout_url') or '').strip()
-    parsed_checkout = urllib.parse.urlparse(checkout_url) if checkout_url else None
-    if parsed_checkout and parsed_checkout.scheme == 'https' and parsed_checkout.netloc:
-        kb.append([InlineKeyboardButton("🌐 Buka Halaman Pembayaran", url=checkout_url)])
-    if sisa_ganti > 0:
-        kb.append([InlineKeyboardButton(f"🔄 Ganti Paket (sisa {sisa_ganti}x)", callback_data="ganti_paket_list")])
-    kb.append([styled_button("❌ Batalkan Pesanan", style="danger", callback_data="cancel_order")])
+        kb = []
+        checkout_url = str(trans_data.get('checkout_url') or '').strip()
+        parsed_checkout = urllib.parse.urlparse(checkout_url) if checkout_url else None
+        if parsed_checkout and parsed_checkout.scheme == 'https' and parsed_checkout.netloc:
+            kb.append([InlineKeyboardButton("🌐 Buka Halaman Pembayaran", url=checkout_url)])
+        if sisa_ganti > 0:
+            kb.append([InlineKeyboardButton(f"🔄 Ganti Paket (sisa {sisa_ganti}x)", callback_data="ganti_paket_list")])
+        kb.append([styled_button("❌ Batalkan Pesanan", style="danger", callback_data="cancel_order")])
 
-    msg = await context.bot.send_photo(
-        chat_id=update.effective_chat.id,
-        photo=qr_buffer,
-        caption=caption,
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(kb)
-    )
-    if perf_trace:
-        perf_trace.mark("telegram-send-qr")
+        msg = await context.bot.send_photo(
+            chat_id=update.effective_chat.id,
+            photo=qr_buffer,
+            caption=caption,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
+        if perf_trace:
+            perf_trace.mark("telegram-send-qr")
 
-    await set_buyer_msg_id(order_id, msg.message_id)
-    simpan_msg_user(context, user_id, msg.message_id)
-    spawn_background(
-        _safe_delete_chat_message(
-            context.bot, update.effective_chat.id, loading_msg.message_id, "pesan loading invoice"
-        ),
-        name=f"delete-loading-{order_id}"
-    )
+        await set_buyer_msg_id(order_id, msg.message_id)
+        simpan_msg_user(context, user_id, msg.message_id)
+        spawn_background(
+            _safe_delete_chat_message(
+                context.bot, update.effective_chat.id, loading_msg.message_id, "pesan loading invoice"
+            ),
+            name=f"delete-loading-{order_id}"
+        )
 
-    # Polling dimulai segera setelah QR diterima buyer. Notifikasi admin berjalan di background.
-    _start_payment_task(
-        context.bot, order_id, paket['paket_id'], user_id, user_name,
-        total_payment, timeout_seconds=timeout_secs, paket=paket
-    )
+    finally:
+        # The database row is durable; Telegram failure must not disable payment recovery.
+        _start_payment_task(context.bot, order_id, paket['paket_id'], user_id, user_name,
+                            total_payment, timeout_seconds=timeout_secs, paket=paket)
     spawn_background(
         _post_invoice_created_tasks(
             context.bot, context, user_id, order_id, user_name,
@@ -4829,8 +4934,10 @@ async def cancel_order_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         cancelled_user_name = query.from_user.full_name
         # Status lokal diubah segera agar /start berikutnya tidak tertahan oleh
         # HTTP cancel provider. Cleanup provider/notifikasi berjalan di background.
-        await update_order_status(cancelled_order_id, "cancelled")
-        await _stop_payment_task(user_id)
+        if await update_order_status(cancelled_order_id, "cancelled") is None:
+            await _callback_feedback(query, context, "Status pesanan sudah berubah. Buka /start untuk memeriksa.")
+            return
+        await _stop_payment_task(user_id, cancelled_order_id)
 
         async def _finalize_cancel():
             try:
@@ -5087,10 +5194,12 @@ async def ganti_paket_exec(update: Update, context: ContextTypes.DEFAULT_TYPE):
     old_order_id = active["order_id"]
     old_paket = await get_product(active["paket_id"])
     amount_old = active.get("harga_dibayar") or (old_paket["harga"] if old_paket else 0)
+    if await update_order_status(old_order_id, "cancelled") is None:
+        await _callback_feedback(query, context, "Status pesanan sudah berubah. Buka /start untuk memeriksa.")
+        return
+    await _stop_payment_task(user_id, old_order_id)
     if amount_old:
         await cancel_transaction(old_order_id, amount_old)
-    await update_order_status(old_order_id, "cancelled")
-    await _stop_payment_task(user_id)
     await hapus_qris_buyer_lama(context.bot, old_order_id, user_id)
     await hapus_notif_lama(context.bot, old_order_id)
 
@@ -5143,6 +5252,7 @@ async def ganti_paket_batal(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =================== ASYNCIO MONITORING PAYMENT TASKS ===================
 
 _payment_tasks: dict = {}
+_payment_task_orders: dict = {}
 _payment_tasks_lock = None
 _current_bot = None
 
@@ -5152,11 +5262,13 @@ def _get_payment_tasks_lock() -> asyncio.Lock:
         _payment_tasks_lock = asyncio.Lock()
     return _payment_tasks_lock
 
-async def _stop_payment_task(user_id: int):
-    task = None
+async def _stop_payment_task(user_id: int, order_id: str = None):
     async with _get_payment_tasks_lock():
+        if order_id is not None and _payment_task_orders.get(user_id) != order_id:
+            return
         task = _payment_tasks.pop(user_id, None)
-        if task and not task.done():
+        _payment_task_orders.pop(user_id, None)
+        if task and task is not asyncio.current_task() and not task.done():
             task.cancel()
     if task and task is not asyncio.current_task() and not task.done():
         await asyncio.gather(task, return_exceptions=True)
@@ -5176,6 +5288,9 @@ async def _start_payment_task_async(bot, order_id: str, paket_id: str, user_id: 
                                     paket: dict = None):
     old_task = None
     async with _get_payment_tasks_lock():
+        existing = _payment_tasks.get(user_id)
+        if existing and not existing.done() and _payment_task_orders.get(user_id) == order_id:
+            return
         old_task = _payment_tasks.pop(user_id, None)
         if old_task and not old_task.done():
             old_task.cancel()
@@ -5187,6 +5302,7 @@ async def _start_payment_task_async(bot, order_id: str, paket_id: str, user_id: 
             name=f"payment-poll-{order_id}"
         )
         _payment_tasks[user_id] = task
+        _payment_task_orders[user_id] = order_id
     if old_task and old_task is not asyncio.current_task() and not old_task.done():
         await asyncio.gather(old_task, return_exceptions=True)
 
@@ -5198,7 +5314,7 @@ async def _ensure_payment_task_for_order(bot, order: dict, paket: dict, user_nam
         return
     async with _get_payment_tasks_lock():
         existing = _payment_tasks.get(user_id)
-        if existing and not existing.done():
+        if existing and not existing.done() and _payment_task_orders.get(user_id) == order['order_id']:
             return
 
     expiry_dt = parse_provider_datetime(order.get('payment_expires_at'))
@@ -5235,6 +5351,7 @@ async def _check_order_status(order_id):
 async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
                              user_name: str, amount: int, timeout_seconds: int,
                              paket: dict = None):
+    started_at = _time.monotonic()
     elapsed = 0
     try:
         order = await get_order_by_id(order_id)
@@ -5246,7 +5363,10 @@ async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
             return
 
         last_db_check_elapsed = -30
-        while elapsed < timeout_seconds:
+        while True:
+            elapsed = _time.monotonic() - started_at
+            if elapsed >= timeout_seconds:
+                break
             # Webhook-first: polling cepat hanya 30 detik pertama, lalu makin jarang.
             if elapsed < 30:
                 interval = AUTOGOPAY_POLL_FAST_SECONDS
@@ -5257,9 +5377,11 @@ async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
             else:
                 interval = AUTOGOPAY_POLL_VERY_SLOW_SECONDS
 
-            sleep_for = min(interval, max(1, timeout_seconds - elapsed))
+            sleep_for = min(interval, timeout_seconds - elapsed)
             await asyncio.sleep(sleep_for)
-            elapsed += sleep_for
+            elapsed = _time.monotonic() - started_at
+            if elapsed >= timeout_seconds:
+                break
 
             # Cek status lokal periodik agar task berhenti jika order diubah dari jalur lain.
             if elapsed - last_db_check_elapsed >= 30:
@@ -5281,9 +5403,9 @@ async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
 
             if trans.get('status') == 'completed':
                 logger.info(f"[PAYMENT POLL] Settlement terdeteksi: {order_id}")
-                await _handle_payment_success(
+                spawn_background(_handle_payment_success(
                     bot, order_id, paket_id, user_id, user_name, amount, trans, paket=paket
-                )
+                ), name=f"poll-settlement-{order_id}")
                 return
 
         row = await _check_order_status(order_id)
@@ -5299,14 +5421,15 @@ async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
             if current_provider_status and current_provider_status != last_provider_status:
                 await update_order_provider_status(order_id, current_provider_status)
         if trans and trans.get('status') == 'completed':
-            await _handle_payment_success(
+            spawn_background(_handle_payment_success(
                 bot, order_id, paket_id, user_id, user_name, amount, trans, paket=paket
-            )
+            ), name=f"poll-settlement-{order_id}")
             return
 
+        if await update_order_status(order_id, 'expired') is None:
+            return
         if amount:
             await cancel_transaction(order_id, amount)
-        await update_order_status(order_id, 'expired')
         spawn_background(
             hapus_qris_buyer_lama(bot, order_id, user_id),
             name=f"cleanup-expired-qr-{order_id}"
@@ -5353,6 +5476,7 @@ async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
         async with _get_payment_tasks_lock():
             if _payment_tasks.get(user_id) is current_task:
                 _payment_tasks.pop(user_id, None)
+                _payment_task_orders.pop(user_id, None)
 
 def _split_required_ids(requires_str: str) -> list:
     return [pid.strip() for pid in (requires_str or '').split(',') if pid.strip()]
@@ -5610,6 +5734,27 @@ async def _notify_parent_prereq_progress(bot, user_id: int, user_name: str, pare
         _format_buyer_prereq_complete(parent_label, parent_name, progress),
     )
 
+async def _retain_delivery_result(order_id, link):
+    # Retrying this UPDATE is idempotent; sending the Telegram message again is not.
+    for attempt in range(3):
+        try:
+            await set_sent_link(order_id, link)
+            return
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            if attempt == 2:
+                raise
+            await asyncio.sleep(0.15 * (2 ** attempt))
+
+
+async def _record_delivery_failure(order_id, error, *, sent=False):
+    if not sent and isinstance(error, (telegram.error.BadRequest, telegram.error.Forbidden)):
+        await reset_delivery_claim(order_id, type(error).__name__)
+    else:
+        # Timeout or post-send DB error: leave the claim locked for manual reconciliation.
+        await set_delivery_status(order_id, 'pending',
+                                  'Hasil pengiriman belum pasti; periksa manual: ' + type(error).__name__)
+
+
 async def _process_completed_order_delivery(bot, order_id: str, paket_id: str, user_id: int,
                                             user_name: str, paid_amount: int,
                                             source_title: str = "✅ <b>PEMBAYARAN BERHASIL</b>",
@@ -5661,15 +5806,17 @@ async def _process_completed_order_delivery(bot, order_id: str, paket_id: str, u
         return
 
     link = None
+    message_sent = False
     try:
         # Ini critical path: akses buyer dikirim sebelum cleanup/notif admin.
         link, _ = await _send_buyer_product_link(bot, user_id, order_id, paket, paid_amount, source_title)
-        await set_sent_link(order_id, link)
+        message_sent = True
+        await _retain_delivery_result(order_id, link)
         kirim_berhasil = True
     except Exception as e:
         kirim_berhasil = False
         logger.error(f"[PAYMENT] Gagal kirim link ke buyer {user_id}: {e}")
-        await reset_delivery_claim(order_id, str(e)[:500])
+        await _record_delivery_failure(order_id, e, sent=message_sent)
         spawn_background(
             _send_delivery_failed_alert(bot, order_id, user_id, user_name, paket, e),
             name=f"delivery-failed-alert-{order_id}"
@@ -5760,14 +5907,14 @@ async def _auto_deliver_pending_prereq_orders(bot, user_id: int, user_name: str,
             )
         except Exception as e:
             logger.error(f"[AUTO-PREREQ] Gagal kirim link ke buyer {user_id}: {e}")
-            await reset_delivery_claim(oid, str(e)[:500])
+            await _record_delivery_failure(oid, e)
             spawn_background(
                 _send_delivery_failed_alert(bot, oid, user_id, user_name, paket, e),
                 name=f"auto-prereq-failed-{oid}",
             )
             continue
 
-        await set_sent_link(oid, link)
+        await _retain_delivery_result(oid, link)
         if old_notice_id:
             await _safe_delete_chat_message(
                 bot, user_id, old_notice_id, "pesan update syarat lama"
@@ -5791,6 +5938,7 @@ async def _auto_deliver_pending_prereq_orders(bot, user_id: int, user_name: str,
 
 # =================== ADMIN: KIRIM LINK PREREQ MANUAL ===================
 
+@admin_callback
 async def admin_kirim_link_prereq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await _fast_callback_ack(query)
@@ -5810,6 +5958,9 @@ async def admin_kirim_link_prereq(update: Update, context: ContextTypes.DEFAULT_
     paket = await get_product(paket_id) or {"emoji": "📦", "nama": "Produk", "harga": 0, "link": DEFAULT_LINK}
     old_notice_id = order.get('buyer_msg_id')
 
+    if not await atomic_claim_for_delivery(order_id):
+        await _callback_feedback(query, context, "Pesanan belum lunas, sudah dikirim, atau sedang diproses.")
+        return
     group_link = await generate_group_link(context.bot, paket, order_id)
     link = group_link or (paket.get("link") or DEFAULT_LINK)
     link_section = _build_link_section(group_link, link)
@@ -5835,10 +5986,11 @@ async def admin_kirim_link_prereq(update: Update, context: ContextTypes.DEFAULT_
         )
         kirim_berhasil = True
     except Exception as e:
-        logger.error(f"[PREREQ] Gagal kirim link manual ke buyer {user_id}: {e}")
+        delivery_error = e
+        logger.error(f"[PREREQ] Gagal kirim link manual ke buyer {user_id}: {type(e).__name__}")
 
     if kirim_berhasil:
-        await set_sent_link(order_id, link)
+        await _retain_delivery_result(order_id, link)
         if msg and getattr(msg, 'message_id', None):
             try:
                 await set_buyer_msg_id(order_id, msg.message_id)
@@ -5849,7 +6001,7 @@ async def admin_kirim_link_prereq(update: Update, context: ContextTypes.DEFAULT_
                 context.bot, user_id, old_notice_id, "pesan hold syarat lama"
             )
     else:
-        await set_delivery_status(order_id, 'failed', 'Manual prereq delivery gagal')
+        await _record_delivery_failure(order_id, delivery_error)
 
     if kirim_berhasil:
         await query.edit_message_text(
@@ -6106,6 +6258,7 @@ async def handle_rate_back_stars(update: Update, context: ContextTypes.DEFAULT_T
 
 # =================== ADMIN: TESTIMONI MODERASI HANDLERS ===================
 
+@admin_callback
 async def admin_testi_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await _fast_callback_ack(query)
@@ -6170,6 +6323,7 @@ async def admin_testi_approve(update: Update, context: ContextTypes.DEFAULT_TYPE
             reply_markup=back_kb
         )
 
+@admin_callback
 async def admin_testi_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await _fast_callback_ack(query)
@@ -6226,6 +6380,7 @@ async def _send_produk_menu(context, chat_id, message=None, query=None):
     else:
         await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=markup)
 
+@admin_callback
 async def produk_detail(update: Update, context: ContextTypes.DEFAULT_TYPE, paket_id: str = None):
     query = update.callback_query
     try:
@@ -6288,6 +6443,7 @@ async def produk_detail(update: Update, context: ContextTypes.DEFAULT_TYPE, pake
 
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
+@admin_callback
 async def produk_toggle_aktif(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -6348,6 +6504,7 @@ async def _show_prereq_selector(query, context, paket_id: str, p: dict):
         reply_markup=InlineKeyboardMarkup(buttons)
     )
 
+@admin_callback
 async def pd_req_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -6370,6 +6527,7 @@ async def pd_req_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await _show_prereq_selector(query, context, paket_id, p)
 
+@admin_callback
 async def pd_req_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer("🗑️ Syarat dikosongkan")
@@ -6382,6 +6540,7 @@ async def pd_req_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await _show_prereq_selector(query, context, paket_id, p)
 
+@admin_callback
 async def pd_req_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -6396,6 +6555,7 @@ async def pd_req_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await produk_detail(update, context, paket_id=paket_id)
 
+@admin_callback
 async def produk_edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -6445,6 +6605,7 @@ async def produk_edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
     )
 
+@admin_callback
 async def produk_hapus_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -6469,6 +6630,7 @@ async def produk_hapus_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
         ])
     )
 
+@admin_callback
 async def produk_hapus_exec(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -6486,6 +6648,7 @@ async def produk_hapus_exec(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await _send_produk_menu(context, chat_id=query.from_user.id)
 
+@admin_callback
 async def produk_tambah_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -6503,12 +6666,14 @@ async def produk_tambah_start(update: Update, context: ContextTypes.DEFAULT_TYPE
         ])
     )
 
+@admin_callback
 async def produk_tambah_batal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     context.user_data.pop('adding_product', None)
     await _send_produk_menu(context, chat_id=query.from_user.id, query=query)
 
+@admin_callback
 async def pd_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -6620,6 +6785,7 @@ def _check_waiting_order_sync(order_id):
             c.execute("SELECT * FROM orders WHERE order_id=%s AND status='waiting'", (order_id,))
             return c.fetchone()
 
+@admin_callback
 async def admin_cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await _fast_callback_ack(query)
@@ -6642,14 +6808,18 @@ async def admin_cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     order = dict(order)
+    if target_user_id != int(order['user_id']):
+        await _callback_feedback(query, context, "User pesanan tidak cocok.")
+        return
     paket = await get_product(order['paket_id']) or {"emoji": "📦", "nama": order['paket_id'], "harga": 0}
 
     cancel_amount = order.get('harga_dibayar') or paket.get('harga', 0)
+    if await update_order_status(order_id, 'cancelled') is None:
+        await _callback_feedback(query, context, "Status pesanan sudah berubah; pembatalan dihentikan.")
+        return
+    await _stop_payment_task(target_user_id, order_id)
     if cancel_amount:
         await cancel_transaction(order_id, cancel_amount)
-
-    await update_order_status(order_id, 'cancelled')
-    await _stop_payment_task(target_user_id)
     await hapus_qris_buyer_lama(context.bot, order_id, target_user_id)
     await hapus_notif_lama(context.bot, order_id)
 
@@ -6691,6 +6861,7 @@ async def admin_cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali ke Orders", callback_data="admpanel_orders")]])
     )
 
+@admin_callback
 async def admin_manual_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -6712,14 +6883,17 @@ async def admin_manual_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     order = dict(order)
+    if target_user_id != int(order['user_id']):
+        await _callback_feedback(query, context, "User pesanan tidak cocok.")
+        return
     paket = await get_product(order['paket_id']) or {"emoji": "📦", "nama": order['paket_id'], "harga": 0, "link": DEFAULT_LINK}
 
-    await _stop_payment_task(target_user_id)
     ok = await mark_order_completed(order_id)
     if not ok:
         await query.edit_message_text("⚠️ Order sudah diproses sebelumnya (mungkin oleh webhook).")
         return
 
+    await _stop_payment_task(target_user_id, order_id)
     await _process_completed_order_delivery(
         context.bot,
         order_id=order_id,
@@ -8086,6 +8260,7 @@ async def _blast_admin_allowed(update,context):
     return True
 
 
+@admin_callback
 async def cmd_blast_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _blast_admin_allowed(update,context):
         return
@@ -8117,6 +8292,7 @@ async def cmd_blast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('❌ Batal',callback_data='blast_batal')]]))
 
 
+@admin_callback
 async def blast_batal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _blast_admin_allowed(update,context):
         return
@@ -8146,6 +8322,7 @@ async def _blast_preview(update,context,text):
             [InlineKeyboardButton('❌ Batalkan',callback_data='blast_batal')]]))
 
 
+@admin_callback
 async def blast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _blast_admin_allowed(update,context):
         return
@@ -8166,6 +8343,7 @@ async def blast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _start_blast_runner(context.bot,job_id)
 
 
+@admin_callback
 async def blast_control(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _blast_admin_allowed(update,context):
         return
@@ -8190,6 +8368,7 @@ async def blast_control(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 raise
 
 
+@admin_callback
 async def blast_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Old buttons have no job identity: never let one cancel an unrelated new blast.
     if not await _blast_admin_allowed(update,context):
@@ -8700,6 +8879,7 @@ def _get_pending_order_sync(user_id):
             c.execute("SELECT * FROM orders WHERE user_id=%s AND status='pending' ORDER BY id DESC LIMIT 1", (user_id,))
             return c.fetchone()
 
+@admin_callback
 async def admin_proses_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -8746,6 +8926,7 @@ async def admin_proses_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
         label="admin detail pending",
     )
 
+@admin_callback
 async def back_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await _fast_callback_ack(query)
@@ -8766,6 +8947,7 @@ async def back_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
 
+@admin_callback
 async def admin_konfirmasi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -8783,7 +8965,7 @@ async def admin_konfirmasi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     paket = await get_product(order["paket_id"]) or {"emoji": "📦", "nama": order["paket_id"], "harga": 0, "link": DEFAULT_LINK}
 
     if action == "confirm":
-        ok = await mark_order_completed(order["order_id"])
+        ok = await mark_order_completed(order["order_id"], expected_status="pending")
         if not ok:
             await query.edit_message_text("⚠️ Order sudah diproses sebelumnya (mungkin oleh webhook).")
             return
@@ -8819,7 +9001,9 @@ async def admin_konfirmasi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif action == "reject":
-        await update_order_status(order["order_id"], 'rejected')
+        if await update_order_status(order["order_id"], 'rejected') is None:
+            await _callback_feedback(query, context, "Status pesanan sudah berubah; penolakan dihentikan.")
+            return
         await hapus_qris_buyer_lama(context.bot, order["order_id"], user_id)
         await hapus_notif_lama(context.bot, order["order_id"])
 
@@ -8902,6 +9086,7 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=build_admin_panel_keyboard(uid)
     )
 
+@admin_callback
 async def admpanel_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -8913,11 +9098,13 @@ async def admpanel_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=build_admin_panel_keyboard(query.from_user.id)
     )
 
+@admin_callback
 async def admpanel_produk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     await _send_produk_menu(context, chat_id=query.from_user.id, query=query)
 
+@admin_callback
 async def admpanel_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -8937,6 +9124,7 @@ async def admpanel_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=keyboard
     )
 
+@admin_callback
 async def admpanel_orders_aktif(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await _fast_callback_ack(query)
@@ -8954,6 +9142,7 @@ async def admpanel_orders_aktif(update: Update, context: ContextTypes.DEFAULT_TY
     keyboard.append([styled_button("⬅️ Kembali", style="primary", callback_data="admpanel_orders")])
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
+@admin_callback
 async def admpanel_orders_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await _fast_callback_ack(query)
@@ -8970,6 +9159,7 @@ async def admpanel_orders_pending(update: Update, context: ContextTypes.DEFAULT_
 
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
+@admin_callback
 async def admpanel_orders_cari(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -8983,6 +9173,7 @@ async def admpanel_orders_cari(update: Update, context: ContextTypes.DEFAULT_TYP
         reply_markup=InlineKeyboardMarkup([[styled_button("❌ Batal", style="danger", callback_data="admpanel_orders")]])
     )
 
+@admin_callback
 async def admpanel_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -8999,10 +9190,12 @@ async def admpanel_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=query.from_user.id, text=text, parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[styled_button("⬅️ Kembali", style="primary", callback_data="admpanel_back")]]))
 
+@admin_callback
 async def admpanel_blast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cmd_blast(update, context)
 
 
+@admin_callback
 async def blast_retype(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _blast_admin_allowed(update, context):
         return
@@ -9016,6 +9209,7 @@ async def blast_retype(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+@admin_callback
 async def admpanel_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -9036,6 +9230,7 @@ async def admpanel_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=keyboard
     )
 
+@admin_callback
 async def admpanel_data_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer("⏳ Membuat backup...")
@@ -9045,6 +9240,7 @@ async def admpanel_data_backup(update: Update, context: ContextTypes.DEFAULT_TYP
         reply_markup=InlineKeyboardMarkup([[styled_button("⬅️ Kembali", style="primary", callback_data="admpanel_data")]])
     )
 
+@admin_callback
 async def admpanel_data_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer("⏳ Membuat export JSON...")
@@ -9077,6 +9273,7 @@ async def admpanel_data_export(update: Update, context: ContextTypes.DEFAULT_TYP
             reply_markup=InlineKeyboardMarkup([[styled_button("⬅️ Kembali", style="primary", callback_data="admpanel_data")]])
         )
 
+@admin_callback
 async def admpanel_data_import(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -9090,6 +9287,7 @@ async def admpanel_data_import(update: Update, context: ContextTypes.DEFAULT_TYP
         reply_markup=InlineKeyboardMarkup([[styled_button("❌ Batal", style="danger", callback_data="admpanel_data")]])
     )
 
+@admin_callback
 async def admpanel_data_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -9106,6 +9304,7 @@ async def admpanel_data_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
         reply_markup=InlineKeyboardMarkup([[styled_button("⬅️ Kembali", style="primary", callback_data="admpanel_data")]])
     )
 
+@admin_callback
 async def admpanel_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -9125,6 +9324,7 @@ async def admpanel_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=keyboard
     )
 
+@admin_callback
 async def admpanel_user_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -9139,6 +9339,7 @@ async def admpanel_user_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     context.user_data['awaiting_ban'] = True
 
+@admin_callback
 async def admpanel_user_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -9152,6 +9353,7 @@ async def admpanel_user_unban(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
     context.user_data['awaiting_unban'] = True
 
+@admin_callback
 async def admpanel_user_daftar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await _fast_callback_ack(query)
@@ -9181,6 +9383,7 @@ async def admpanel_user_daftar(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # =================== ADMIN: CEK & KICK USER DI GRUP ===================
 
+@admin_callback
 async def admpanel_kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -9227,6 +9430,7 @@ async def admpanel_kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=keyboard
     )
 
+@admin_callback
 async def kick_cek_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -9240,6 +9444,7 @@ async def kick_cek_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup([[styled_button("❌ Batal", style="danger", callback_data="admpanel_kick")]])
     )
 
+@admin_callback
 async def kick_select_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     try:
@@ -9297,6 +9502,7 @@ async def kick_select_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     buttons.append([styled_button("⬅️ Kembali", style="primary", callback_data="admpanel_kick")])
     await query.edit_message_text(result_text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
 
+@admin_callback
 async def kick_one(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await _fast_callback_ack(query, "⏳ Memproses kick...")
@@ -9320,6 +9526,7 @@ async def kick_one(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query.data = f"kick_select|{target_id}"
     await kick_select_user(update, context)
 
+@admin_callback
 async def kick_add_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -9333,6 +9540,7 @@ async def kick_add_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup([[styled_button("❌ Batal", style="danger", callback_data="admpanel_kick")]])
     )
 
+@admin_callback
 async def kick_del_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -9356,6 +9564,7 @@ async def kick_del_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(buttons)
     )
 
+@admin_callback
 async def kick_del_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -9366,6 +9575,7 @@ async def kick_del_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer(f"✅ Grup {gid_str} dihapus.", show_alert=True)
     await admpanel_kick(update, context)
 
+@admin_callback
 async def kick_do_kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -9423,6 +9633,7 @@ async def kick_do_kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # =================== ADMIN: PENGATURAN ===================
 
+@admin_callback
 async def admpanel_setting(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -9487,6 +9698,7 @@ async def admpanel_setting(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ])
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
 
+@admin_callback
 async def admpanel_setting_maintenance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -9504,6 +9716,7 @@ async def admpanel_setting_maintenance(update: Update, context: ContextTypes.DEF
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali ke Pengaturan", callback_data="admpanel_setting")]])
     )
 
+@admin_callback
 async def admpanel_setting_channel_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -9518,6 +9731,7 @@ async def admpanel_setting_channel_set(update: Update, context: ContextTypes.DEF
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Batal", callback_data="admpanel_setting")]])
     )
 
+@admin_callback
 async def admpanel_setting_channel_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -9528,6 +9742,7 @@ async def admpanel_setting_channel_off(update: Update, context: ContextTypes.DEF
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali ke Pengaturan", callback_data="admpanel_setting")]])
     )
 
+@admin_callback
 async def admpanel_setting_testich_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -9542,6 +9757,7 @@ async def admpanel_setting_testich_set(update: Update, context: ContextTypes.DEF
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Batal", callback_data="admpanel_setting")]])
     )
 
+@admin_callback
 async def admpanel_setting_testich_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -9552,6 +9768,7 @@ async def admpanel_setting_testich_off(update: Update, context: ContextTypes.DEF
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali ke Pengaturan", callback_data="admpanel_setting")]])
     )
 
+@admin_callback
 async def admpanel_setting_channel_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -9574,6 +9791,7 @@ async def admpanel_setting_channel_test(update: Update, context: ContextTypes.DE
     except Exception as e:
         await query.answer(f"❌ Gagal: {str(e)[:100]}", show_alert=True)
 
+@admin_callback
 async def admpanel_setting_link_testi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -9588,6 +9806,7 @@ async def admpanel_setting_link_testi(update: Update, context: ContextTypes.DEFA
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Batal", callback_data="admpanel_setting")]])
     )
 
+@admin_callback
 async def admpanel_setting_link_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -9603,6 +9822,7 @@ async def admpanel_setting_link_admin(update: Update, context: ContextTypes.DEFA
     )
 
 
+@admin_callback
 async def admpanel_setting_group_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -9621,6 +9841,7 @@ async def admpanel_setting_group_name(update: Update, context: ContextTypes.DEFA
     )
 
 
+@admin_callback
 async def admpanel_setting_group_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -9719,6 +9940,7 @@ async def cmd_cari(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # =================== ADMIN: KELOLA ADMIN (SUPER ADMIN ONLY) ===================
 
+@admin_callback
 async def admpanel_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -9746,6 +9968,7 @@ async def admpanel_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ])
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
 
+@admin_callback
 async def admpanel_admin_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -9763,6 +9986,7 @@ async def admpanel_admin_add(update: Update, context: ContextTypes.DEFAULT_TYPE)
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Batal", callback_data="admpanel_admins")]])
     )
 
+@admin_callback
 async def admpanel_admin_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -9791,6 +10015,7 @@ async def admpanel_admin_remove(update: Update, context: ContextTypes.DEFAULT_TY
         reply_markup=InlineKeyboardMarkup(buttons)
     )
 
+@admin_callback
 async def admpanel_admin_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()

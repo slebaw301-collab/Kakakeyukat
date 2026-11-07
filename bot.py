@@ -18,6 +18,9 @@ import time as _time
 import copy
 import uuid
 import weakref
+from contextvars import ContextVar
+import httpx
+from telegram.request import HTTPXRequest
 from concurrent.futures import ThreadPoolExecutor
 from collections import deque, OrderedDict
 from aiohttp import web as aio_web
@@ -278,7 +281,7 @@ TOKEN = os.environ.get("BOT_TOKEN")
 _ADMIN_ID_RAW = os.environ.get("ADMIN_ID", "")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 APP_ENV = os.environ.get("APP_ENV") or os.environ.get("ENV") or "development"
-BOT_RELEASE = "2026-11-07-perf-v3"
+BOT_RELEASE = "2026-11-07-phase2-measure"
 
 # AutoGoPay gateway: GoPay utama, ShopeePay merchant sebagai cadangan.
 AUTOGOPAY_API_KEY = (os.environ.get("AUTOGOPAY_API_KEY") or "").strip()
@@ -296,6 +299,8 @@ SHOPEEPAY_FALLBACK_ENABLED = (
 BOT_CONCURRENT_UPDATES = _env_int("BOT_CONCURRENT_UPDATES", 24, 4, 128)
 TELEGRAM_CONNECTION_POOL_SIZE = _env_int("TELEGRAM_CONNECTION_POOL_SIZE", 64, 16, 256)
 TELEGRAM_POOL_TIMEOUT_SECONDS = _env_float("TELEGRAM_POOL_TIMEOUT_SECONDS", 15.0, 1.0, 60.0)
+TELEGRAM_KEEPALIVE_SECONDS = _env_float("TELEGRAM_KEEPALIVE_SECONDS", 5.0, 5.0, 120.0)
+TELEGRAM_TRANSPORT_PROBE = os.environ.get("TELEGRAM_TRANSPORT_PROBE", "0").strip() == "1"
 DB_POOL_MIN = _env_int("DB_POOL_MIN", 4, 1, 10)
 DB_POOL_MAX = _env_int("DB_POOL_MAX", 20, DB_POOL_MIN, 50)
 # Jalur DB admin/background dibatasi agar query berat tidak menghabiskan semua worker buyer.
@@ -552,6 +557,91 @@ async def _latency_reporter_loop():
                 f"p95={_percentile(values, 95):.3f}s "
                 f"p99={_percentile(values, 99):.3f}s"
             )
+
+_telegram_transport_state = ContextVar("telegram_transport_state", default=None)
+_telegram_transport_probe = ContextVar("telegram_transport_probe", default=False)
+
+
+class TelegramHTTPXRequest(HTTPXRequest):
+    """PTB 20.7 adapter: preserve request semantics, measure connection setup safely."""
+    __slots__ = ()
+
+    def _build_client(self):
+        # PTB 20.7 has no public keepalive option. Preserve its other client options.
+        limits = self._client_kwargs['limits']
+        self._client_kwargs['limits'] = httpx.Limits(
+            max_connections=limits.max_connections,
+            max_keepalive_connections=limits.max_keepalive_connections,
+            keepalive_expiry=TELEGRAM_KEEPALIVE_SECONDS,
+        )
+        self._client_kwargs['event_hooks'] = {'request': [self._trace_request]}
+        return super()._build_client()
+
+    @staticmethod
+    async def _trace_request(request):
+        stats = _telegram_transport_state.get()
+        if stats is None:
+            return
+
+        async def trace(event, info):
+            # Never record URL, headers, request/response bodies, token or user data.
+            for operation, label in (('connect_tcp', 'tcp'), ('start_tls', 'tls')):
+                if event.endswith('.' + operation + '.started'):
+                    stats[label + '_at'] = _time.monotonic()
+                    if label == 'tcp':
+                        stats['cold'] = True
+                elif event.endswith('.' + operation + '.complete') or event.endswith('.' + operation + '.failed'):
+                    began = stats.pop(label + '_at', None)
+                    if began is not None:
+                        stats[label] = stats.get(label, 0.0) + _time.monotonic() - began
+
+        request.extensions['trace'] = trace
+
+    async def do_request(self, *args, **kwargs):
+        stats = {}
+        state_token = _telegram_transport_state.set(stats)
+        started = _time.monotonic()
+        success = False
+        try:
+            result = await super().do_request(*args, **kwargs)
+            success = result[0] == 200
+            return result
+        finally:
+            elapsed = _time.monotonic() - started
+            probe = _telegram_transport_probe.get()
+            prefix = 'telegram-probe' if probe else 'telegram-http'
+            connection = 'cold' if stats.get('cold') else 'warm'
+            _record_latency(prefix + '-' + connection, elapsed)
+            for part in ('tcp', 'tls'):
+                if part in stats:
+                    _record_latency(prefix + '-' + part, stats[part])
+            if not success:
+                _record_latency(prefix + '-failed', elapsed)
+            if probe:
+                logger.info('[TRANSPORT PROBE] keepalive_s=%.1f connection=%s total_ms=%.1f tcp_ms=%.1f tls_ms=%.1f ok=%s',
+                            TELEGRAM_KEEPALIVE_SECONDS, connection, elapsed * 1000,
+                            stats.get('tcp', 0) * 1000, stats.get('tls', 0) * 1000, success)
+            _telegram_transport_state.reset(state_token)
+
+
+async def _probe_telegram_transport(bot):
+    """Opt-in, finite read-only probe. Never creates an order or sends a message."""
+    await asyncio.sleep(2)
+    for group in range(4):
+        if group:
+            await asyncio.sleep(6.5)
+        for _ in range(3):
+            token = _telegram_transport_probe.set(True)
+            try:
+                await bot.get_me()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning('[TRANSPORT PROBE] getMe failed: %s', type(exc).__name__)
+            finally:
+                _telegram_transport_probe.reset(token)
+    logger.info('[TRANSPORT PROBE] Completed 12 read-only samples.')
+
 
 class PerfTrace:
     """Profiling ringan per alur; hanya menulis log saat proses terasa lambat."""
@@ -4188,6 +4278,7 @@ async def post_init(application: Application):
     _current_bot = application.bot
 
     logger.info("[RELEASE] %s", BOT_RELEASE)
+    logger.info('[TELEGRAM TRANSPORT] keepalive_s=%.1f pool=%s', TELEGRAM_KEEPALIVE_SECONDS, TELEGRAM_CONNECTION_POOL_SIZE)
     logger.info(
         f"[PERFORMANCE] Executor aktif: buyer_db={DB_THREAD_WORKERS}, "
         f"admin_db={DB_ADMIN_THREAD_WORKERS}, cpu={CPU_THREAD_WORKERS}"
@@ -4203,6 +4294,8 @@ async def post_init(application: Application):
     spawn_background(_event_loop_lag_monitor(), name="event-loop-lag-monitor")
     spawn_background(_latency_reporter_loop(), name="latency-reporter-loop")
     spawn_background(_start_webhook_server(), name="webhook-server")
+    if TELEGRAM_TRANSPORT_PROBE:
+        spawn_background(_probe_telegram_transport(application.bot), name='telegram-transport-probe')
     logger.info("[POST_INIT] Background task aktif dan bot siap menerima update.")
 
 # =================== GRACEFUL SHUTDOWN ===================
@@ -10076,8 +10169,8 @@ def main():
         .token(TOKEN)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
-        .connection_pool_size(TELEGRAM_CONNECTION_POOL_SIZE)
-        .pool_timeout(TELEGRAM_POOL_TIMEOUT_SECONDS)
+        .request(TelegramHTTPXRequest(connection_pool_size=TELEGRAM_CONNECTION_POOL_SIZE,
+                                    pool_timeout=TELEGRAM_POOL_TIMEOUT_SECONDS))
     )
     if hasattr(builder, 'post_stop'):
         builder = builder.post_stop(_stop_blast_before_shutdown)

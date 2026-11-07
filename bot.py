@@ -281,7 +281,7 @@ TOKEN = os.environ.get("BOT_TOKEN")
 _ADMIN_ID_RAW = os.environ.get("ADMIN_ID", "")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 APP_ENV = os.environ.get("APP_ENV") or os.environ.get("ENV") or "development"
-BOT_RELEASE = "2026-11-07-phase2-measure"
+BOT_RELEASE = "2026-11-07-phase2-nav"
 
 # AutoGoPay gateway: GoPay utama, ShopeePay merchant sebagai cadangan.
 AUTOGOPAY_API_KEY = (os.environ.get("AUTOGOPAY_API_KEY") or "").strip()
@@ -299,7 +299,7 @@ SHOPEEPAY_FALLBACK_ENABLED = (
 BOT_CONCURRENT_UPDATES = _env_int("BOT_CONCURRENT_UPDATES", 24, 4, 128)
 TELEGRAM_CONNECTION_POOL_SIZE = _env_int("TELEGRAM_CONNECTION_POOL_SIZE", 64, 16, 256)
 TELEGRAM_POOL_TIMEOUT_SECONDS = _env_float("TELEGRAM_POOL_TIMEOUT_SECONDS", 15.0, 1.0, 60.0)
-TELEGRAM_KEEPALIVE_SECONDS = _env_float("TELEGRAM_KEEPALIVE_SECONDS", 5.0, 5.0, 120.0)
+TELEGRAM_KEEPALIVE_SECONDS = _env_float("TELEGRAM_KEEPALIVE_SECONDS", 60.0, 5.0, 120.0)
 TELEGRAM_TRANSPORT_PROBE = os.environ.get("TELEGRAM_TRANSPORT_PROBE", "0").strip() == "1"
 DB_POOL_MIN = _env_int("DB_POOL_MIN", 4, 1, 10)
 DB_POOL_MAX = _env_int("DB_POOL_MAX", 20, DB_POOL_MIN, 50)
@@ -560,6 +560,7 @@ async def _latency_reporter_loop():
 
 _telegram_transport_state = ContextVar("telegram_transport_state", default=None)
 _telegram_transport_probe = ContextVar("telegram_transport_probe", default=False)
+_navigation_timing = ContextVar("navigation_timing", default=None)
 
 
 class TelegramHTTPXRequest(HTTPXRequest):
@@ -952,6 +953,7 @@ if BaseUpdateProcessor is not None:
                 entry.navigation[nav_key] = token
             started = _time.monotonic()
             executed = False
+            navigation_context = None
             try:
                 query = getattr(update, 'callback_query', None)
                 if nav_key is not None and query is not None:
@@ -968,8 +970,12 @@ if BaseUpdateProcessor is not None:
                         waited = _time.monotonic() - started
                         _record_latency("update-queue-wait", waited)
                         executed = True
+                        if nav_key is not None:
+                            navigation_context = _navigation_timing.set({'started': _time.monotonic(), 'rendered': False})
                         await coroutine
             finally:
+                if navigation_context is not None:
+                    _navigation_timing.reset(navigation_context)
                 if not executed and hasattr(coroutine, 'close'):
                     coroutine.close()
                 if nav_key is not None and entry.navigation.get(nav_key) is token:
@@ -1835,6 +1841,7 @@ _products_by_id_cache: tuple = None
 _PRODUCTS_TTL = 30
 _products_cache_lock: asyncio.Lock = None
 _products_cache_generation = 0
+_buyer_products_view = None
 _settings_cache_versions: dict = {}
 
 def _settings_cache_get(key):
@@ -1896,10 +1903,32 @@ async def get_all_products():
                 return copy.deepcopy(data)
 
 def _invalidate_products_cache():
-    global _products_cache, _products_by_id_cache, _products_cache_generation
+    global _products_cache, _products_by_id_cache, _products_cache_generation, _buyer_products_view
     _products_cache_generation += 1
     _products_cache = None
     _products_by_id_cache = None
+    _buyer_products_view = None
+
+
+async def _get_buyer_products_page(page, page_size=8):
+    """Use the same TTL/invalidation as products; copy only the visible page."""
+    global _buyer_products_view
+    snapshot = _products_cache
+    if snapshot is None or _time.monotonic() >= snapshot[1]:
+        products = await get_all_products()
+        snapshot = _products_cache
+    else:
+        products = snapshot[0]
+    if snapshot is not None and _time.monotonic() < snapshot[1]:
+        if _buyer_products_view is None or _buyer_products_view[0] is not snapshot:
+            _buyer_products_view = (snapshot, tuple(p for p in snapshot[0] if p.get('aktif', True)))
+        active = _buyer_products_view[1]
+    else:
+        active = tuple(p for p in products if p.get('aktif', True))
+    pages = max(1, (len(active) + page_size - 1) // page_size)
+    page = max(0, min(page, pages - 1))
+    shown = [dict(p) for p in active[page * page_size:(page + 1) * page_size]]
+    return page, pages, shown
 
 async def get_product(paket_id):
     # Jalur tombol detail memakai index in-memory sehingga tidak perlu deep-copy + scan semua produk.
@@ -3687,6 +3716,10 @@ def _forget_menu_render(query):
 async def _render_buyer_menu(query, text, reply_markup):
     """Edit caption untuk menu bergambar; tetap dukung pesan teks lama."""
     started = _time.monotonic()
+    navigation = _navigation_timing.get()
+    if navigation is not None and not navigation['rendered']:
+        navigation['rendered'] = True
+        _record_latency('navigation-build', started - navigation['started'])
     key = _menu_render_key(query)
     cached = _menu_render_cache.get(key)
     # Keep only a digest, not the full keyboard graph, in the bounded render cache.
@@ -4559,12 +4592,8 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         page = max(0, min(100000, int(query.data.split('|', 1)[1]))) if '|' in query.data else 0
     except ValueError:
         page = 0
-    products = [p for p in await get_all_products() if p.get('aktif', True)]
-    page_size = 8
-    pages = max(1, (len(products) + page_size - 1) // page_size)
-    page = min(page, pages - 1)
+    page, pages, shown = await _get_buyer_products_page(page)
     context.user_data['_buyer_package_page'] = page
-    shown = products[page * page_size:(page + 1) * page_size]
     text = "📦 <b>DAFTAR PAKET</b>\n\nSilakan pilih paket yang tersedia di bawah ini."
     keyboard = []
     for product in shown:

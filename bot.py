@@ -281,7 +281,7 @@ TOKEN = os.environ.get("BOT_TOKEN")
 _ADMIN_ID_RAW = os.environ.get("ADMIN_ID", "")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 APP_ENV = os.environ.get("APP_ENV") or os.environ.get("ENV") or "development"
-BOT_RELEASE = "2026-11-07-phase2-nav"
+BOT_RELEASE = "2026-11-07-callback-trace"
 
 # AutoGoPay gateway: GoPay utama, ShopeePay merchant sebagai cadangan.
 AUTOGOPAY_API_KEY = (os.environ.get("AUTOGOPAY_API_KEY") or "").strip()
@@ -301,6 +301,8 @@ TELEGRAM_CONNECTION_POOL_SIZE = _env_int("TELEGRAM_CONNECTION_POOL_SIZE", 64, 16
 TELEGRAM_POOL_TIMEOUT_SECONDS = _env_float("TELEGRAM_POOL_TIMEOUT_SECONDS", 15.0, 1.0, 60.0)
 TELEGRAM_KEEPALIVE_SECONDS = _env_float("TELEGRAM_KEEPALIVE_SECONDS", 60.0, 5.0, 120.0)
 TELEGRAM_TRANSPORT_PROBE = os.environ.get("TELEGRAM_TRANSPORT_PROBE", "0").strip() == "1"
+CALLBACK_TRACE_ENABLED = os.environ.get("CALLBACK_TRACE_ENABLED", "1").strip() == "1"
+CALLBACK_TRACE_MAX = _env_int("CALLBACK_TRACE_MAX", 2000, 100, 10000)
 DB_POOL_MIN = _env_int("DB_POOL_MIN", 4, 1, 10)
 DB_POOL_MAX = _env_int("DB_POOL_MAX", 20, DB_POOL_MIN, 50)
 # Jalur DB admin/background dibatasi agar query berat tidak menghabiskan semua worker buyer.
@@ -436,12 +438,18 @@ def _schedule_navigation_ack(query):
         return
     if _callback_acks.get(query_id, 0) > _time.monotonic():
         return
-    task = spawn_background(_fast_callback_ack(query), name="menu-callback-ack")
+    trace = _callback_trace_state.get()
+    if trace is not None:
+        trace['ack_expected'] = True
+    task = spawn_background(_fast_callback_ack(query), name="menu-callback-ack", trace_callback=True)
     _callback_ack_tasks[query_id] = task
 
     def done(completed):
         if _callback_ack_tasks.get(query_id) is completed:
             _callback_ack_tasks.pop(query_id, None)
+        if trace is not None:
+            trace['ack_task_done_ns'] = _time.perf_counter_ns()
+            _callback_trace_emit(trace)
     task.add_done_callback(done)
 
 
@@ -485,6 +493,97 @@ _executor_limits = {_db_executor: DB_THREAD_WORKERS,
                     _db_admin_executor: DB_ADMIN_THREAD_WORKERS,
                     _cpu_executor: CPU_THREAD_WORKERS}
 
+_callback_trace_state = ContextVar('callback_trace_state', default=None)
+_callback_http_span = ContextVar('callback_http_span', default=None)
+_callback_ingress = OrderedDict()
+_callback_trace_created = 0
+_last_poll_read_ns = 0
+_loop_stalls = deque(maxlen=512)
+
+
+def _callback_route(update):
+    query = getattr(update, 'callback_query', None)
+    if query is None:
+        return 'message'
+    data = str(query.data or '')
+    for prefix, route in (('buy|', 'buyer:list'), ('pilih_', 'buyer:product'),
+                          ('confirm_buy_', 'payment:create'), ('prereq_buy_', 'payment:prerequisite'),
+                          ('resend_menu', 'buyer:resend'), ('resend_select|', 'buyer:delivery'),
+                          ('buyer_desc_', 'buyer:description'), ('admpanel_', 'admin:panel'),
+                          ('produk_', 'admin:products')):
+        if data.startswith(prefix):
+            return route
+    return {'buy':'buyer:list', 'back_to_menu':'buyer:back', 'buyer_how':'buyer:how',
+            'buyer_history':'buyer:history', 'cancel_order':'payment:cancel'}.get(data, 'callback:other')
+
+
+def _new_callback_trace(update, source='processor'):
+    global _callback_trace_created
+    if (not CALLBACK_TRACE_ENABLED or getattr(update, 'callback_query', None) is None
+            or _callback_trace_created >= CALLBACK_TRACE_MAX):
+        return None
+    _callback_trace_created += 1
+    now = _time.perf_counter_ns()
+    return {'id': uuid.uuid4().hex[:12], 'route': _callback_route(update), 'source': source,
+            'epoch_ns': _time.time_ns(), 'ingress_ns': now,
+            'poll_ns': _last_poll_read_ns if source == 'queue' and 0 <= now-_last_poll_read_ns < 2_000_000_000 else None,
+            'api': [], 'db': [], 'pending': 0, 'closed': False}
+
+
+def _callback_trace_emit(trace):
+    if (not trace or trace['closed'] or 'done_ns' not in trace or trace['pending']
+            or trace.get('ack_expected') and 'ack_task_done_ns' not in trace):
+        return
+    trace['closed'] = True
+    origin = trace['ingress_ns']
+    def elapsed(start, end):
+        return round((trace[end]-trace[start])/1e6, 3) if start in trace and end in trace else None
+    stages = {
+        'poll_decode_enqueue_ms': elapsed('poll_ns', 'ingress_ns') if trace.get('poll_ns') is not None else None,
+        'queue_ms': elapsed('ingress_ns', 'dequeue_ns'),
+        'dispatch_ms': elapsed('dequeue_ns', 'processor_ns'),
+        'chat_lock_ms': elapsed('processor_ns', 'chat_lock_ns'),
+        'admission_ms': elapsed('chat_lock_ns', 'handler_ns'),
+        'build_ms': elapsed('handler_ns', 'render_ns'),
+        'handler_ms': elapsed('handler_ns', 'done_ns'),
+        'total_ms': elapsed('ingress_ns', 'done_ns'),
+        'ack_task_done_ms': elapsed('ingress_ns', 'ack_task_done_ns'),
+    }
+    record = dict(id=trace['id'], route=trace['route'], source=trace['source'], epoch_ns=trace['epoch_ns'],
+                  stages=stages, coalesced=trace.get('coalesced', False), outcome=trace.get('outcome','ok'),
+                  api=trace['api'], db=trace['db'], overflow=trace.get('overflow',0),
+                  loop_lag_ms=round(max((lag for ts,lag in _loop_stalls if origin <= ts <= trace['done_ns']),default=0),3))
+    logger.info('[CBTRACE] %s', json.dumps(record,separators=(',',':')))
+
+
+class CallbackTimingQueue(asyncio.Queue):
+    """Observe real updater enqueue/dequeue without changing queue capacity or delivery."""
+    def put_nowait(self, item):
+        result = super().put_nowait(item)
+        trace = _new_callback_trace(item, 'queue')
+        if trace is not None:
+            _callback_ingress[id(item)] = trace
+            while len(_callback_ingress) > 4096:
+                _callback_ingress.popitem(last=False)
+        return result
+
+    def get_nowait(self):
+        item = super().get_nowait()
+        trace = _callback_ingress.get(id(item))
+        if trace is not None:
+            trace['dequeue_ns'] = _time.perf_counter_ns()
+        return item
+
+
+class PollingHTTPXRequest(HTTPXRequest):
+    __slots__ = ()
+    async def do_request(self, *args, **kwargs):
+        global _last_poll_read_ns
+        result = await super().do_request(*args, **kwargs)
+        if result[0] == 200:
+            _last_poll_read_ns = _time.perf_counter_ns()
+        return result
+
 async def _run_executor(executor, func, *args, **kwargs):
     loop = asyncio.get_running_loop()
     slots = _executor_admission.get(executor)
@@ -494,10 +593,28 @@ async def _run_executor(executor, func, *args, **kwargs):
     label = ('db-admin' if executor is _db_admin_executor else
              'db-buyer' if executor is _db_executor else 'cpu')
     queued_at = _time.monotonic()
+    trace = _callback_trace_state.get()
+    span = None
+    if trace is not None and not trace['closed'] and len(trace['db']) < 16:
+        span = {'kind': label, 'fn': getattr(func,'__name__','callable')[:50],
+                'at_ms': round((_time.perf_counter_ns()-trace['ingress_ns'])/1e6,3)}
+        trace['db'].append(span)
     await slots.acquire()
+    if span is not None:
+        span['admission_ms'] = round((_time.monotonic()-queued_at)*1000,3)
     _record_latency(label + '-queue', _time.monotonic() - queued_at)
     try:
-        future = loop.run_in_executor(executor, functools.partial(func, *args, **kwargs))
+        submitted_ns = _time.perf_counter_ns()
+        def work():
+            began = _time.perf_counter_ns()
+            if span is not None:
+                span['thread_wait_ms'] = round((began-submitted_ns)/1e6,3)
+            try:
+                return func(*args, **kwargs)
+            finally:
+                if span is not None:
+                    span['execution_ms'] = round((_time.perf_counter_ns()-began)/1e6,3)
+        future = loop.run_in_executor(executor, work)
     except BaseException:
         slots.release()
         raise
@@ -505,6 +622,8 @@ async def _run_executor(executor, func, *args, **kwargs):
     def completed(done):
         slots.release()
         _record_latency(label + '-work', _time.monotonic() - started)
+        if span is not None:
+            span['work_ms'] = round((_time.monotonic()-started)*1000,3)
         # Retrieve exceptions even when the caller stopped awaiting a running thread.
         if not done.cancelled():
             done.exception()
@@ -595,16 +714,26 @@ class TelegramHTTPXRequest(HTTPXRequest):
                     began = stats.pop(label + '_at', None)
                     if began is not None:
                         stats[label] = stats.get(label, 0.0) + _time.monotonic() - began
+            now_ns = _time.perf_counter_ns()
+            for operation, label in (('send_request_headers','send_headers'), ('send_request_body','send_body'),
+                                     ('receive_response_headers','recv_headers'), ('receive_response_body','recv_body')):
+                if event.endswith('.' + operation + '.started'):
+                    stats[label + '_ns'] = now_ns
+                elif event.endswith('.' + operation + '.complete'):
+                    stats[label + '_done_ns'] = now_ns
+            stats.setdefault('first_event_ns', now_ns)
 
+        stats['hook_ns'] = _time.perf_counter_ns()
         request.extensions['trace'] = trace
 
     async def do_request(self, *args, **kwargs):
-        stats = {}
+        stats = {'started_ns': _time.perf_counter_ns()}
         state_token = _telegram_transport_state.set(stats)
         started = _time.monotonic()
         success = False
         try:
             result = await super().do_request(*args, **kwargs)
+            stats['http_status'] = result[0]
             success = result[0] == 200
             return result
         finally:
@@ -622,6 +751,19 @@ class TelegramHTTPXRequest(HTTPXRequest):
                 logger.info('[TRANSPORT PROBE] keepalive_s=%.1f connection=%s total_ms=%.1f tcp_ms=%.1f tls_ms=%.1f ok=%s',
                             TELEGRAM_KEEPALIVE_SECONDS, connection, elapsed * 1000,
                             stats.get('tcp', 0) * 1000, stats.get('tls', 0) * 1000, success)
+            span = _callback_http_span.get()
+            if span is not None:
+                span.update(http_ms=round(elapsed*1000,3),cold=bool(stats.get('cold')),
+                            tcp_ms=round(stats.get('tcp',0)*1000,3),tls_ms=round(stats.get('tls',0)*1000,3),
+                            http_status=stats.get('http_status'))
+                for label,begin,end in (
+                    ('httpx_prepare_ms','started_ns','hook_ns'),
+                    ('httpx_dispatch_ms','hook_ns','first_event_ns'),
+                    ('send_ms','send_headers_ns','send_body_done_ns'),
+                    ('wait_headers_ms','send_body_done_ns','recv_headers_done_ns'),
+                    ('read_body_ms','recv_body_ns','recv_body_done_ns')):
+                    if begin in stats and end in stats:
+                        span[label] = round((stats[end]-stats[begin])/1e6,3)
             _telegram_transport_state.reset(state_token)
 
 
@@ -722,9 +864,13 @@ async def telegram_send_rate_retry(operation, *, label: str, attempts: int = Non
             await asyncio.sleep(delay)
 
 
-def spawn_background(coro, *, name: str = None):
+def spawn_background(coro, *, name: str = None, trace_callback=False):
     """Jalankan coroutine tanpa menahan handler dan tetap laporkan exception-nya."""
-    task = asyncio.create_task(coro, name=name)
+    token = _callback_trace_state.set(_callback_trace_state.get() if trace_callback else None)
+    try:
+        task = asyncio.create_task(coro, name=name)
+    finally:
+        _callback_trace_state.reset(token)
     _background_tasks.add(task)
 
     def _done(done_task):
@@ -844,6 +990,46 @@ if BaseRateLimiter is not None:
                     self._waiting.pop(token, None)
                     self._condition.notify_all()
 
+        async def _request_attempt(self, callback, args, kwargs, endpoint, data, background, attempt):
+            trace = _callback_trace_state.get()
+            span = None
+            if trace is not None and not trace['closed']:
+                if len(trace['api']) < 24:
+                    span = {'method':endpoint,'attempt':attempt+1,
+                            'at_ms':round((_time.perf_counter_ns()-trace['ingress_ns'])/1e6,3)}
+                    trace['api'].append(span)
+                    trace['pending'] += 1
+                else:
+                    trace['overflow'] = trace.get('overflow',0)+1
+            token = _callback_http_span.set(span)
+            began_ns = _time.perf_counter_ns()
+            started = None
+            try:
+                await self._acquire(endpoint, data, background)
+                if span is not None:
+                    span['limiter_ms'] = round((_time.perf_counter_ns()-began_ns)/1e6,3)
+                started = _time.monotonic()
+                return await callback(*args, **kwargs)
+            except BaseException as exc:
+                if span is not None:
+                    span['outcome'] = type(exc).__name__
+                    if isinstance(exc,telegram.error.RetryAfter):
+                        delay=exc.retry_after
+                        span['retry_after_s'] = delay.total_seconds() if isinstance(delay,timedelta) else float(delay)
+                raise
+            finally:
+                if started is not None:
+                    elapsed = _time.monotonic()-started
+                    _record_latency('telegram-api:' + endpoint, elapsed)
+                    if span is not None:
+                        span['api_ms'] = round(elapsed*1000,3)
+                if span is not None:
+                    span.setdefault('outcome','ok')
+                    span['total_ms'] = round((_time.perf_counter_ns()-began_ns)/1e6,3)
+                    trace['pending'] -= 1
+                _callback_http_span.reset(token)
+                _callback_trace_emit(trace)
+
         async def process_request(self, callback, args, kwargs, endpoint, data, rate_limit_args):
             options = rate_limit_args if isinstance(rate_limit_args, dict) else {}
             # Legacy rate_limit_args=0 digunakan oleh durable blast: nol retry, bukan bypass.
@@ -853,10 +1039,8 @@ if BaseRateLimiter is not None:
             retries = options.get('max_retries', rate_limit_args if type(rate_limit_args) is int else 1)
             retries = max(0, min(3, int(retries)))
             for attempt in range(retries + 1):
-                await self._acquire(endpoint, data, background)
-                started = _time.monotonic()
                 try:
-                    return await callback(*args, **kwargs)
+                    return await self._request_attempt(callback,args,kwargs,endpoint,data,background,attempt)
                 except telegram.error.RetryAfter as exc:
                     delay = exc.retry_after.total_seconds() if isinstance(exc.retry_after, timedelta) else float(exc.retry_after)
                     # Hormati cooldown Telegram. Tidak menghindari limit dengan bot/client lain.
@@ -865,8 +1049,6 @@ if BaseRateLimiter is not None:
                         self._condition.notify_all()
                     if attempt >= retries:
                         raise
-                finally:
-                    _record_latency('telegram-api:' + endpoint, _time.monotonic() - started)
 else:
     BuyerPriorityRateLimiter = None
 
@@ -939,6 +1121,9 @@ if BaseUpdateProcessor is not None:
                     self._chat_locks.pop(key, None)
 
         async def do_process_update(self, update, coroutine):
+            trace = _callback_ingress.pop(id(update),None) or _new_callback_trace(update)
+            if trace is not None:
+                trace['processor_ns'] = _time.perf_counter_ns()
             chat = getattr(update, "effective_chat", None)
             user = getattr(update, "effective_user", None)
             key = (("chat", chat.id) if chat is not None else ("user", user.id) if user is not None
@@ -954,11 +1139,14 @@ if BaseUpdateProcessor is not None:
             started = _time.monotonic()
             executed = False
             navigation_context = None
+            trace_token = _callback_trace_state.set(trace)
             try:
                 query = getattr(update, 'callback_query', None)
                 if nav_key is not None and query is not None:
                     _schedule_navigation_ack(query)
                 async with entry.lock:
+                    if trace is not None:
+                        trace['chat_lock_ns'] = _time.perf_counter_ns()
                     if nav_key is not None and entry.navigation.get(nav_key) is not token:
                         return
                     async with AsyncExitStack() as admission:
@@ -970,10 +1158,21 @@ if BaseUpdateProcessor is not None:
                         waited = _time.monotonic() - started
                         _record_latency("update-queue-wait", waited)
                         executed = True
+                        if trace is not None:
+                            trace['handler_ns'] = _time.perf_counter_ns()
                         if nav_key is not None:
                             navigation_context = _navigation_timing.set({'started': _time.monotonic(), 'rendered': False})
                         await coroutine
+            except BaseException as exc:
+                if trace is not None:
+                    trace['outcome'] = type(exc).__name__
+                raise
             finally:
+                if trace is not None:
+                    trace['done_ns'] = _time.perf_counter_ns()
+                    trace['coalesced'] = not executed
+                _callback_trace_state.reset(trace_token)
+                _callback_trace_emit(trace)
                 if navigation_context is not None:
                     _navigation_timing.reset(navigation_context)
                 if not executed and hasattr(coroutine, 'close'):
@@ -3716,6 +3915,9 @@ def _forget_menu_render(query):
 async def _render_buyer_menu(query, text, reply_markup):
     """Edit caption untuk menu bergambar; tetap dukung pesan teks lama."""
     started = _time.monotonic()
+    trace = _callback_trace_state.get()
+    if trace is not None and not trace['closed']:
+        trace.setdefault('render_ns', _time.perf_counter_ns())
     navigation = _navigation_timing.get()
     if navigation is not None and not navigation['rendered']:
         navigation['rendered'] = True
@@ -4221,14 +4423,18 @@ async def _start_webhook_server():
 
 async def _event_loop_lag_monitor():
     """Mendeteksi CPU starvation/blocking I/O pada hosting tanpa mengganggu bot."""
-    interval = 5.0
+    interval = 0.05
+    last_warning = 0.0
     expected = _time.monotonic() + interval
     while True:
         await asyncio.sleep(interval)
         now_mono = _time.monotonic()
         lag = max(0.0, now_mono - expected)
         expected = now_mono + interval
-        if lag >= EVENT_LOOP_LAG_WARNING_SECONDS:
+        if lag >= 0.001:
+            _loop_stalls.append((_time.perf_counter_ns(), lag*1000))
+        if lag >= EVENT_LOOP_LAG_WARNING_SECONDS and now_mono-last_warning >= 5:
+            last_warning = now_mono
             logger.warning(f"[EVENT LOOP LAG] Event loop tertahan {lag:.2f}s")
 
 
@@ -4311,6 +4517,7 @@ async def post_init(application: Application):
     _current_bot = application.bot
 
     logger.info("[RELEASE] %s", BOT_RELEASE)
+    logger.info('[CALLBACK TRACE] enabled=%s max=%s', CALLBACK_TRACE_ENABLED, CALLBACK_TRACE_MAX)
     logger.info('[TELEGRAM TRANSPORT] keepalive_s=%.1f pool=%s', TELEGRAM_KEEPALIVE_SECONDS, TELEGRAM_CONNECTION_POOL_SIZE)
     logger.info(
         f"[PERFORMANCE] Executor aktif: buyer_db={DB_THREAD_WORKERS}, "
@@ -10198,6 +10405,8 @@ def main():
         .token(TOKEN)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
+        .update_queue(CallbackTimingQueue())
+        .get_updates_request(PollingHTTPXRequest())
         .request(TelegramHTTPXRequest(connection_pool_size=TELEGRAM_CONNECTION_POOL_SIZE,
                                     pool_timeout=TELEGRAM_POOL_TIMEOUT_SECONDS))
     )

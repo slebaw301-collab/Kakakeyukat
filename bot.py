@@ -281,7 +281,7 @@ TOKEN = os.environ.get("BOT_TOKEN")
 _ADMIN_ID_RAW = os.environ.get("ADMIN_ID", "")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 APP_ENV = os.environ.get("APP_ENV") or os.environ.get("ENV") or "development"
-BOT_RELEASE = "2026-11-07-catalog-history"
+BOT_RELEASE = "2026-11-08-public-transaction-testimonials"
 
 # AutoGoPay gateway: GoPay utama, ShopeePay merchant sebagai cadangan.
 AUTOGOPAY_API_KEY = (os.environ.get("AUTOGOPAY_API_KEY") or "").strip()
@@ -2020,7 +2020,7 @@ def save_testimonial(user_id, user_name, paket_id, order_id, rating, review):
 def update_testimonial_status(order_id, status):
     with db_session_safe() as conn:
         with conn.cursor() as c:
-            c.execute("UPDATE testimonials SET status=%s WHERE order_id=%s", (status, order_id))
+            c.execute("UPDATE testimonials SET status=%s WHERE order_id=%s AND status='pending'", (status, order_id))
 
 @async_wrap
 def get_testimonial_by_order(order_id):
@@ -2029,6 +2029,111 @@ def get_testimonial_by_order(order_id):
             c.execute("SELECT * FROM testimonials WHERE order_id=%s", (order_id,))
             row = c.fetchone()
             return dict(row) if row else None
+
+
+def _claim_public_testimonial_sync(order_id, manual=False):
+    """Use the existing unique order_id as a durable publication claim; no DDL."""
+    with db_session_safe() as conn:
+        with conn.cursor() as c:
+            c.execute("""
+                INSERT INTO testimonials (user_id, user_name, paket_id, order_id, rating, review, status)
+                SELECT user_id, '', paket_id, order_id, NULL, '', 'publishing'
+                FROM orders
+                WHERE order_id=%s AND status='completed' AND delivery_status='sent'
+                  AND COALESCE(sent_link, '') NOT IN ('', 'pending')
+                ON CONFLICT (order_id) DO UPDATE SET status='publishing'
+                WHERE %s AND testimonials.status IN ('pending', 'publish_failed')
+                RETURNING order_id
+            """, (order_id, bool(manual)))
+            return c.fetchone() is not None
+
+
+def _finish_public_testimonial_sync(order_id, status):
+    if status not in {'approved', 'publish_failed', 'publish_uncertain'}:
+        raise ValueError('Status publikasi tidak valid')
+    with db_session_safe() as conn:
+        with conn.cursor() as c:
+            c.execute("UPDATE testimonials SET status=%s WHERE order_id=%s AND status='publishing'",
+                      (status, order_id))
+
+
+def _format_public_transaction(order, paket):
+    amount = order.get('harga_dibayar')
+    total = format_harga(amount) if amount is not None else '—'
+    waktu = f"{_compact_waktu(order['waktu'])} WIB" if order.get('waktu') else '—'
+    product = str(paket.get('nama') or 'Produk')[:300]
+    return (
+        "💠 <b>HYPER FAMILY STORE</b>\n"
+        "✅ <b>Transaksi berhasil</b>\n\n"
+        "<blockquote><b>RINCIAN PEMBELIAN</b>\n"
+        f"ID Buyer: <code>{esc(order['user_id'])}</code>\n"
+        f"Produk: <b>{esc(product)}</b>\n"
+        f"Total: <b>{total}</b>\n"
+        "Pembayaran: Diterima\n"
+        "Akses: Berhasil dikirim\n"
+        f"Waktu order: {esc(waktu)}</blockquote>\n\n"
+        "<i>Terima kasih telah menjadi bagian dari Hyper Family.</i>"
+    )
+
+
+async def _publish_public_testimonial(bot, order_id, *, manual=False):
+    """Best effort public receipt, independent of payment/delivery and admin routing.
+
+    An uncertain send stays claimed. Never retry a timeout or reset an order.
+    Existing review rows and schemas are retained for compatibility.
+    """
+    try:
+        channel_id, admin_channel, admin_link, order = await asyncio.gather(
+            get_setting('testimoni_channel_id'), get_setting('notif_channel_id'),
+            get_setting('link_admin', ADMIN_URL), get_order_by_id(order_id),
+        )
+        if not channel_id or not str(channel_id).strip():
+            return 'disabled'
+        target = int(channel_id)
+        if target >= 0 or target == ADMIN_ID or str(target) == str(admin_channel or '').strip():
+            logger.warning('[PUBLIC TESTI] Channel publik harus berbeda dari tujuan notifikasi admin.')
+            return 'disabled'
+        if (not order or order.get('status') != 'completed' or order.get('delivery_status') != 'sent'
+                or not order.get('sent_link') or order['sent_link'] == 'pending'):
+            return 'not_ready'
+        paket = await get_product(order['paket_id']) or {'nama':'Produk','harga':0}
+        username = getattr(bot, 'username', None)
+        if not isinstance(username, str) or not re.fullmatch(r'[A-Za-z0-9_]+', username):
+            return 'not_ready'
+        text = _format_public_transaction(order, paket)
+        keyboard = InlineKeyboardMarkup([[
+            styled_button('🛒 Order Sekarang', style='success', url=f'https://t.me/{username}?start=order'),
+            styled_button('💬 Hubungi Admin', style='primary', url=admin_link or ADMIN_URL),
+        ]])
+        if not await run_db(_claim_public_testimonial_sync, order_id, manual):
+            return 'already'
+        try:
+            await telegram_send_rate_retry(
+                lambda: bot.send_message(chat_id=target, text=text, parse_mode='HTML',
+                                         reply_markup=keyboard, disable_web_page_preview=True,
+                                         **_telegram_background_options(bot)),
+                label='testimoni transaksi publik',
+            )
+        except asyncio.CancelledError:
+            # The durable publishing claim remains; reconciliation must be manual.
+            raise
+        except Exception as exc:
+            definite = isinstance(exc, (telegram.error.BadRequest, telegram.error.Forbidden, telegram.error.RetryAfter))
+            await run_db(_finish_public_testimonial_sync, order_id,
+                         'publish_failed' if definite else 'publish_uncertain')
+            logger.warning('[PUBLIC TESTI] Publikasi gagal: %s', type(exc).__name__)
+            return 'failed' if definite else 'uncertain'
+        try:
+            await run_db(_finish_public_testimonial_sync, order_id, 'approved')
+        except Exception as exc:
+            # Already sent: leaving publishing reserved is safer than a second post.
+            logger.warning('[PUBLIC TESTI] Terkirim; pencatatan belum pasti: %s', type(exc).__name__)
+        return 'sent'
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning('[PUBLIC TESTI] Tidak dapat mempublikasikan: %s', type(exc).__name__)
+        return 'failed'
 
 # =================== PRODUCT DB FUNCTIONS ===================
 
@@ -4281,12 +4386,10 @@ async def kirim_link_ke_buyer(context, user_id, paket, order_id, amount):
             f"- Total: {format_harga(amount)}\n\n"
             f"========================\n"
             f"{link_section}\n\n"
-            f"Terima kasih telah berbelanja! 🙏\n\n"
-            f"Bantu kami berkembang dengan memberikan ulasan di bawah ini:"
+            f"Terima kasih telah berbelanja di Hyper Family Store! 🙏"
         ),
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([
-            [styled_button("⭐ Beri Ulasan / Testimoni", style="primary", callback_data=f"rate_start|{order_id}")],
             [styled_button("💬 Chat Admin", style="primary", url=await get_setting('link_admin', ADMIN_URL))]
         ])
     )
@@ -4521,7 +4624,19 @@ async def _event_loop_lag_monitor():
 async def _prewarm_hot_settings():
     defaults = _menu_setting_defaults()
     defaults.update(notif_channel_id='', testimoni_channel_id='')
-    await get_settings(defaults)
+    settings = await get_settings(defaults)
+    target = str(settings.get('testimoni_channel_id') or '').strip()
+    if not target:
+        status = 'not_configured'
+    else:
+        try:
+            target_id = int(target)
+            status = 'configured' if target_id < 0 else 'invalid_destination'
+            if target_id == ADMIN_ID or str(target_id) == str(settings.get('notif_channel_id') or '').strip():
+                status = 'conflicts_with_private_admin'
+        except ValueError:
+            status = 'invalid_destination'
+    logger.info('[PUBLIC TESTI] destination=%s', status)
 
 async def _post_init_warmup(application: Application):
     """Warmup non-kritis dipisahkan agar polling bisa menerima /start lebih cepat."""
@@ -5985,13 +6100,10 @@ async def _send_buyer_product_link(bot, user_id: int, order_id: str, paket: dict
             f"🔖 <b>Order ID</b>\n"
             f"<code>{esc(order_id)}</code>\n\n"
             f"{link_section}\n\n"
-            f"Terima kasih telah berbelanja! 🙏\n\n"
-            f"Bantu kami berkembang dengan memberikan ulasan di bawah ini:"
+            f"Terima kasih telah berbelanja di Hyper Family Store! 🙏"
         ),
         parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([
-                [styled_button("⭐ Beri Ulasan / Testimoni", style="primary", callback_data=f"rate_start|{order_id}")]
-            ])
+            reply_markup=None
         ),
         label=f"kirim link buyer {order_id}",
     )
@@ -6233,6 +6345,9 @@ async def _process_completed_order_delivery(bot, order_id: str, paket_id: str, u
             name=f"delivery-failed-alert-{order_id}"
         )
 
+    if kirim_berhasil:
+        spawn_background(_publish_public_testimonial(bot, order_id), name=f'public-testi-{order_id}')
+
     async def _finalize_after_buyer():
         await hapus_notif_lama(bot, order_id)
         extra_paid = "🔗 Link produk berhasil dikirim ✅" if kirim_berhasil else "⚠️ Link gagal dikirim — cek manual"
@@ -6326,6 +6441,7 @@ async def _auto_deliver_pending_prereq_orders(bot, user_id: int, user_name: str,
             continue
 
         await _retain_delivery_result(oid, link)
+        spawn_background(_publish_public_testimonial(bot, oid), name=f'public-testi-{oid}')
         if old_notice_id:
             await _safe_delete_chat_message(
                 bot, user_id, old_notice_id, "pesan update syarat lama"
@@ -6387,13 +6503,10 @@ async def admin_kirim_link_prereq(update: Update, context: ContextTypes.DEFAULT_
                 f"🔖 Order ID: <code>{esc(order_id)}</code>\n\n"
                 f"========================\n"
                 f"{link_section}\n\n"
-                f"Terima kasih telah memenuhi syarat! Nikmati paketmu. 🙏\n\n"
-                f"Bantu kami berkembang dengan memberikan ulasan:"
+                f"Terima kasih telah memenuhi syarat! Nikmati paketmu. 🙏"
             ),
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([
-                [styled_button("⭐ Beri Ulasan / Testimoni", style="primary", callback_data=f"rate_start|{order_id}")]
-            ])
+            reply_markup=None
         )
         kirim_berhasil = True
     except Exception as e:
@@ -6402,6 +6515,7 @@ async def admin_kirim_link_prereq(update: Update, context: ContextTypes.DEFAULT_
 
     if kirim_berhasil:
         await _retain_delivery_result(order_id, link)
+        spawn_background(_publish_public_testimonial(context.bot, order_id), name=f'public-testi-{order_id}')
         if msg and getattr(msg, 'message_id', None):
             try:
                 await set_buyer_msg_id(order_id, msg.message_id)
@@ -6469,116 +6583,22 @@ async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 # =================== USER: TESTIMONI HANDLERS ===================
 
+async def _legacy_review_notice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop('awaiting_review_text', None)
+    context.user_data.pop('temp_rating', None)
+    await _fast_callback_ack(update.callback_query)
+    await _callback_feedback(update.callback_query, context,
+        'Testimoni transaksi kini dipublikasikan otomatis setelah akses berhasil dikirim. '
+        'Kamu tidak perlu mengisi rating atau ulasan.')
+
 async def handle_rate_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    order_id = query.data.split("|")[1]
-    order = await get_completed_order_for_user(order_id, query.from_user.id)
-    if not order:
-        await query.edit_message_text("⚠️ Pesanan tidak ditemukan atau bukan milik kamu.")
-        return
-
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("⭐ 1", callback_data=f"rate_val|1|{order_id}"),
-            InlineKeyboardButton("⭐ 2", callback_data=f"rate_val|2|{order_id}"),
-            InlineKeyboardButton("⭐ 3", callback_data=f"rate_val|3|{order_id}"),
-            InlineKeyboardButton("⭐ 4", callback_data=f"rate_val|4|{order_id}"),
-            InlineKeyboardButton("⭐ 5", callback_data=f"rate_val|5|{order_id}"),
-        ],
-        [InlineKeyboardButton("⬅️ Kembali (Lihat Link)", callback_data=f"rate_back|{order_id}")],
-        [InlineKeyboardButton("❌ Lewati", callback_data="rate_skip")]
-    ])
-
-    await query.edit_message_text(
-        "<b>⭐ PENILAIAN PELAYANAN TOKO</b>\n"
-        "========================\n\n"
-        "Masukan Anda membantu kami meningkatkan kualitas pelayanan.\n"
-        "Silakan pilih bintang penilaian Anda:",
-        parse_mode="HTML",
-        reply_markup=keyboard
-    )
+    return await _legacy_review_notice(update, context)
 
 async def handle_rate_val(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    parts = query.data.split("|")
-    rating = int(parts[1])
-    order_id = parts[2]
-
-    order = await get_completed_order_for_user(order_id, query.from_user.id)
-    if not order:
-        await query.edit_message_text("⚠️ Pesanan tidak ditemukan atau bukan milik kamu.")
-        return
-
-    context.user_data['temp_rating'] = {'order_id': order_id, 'rating': rating}
-    context.user_data['awaiting_review_text'] = True
-
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("⏩ Kirim Rating Saja (Tanpa Teks)", callback_data=f"rate_text_skip|{order_id}")],
-        [InlineKeyboardButton("⬅️ Kembali Pilih Bintang", callback_data=f"rate_back_stars|{order_id}")],
-        [InlineKeyboardButton("🔗 Lihat Link Lagi", callback_data=f"rate_back|{order_id}")]
-    ])
-
-    await query.edit_message_text(
-        f"Anda memilih rating: {'⭐' * rating}\n\n"
-        "Silakan ketik dan kirimkan ulasan singkat Anda.\n"
-        "Atau tekan tombol di bawah jika tidak ingin menulis teks:",
-        reply_markup=keyboard
-    )
+    return await _legacy_review_notice(update, context)
 
 async def handle_rate_text_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    order_id = query.data.split("|")[1]
-    temp = context.user_data.pop('temp_rating', None)
-    context.user_data.pop('awaiting_review_text', None)
-
-    if not temp:
-        await query.edit_message_text("⚠️ Terjadi kesalahan sesi. Silakan ulangi.")
-        return
-
-    rating = temp['rating']
-    review_text = "Tidak ada ulasan tertulis."
-
-    order = await get_completed_order_for_user(order_id, query.from_user.id)
-    if not order:
-        await query.edit_message_text("⚠️ Pesanan tidak ditemukan atau bukan milik kamu.")
-        return
-    paket_id_testi = order['paket_id']
-    paket = await get_product(paket_id_testi)
-    paket_nama = paket['nama'] if paket else "Produk"
-    paket_emoji = paket['emoji'] if paket else "📦"
-
-    await save_testimonial(query.from_user.id, query.from_user.full_name, paket_id_testi, order_id, rating, review_text)
-
-    moderation_text = (
-        f"📩 <b>MODERASI TESTIMONI BARU</b>\n"
-        f"========================\n\n"
-        f"👤 Buyer: {esc(query.from_user.full_name)} (<code>{query.from_user.id}</code>)\n"
-        f"📦 Paket: {esc(paket_emoji)} {esc(paket_nama)}\n"
-        f"📊 Rating: {'⭐' * rating}\n"
-        f"💬 Ulasan: <i>\"{esc(review_text)}\"</i>\n\n"
-        f"========================\n"
-        f"Pilih tindakan untuk persetujuan publikasi:"
-    )
-
-    keyboard = InlineKeyboardMarkup([
-        [
-            styled_button("✅ Setujui & Posting", style="success", callback_data=f"adm_testi_approve|{order_id}"),
-            styled_button("❌ Tolak", style="danger", callback_data=f"adm_testi_reject|{order_id}")
-        ]
-    ])
-
-    try:
-        await context.bot.send_message(chat_id=ADMIN_ID, text=moderation_text, parse_mode="HTML", reply_markup=keyboard)
-    except Exception as e:
-        logger.error(f"Gagal mengirim notif moderasi ke admin: {e}")
-
-    await query.edit_message_text("🙏 Terima kasih banyak! Penilaian Anda telah dikirim dan menunggu peninjauan admin.")
+    return await _legacy_review_notice(update, context)
 
 async def handle_rate_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -6632,40 +6652,11 @@ async def handle_rate_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{link_section}\n\n"
         f"Terima kasih telah berbelanja! 🙏",
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([
-            [styled_button("⭐ Beri Ulasan / Testimoni", style="primary", callback_data=f"rate_start|{order_id}")]
-        ])
+        reply_markup=None
     )
 
 async def handle_rate_back_stars(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    order_id = query.data.split("|")[1]
-
-    context.user_data.pop('awaiting_review_text', None)
-    context.user_data.pop('temp_rating', None)
-
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("⭐ 1", callback_data=f"rate_val|1|{order_id}"),
-            InlineKeyboardButton("⭐ 2", callback_data=f"rate_val|2|{order_id}"),
-            InlineKeyboardButton("⭐ 3", callback_data=f"rate_val|3|{order_id}"),
-            InlineKeyboardButton("⭐ 4", callback_data=f"rate_val|4|{order_id}"),
-            InlineKeyboardButton("⭐ 5", callback_data=f"rate_val|5|{order_id}"),
-        ],
-        [InlineKeyboardButton("⬅️ Kembali (Lihat Link)", callback_data=f"rate_back|{order_id}")],
-        [InlineKeyboardButton("❌ Lewati", callback_data="rate_skip")]
-    ])
-
-    await query.edit_message_text(
-        "<b>⭐ PENILAIAN PELAYANAN TOKO</b>\n"
-        "========================\n\n"
-        "Masukan Anda membantu kami meningkatkan kualitas pelayanan.\n"
-        "Silakan pilih bintang penilaian Anda:",
-        parse_mode="HTML",
-        reply_markup=keyboard
-    )
+    return await _legacy_review_notice(update, context)
 
 # =================== ADMIN: TESTIMONI MODERASI HANDLERS ===================
 
@@ -6680,59 +6671,17 @@ async def admin_testi_approve(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
     order_id = query.data.split("|")[1]
-    testi = await get_testimonial_by_order(order_id)
-    if not testi:
-        await query.edit_message_text("❌ Data ulasan tidak ditemukan di database.")
-        return
-
-    await update_testimonial_status(order_id, 'approved')
-
-    channel_id = await get_setting('testimoni_channel_id')
-    if not channel_id or channel_id.strip() == "":
-        await query.edit_message_text(
-            "✅ <b>Testimoni Disetujui</b>\n\n"
-            "⚠️ ID Channel Testimoni belum diset. Ulasan tersimpan di DB tapi tidak dikirim ke channel publik.",
-            parse_mode="HTML"
-        )
-        return
-
-    nama_sensor = samarkan_nama(testi['user_name'])
-    order = await get_order_by_id(order_id)
-    paket = await get_product(order['paket_id']) if order else None
-    paket_nama = paket['nama'] if paket else "Produk"
-    paket_emoji = paket['emoji'] if paket else "📦"
-
-    bintang_penuh = '⭐' * testi['rating']
-    bintang_kosong = '☆' * (5 - testi['rating'])
-
-    channel_msg = (
-        f"⭐ <b>TESTIMONI PELANGGAN</b>\n"
-        f"========================\n\n"
-        f"📦 <b>Produk:</b> {esc(paket_emoji)} {esc(paket_nama)}\n"
-        f"👤 <b>Pembeli:</b> {esc(nama_sensor)}\n"
-        f"🌟 <b>Rating:</b> {bintang_penuh}{bintang_kosong}  <b>{testi['rating']}/5</b>\n\n"
-        f"💬 <i>'{esc(testi['review'])}'</i>\n\n"
-        f"========================\n"
-        f"✅ <b>Transaksi Terverifikasi</b>\n"
-        f"🛒 Order otomatis via @{context.bot.username}"
-    )
-
+    result = await _publish_public_testimonial(context.bot, order_id, manual=True)
+    messages = {
+        'sent': '✅ Bukti transaksi berhasil dipublikasikan tanpa nama atau username buyer.',
+        'already': 'ℹ️ Transaksi sudah dipublikasikan atau sedang dicatat. Tidak dikirim ulang.',
+        'disabled': '⚠️ Set channel testimoni publik yang berbeda dari notifikasi admin di Pengaturan.',
+        'not_ready': '⚠️ Bukti publik hanya untuk order lunas yang aksesnya sudah berhasil dikirim.',
+        'uncertain': '⚠️ Hasil kirim belum pasti. Periksa channel secara manual; jangan kirim ulang.',
+        'failed': '⚠️ Publikasi gagal. Periksa izin channel dan log; transaksi buyer tidak diubah.',
+    }
     back_kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali ke Panel", callback_data="admpanel_back")]])
-    try:
-        await context.bot.send_message(chat_id=int(channel_id), text=channel_msg, parse_mode="HTML")
-        await query.edit_message_text(
-            "✅ <b>Testimoni Disetujui</b>\n\nUlasan berhasil dipublikasikan ke channel testimoni.",
-            parse_mode="HTML",
-            reply_markup=back_kb
-        )
-    except Exception as e:
-        await query.edit_message_text(
-            f"⚠️ <b>Ulasan Disetujui di DB, tapi GAGAL dikirim ke Channel.</b>\n\n"
-            f"Error: <code>{esc(str(e))}</code>\n"
-            f"Pastikan bot sudah dijadikan Administrator di channel <code>{esc(channel_id)}</code>.",
-            parse_mode="HTML",
-            reply_markup=back_kb
-        )
+    await query.edit_message_text(messages[result], reply_markup=back_kb)
 
 @admin_callback
 async def admin_testi_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6745,6 +6694,10 @@ async def admin_testi_reject(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
     order_id = query.data.split("|")[1]
+    testi = await get_testimonial_by_order(order_id)
+    if not testi or testi.get('status') != 'pending':
+        await _callback_feedback(query, context, "Publikasi sudah diproses; statusnya tidak diubah.")
+        return
     await update_testimonial_status(order_id, 'rejected')
     await query.edit_message_text(
         "❌ <b>Testimoni Ditolak</b>\n\nUlasan dihapus dari antrean moderasi.",
@@ -8801,46 +8754,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if context.user_data.get('awaiting_review_text'):
         context.user_data.pop('awaiting_review_text', None)
-        temp = context.user_data.pop('temp_rating', None)
-
-        if not temp:
-            await update.message.reply_text("❌ Sesi pengisian ulasan kedaluwarsa. Silakan ulangi.")
-            return
-
-        rating = temp['rating']
-        order_id = temp['order_id']
-        order = await get_completed_order_for_user(order_id, user_id)
-        if not order:
-            await update.message.reply_text("❌ Pesanan tidak ditemukan atau bukan milik kamu.")
-            return
-
-        await save_testimonial(user_id, update.effective_user.full_name, order['paket_id'], order_id, rating, text)
-
-        paket = await get_product(order['paket_id']) or {"emoji": "📦", "nama": order['paket_id']}
-        moderation_text = (
-            f"📩 <b>MODERASI TESTIMONI BARU</b>\n"
-            f"========================\n\n"
-            f"👤 Buyer: {esc(update.effective_user.full_name)} (<code>{user_id}</code>)\n"
-            f"📦 Paket: {esc(paket['emoji'])} {esc(paket['nama'])}\n"
-            f"📊 Rating: {'⭐' * rating}\n"
-            f"💬 Ulasan: <i>\"{esc(text)}\"</i>\n\n"
-            f"========================\n"
-            f"Pilih tindakan untuk persetujuan publikasi:"
-        )
-
-        keyboard = InlineKeyboardMarkup([
-            [
-                styled_button("✅ Setujui & Posting", style="success", callback_data=f"adm_testi_approve|{order_id}"),
-                styled_button("❌ Tolak", style="danger", callback_data=f"adm_testi_reject|{order_id}")
-            ]
-        ])
-
-        try:
-            await context.bot.send_message(chat_id=ADMIN_ID, text=moderation_text, parse_mode="HTML", reply_markup=keyboard)
-        except Exception as e:
-            logger.error(f"Gagal mengirim notif moderasi ke admin: {e}")
-
-        await update.message.reply_text("🙏 Terima kasih banyak! Ulasan Anda telah berhasil dikirim dan saat ini sedang ditinjau oleh admin.")
+        context.user_data.pop('temp_rating', None)
+        await update.message.reply_text(
+            "Testimoni transaksi kini dipublikasikan otomatis setelah akses berhasil dikirim. "
+            "Kamu tidak perlu mengisi rating atau ulasan.")
         return
 
     if await is_admin(user_id, context):
@@ -9021,7 +8938,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 try:
                     await context.bot.send_message(
                         chat_id=int(val),
-                        text="⭐ <b>Uji Coba Channel Testimoni</b>\n\nKoneksi berhasil! Bot siap memposting ulasan dari pembeli ke channel ini.",
+                        text="💠 <b>Channel Testimoni Transaksi</b>\n\nKoneksi berhasil. Bukti transaksi dipublikasikan otomatis setelah pembayaran valid dan akses berhasil dikirim, tanpa nama atau username buyer.",
                         parse_mode="HTML"
                     )
                     await set_setting('testimoni_channel_id', val)
@@ -10075,7 +9992,7 @@ async def admpanel_setting(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "========================\n\n"
         "<b>📢 Channel Notifikasi Order</b>\n"
         f"{ch_status}\n\n"
-        "<b>⭐ Channel Testimoni Pembeli</b>\n"
+        "<b>💠 Channel Testimoni Transaksi Publik</b>\n"
         f"{testi_ch_status}\n\n"
         "<b>⚙️ Maintenance Mode</b>\n"
         f"{maint_status}\n\n"
@@ -10163,7 +10080,7 @@ async def admpanel_setting_testich_set(update: Update, context: ContextTypes.DEF
     await query.edit_message_text(
         "<b>✍️ SET CHANNEL TESTIMONI</b>\n"
         "========================\n\n"
-        "Ketik Channel ID tujuan ulasan testimoni:\n"
+        "Ketik Channel ID tujuan bukti transaksi publik (berbeda dari channel notifikasi admin):\n"
         "Contoh: <code>-1001234567890</code>\n\n"
         "Ketik <code>hapus</code> untuk menonaktifkan channel.",
         parse_mode="HTML",

@@ -1,0 +1,41 @@
+name: Public testimonial safety checks
+on:
+  push:
+    branches: [feat/public-transaction-testimonials]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  regressions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: test_user
+          POSTGRES_PASSWORD: disposable_ci_password
+          POSTGRES_DB: public_testi_ci
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U test_user -d public_testi_ci"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      NATIVE_TEST_DSN: postgresql://test_user:disposable_ci_password@127.0.0.1:5432/public_testi_ci
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.11.11'
+      - name: Install test dependencies
+        run: |
+          python -m pip install -r requirements-dev.txt
+          npm install --prefix ci/pgtest --ignore-scripts --no-audit --no-fund
+      - name: Prepare immutable regression fixtures
+        run: python tools/prepare_test_sources.py
+      - name: Run offline regressions and native PostgreSQL concurrency checks
+        run: |
+          export AUDIT_PGLITE_MODULE="$GITHUB_WORKSPACE/ci/pgtest/node_modules/@electric-sql/pglite"
+          python -m pytest -q tests --tb=short --junitxml=evidence/ci_results.xml

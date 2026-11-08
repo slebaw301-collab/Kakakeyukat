@@ -289,7 +289,7 @@ TOKEN = os.environ.get("BOT_TOKEN")
 _ADMIN_ID_RAW = os.environ.get("ADMIN_ID", "")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 APP_ENV = os.environ.get("APP_ENV") or os.environ.get("ENV") or "development"
-BOT_RELEASE = "2026-11-08-hyper-store-catalog-batch-v5"
+BOT_RELEASE = "2026-11-08-hyper-store-catalog-history-v6"
 
 # AutoGoPay gateway: GoPay utama, ShopeePay merchant sebagai cadangan.
 AUTOGOPAY_API_KEY = (os.environ.get("AUTOGOPAY_API_KEY") or "").strip()
@@ -4029,7 +4029,6 @@ _MENU_PHOTO_BASE64 = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAUDBAQEAwUEBAQFBQUGBwwIBw
 _MENU_PHOTO_FILE_ID = None
 _MENU_PHOTO_LOCK = None
 _catalog_photo_messages = OrderedDict()
-_CATALOG_BATCH_LIMIT = 5
 _MENU_PHOTO_SETTING = "main_menu_photo_" + hashlib.sha256(_MENU_PHOTO_BASE64.encode("ascii")).hexdigest()[:16]
 
 
@@ -4195,20 +4194,7 @@ async def _send_main_menu_photo(context, user_id, text, markup, *, reuse_recent=
         while len(_catalog_photo_messages)>4096:
             _catalog_photo_messages.popitem(last=False)
         logger.info('[CATALOG MEDIA] action=send source=%s identity=%s',source,_menu_photo_identity(msg))
-        # Rotate the entire previous batch only after the new photo succeeds.
-        catalog_ids = context.user_data.setdefault('_catalog_batch_ids', [])
-        if len(catalog_ids) >= _CATALOG_BATCH_LIMIT:
-            old_catalog_ids = tuple(catalog_ids)
-            catalog_ids.clear()
-
-            async def cleanup_catalog_batch():
-                await asyncio.gather(*(
-                    _safe_delete_chat_message(context.bot, user_id, message_id, 'katalog lama')
-                    for message_id in old_catalog_ids
-                ))
-
-            spawn_background(cleanup_catalog_batch(), name=f'cleanup-catalog-batch-{user_id}-{msg.message_id}')
-        catalog_ids.append(msg.message_id)
+        # Catalog photos remain in chat history, separate from temporary notices.
         context.user_data['_home_photo_id'] = msg.message_id
         context.user_data['_home_photo_at'] = _time.monotonic()
         await hapus_msg_user_lama(context, user_id, keep_last=0)

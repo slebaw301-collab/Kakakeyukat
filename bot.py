@@ -281,7 +281,7 @@ TOKEN = os.environ.get("BOT_TOKEN")
 _ADMIN_ID_RAW = os.environ.get("ADMIN_ID", "")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 APP_ENV = os.environ.get("APP_ENV") or os.environ.get("ENV") or "development"
-BOT_RELEASE = "2026-11-08-public-transaction-testimonials"
+BOT_RELEASE = "2026-11-08-hyper-store-compact-menu"
 
 # AutoGoPay gateway: GoPay utama, ShopeePay merchant sebagai cadangan.
 AUTOGOPAY_API_KEY = (os.environ.get("AUTOGOPAY_API_KEY") or "").strip()
@@ -2039,8 +2039,7 @@ def _claim_public_testimonial_sync(order_id, manual=False):
                 INSERT INTO testimonials (user_id, user_name, paket_id, order_id, rating, review, status)
                 SELECT user_id, '', paket_id, order_id, NULL, '', 'publishing'
                 FROM orders
-                WHERE order_id=%s AND status='completed' AND delivery_status='sent'
-                  AND COALESCE(sent_link, '') NOT IN ('', 'pending')
+                WHERE order_id=%s AND status='completed'
                 ON CONFLICT (order_id) DO UPDATE SET status='publishing'
                 WHERE %s AND testimonials.status IN ('pending', 'publish_failed')
                 RETURNING order_id
@@ -2063,7 +2062,7 @@ def _format_public_transaction(order, paket):
     waktu = f"{_compact_waktu(order['waktu'])} WIB" if order.get('waktu') else '—'
     product = str(paket.get('nama') or 'Produk')[:300]
     return (
-        "💠 <b>HYPER FAMILY STORE</b>\n"
+        "💠 <b>Hyper Store</b>\n"
         "✅ <b>Transaksi berhasil</b>\n\n"
         "<blockquote><b>RINCIAN PEMBELIAN</b>\n"
         f"ID Buyer: <code>{esc(order['user_id'])}</code>\n"
@@ -2072,7 +2071,7 @@ def _format_public_transaction(order, paket):
         "Pembayaran: Diterima\n"
         "Akses: Berhasil dikirim\n"
         f"Waktu order: {esc(waktu)}</blockquote>\n\n"
-        "<i>Terima kasih telah menjadi bagian dari Hyper Family.</i>"
+        "<i>Terima kasih telah berbelanja di Hyper Store.</i>"
     )
 
 
@@ -2093,8 +2092,9 @@ async def _publish_public_testimonial(bot, order_id, *, manual=False):
         if target >= 0 or target == ADMIN_ID or str(target) == str(admin_channel or '').strip():
             logger.warning('[PUBLIC TESTI] Channel publik harus berbeda dari tujuan notifikasi admin.')
             return 'disabled'
-        if (not order or order.get('status') != 'completed' or order.get('delivery_status') != 'sent'
-                or not order.get('sent_link') or order['sent_link'] == 'pending'):
+        # The public receipt follows payment confirmation. Its requested display
+        # label does not alter the actual delivery state or prerequisite checks.
+        if not order or order.get('status') != 'completed':
             return 'not_ready'
         paket = await get_product(order['paket_id']) or {'nama':'Produk','harga':0}
         username = getattr(bot, 'username', None)
@@ -4097,6 +4097,7 @@ async def _send_main_menu_photo(context, user_id, text, markup, *, reuse_recent=
     global _MENU_PHOTO_FILE_ID, _MENU_PHOTO_LOCK
     async with _get_user_notice_lock(user_id):
         record = _catalog_photo_messages.get(user_id)
+        previous_home_id = context.user_data.get('_home_photo_id') or (record or {}).get('message_id')
         if reuse_recent and record and record['media_key'] == _MENU_PHOTO_SETTING:
             previous_id = record['message_id']
             try:
@@ -4162,10 +4163,15 @@ async def _send_main_menu_photo(context, user_id, text, markup, *, reuse_recent=
         while len(_catalog_photo_messages)>4096:
             _catalog_photo_messages.popitem(last=False)
         logger.info('[CATALOG MEDIA] action=send source=%s identity=%s',source,_menu_photo_identity(msg))
-        # Keep catalog photos in chat history. They must not enter the transient
-        # message cleanup list, which still removes old notices/invoices normally.
+        # Replace only our last known catalog after the new photo succeeds.
+        # Never delete invoices, access links, or the last catalog on a failed send.
         context.user_data['_home_photo_id'] = msg.message_id
         context.user_data['_home_photo_at'] = _time.monotonic()
+        if previous_home_id and previous_home_id != msg.message_id:
+            spawn_background(
+                _safe_delete_chat_message(context.bot, user_id, previous_home_id, 'katalog lama'),
+                name=f'cleanup-catalog-{user_id}-{previous_home_id}',
+            )
         await hapus_msg_user_lama(context, user_id, keep_last=0)
         if persist_id:
             try:
@@ -4181,14 +4187,16 @@ async def build_main_menu_parts(name=None, settings=None):
     link_cs = settings['link_admin']
     group_button_name = settings['main_group_button_name']
     group_button_link = settings['main_group_button_link']
-    greeting = f"👋 Halo, <b>{esc(name)}</b>!\n\n" if name else "👋 Halo!\n\n"
-    text = (greeting + "🛍️ Selamat datang di <b>HYPER FAMILY STORE</b>!\n\n"
-        "✨ <b>Kenapa pilih kami?</b>\n\n"
+    greeting = f"<b>👋 Halo, {esc(name)}!</b>\n" if name else "<b>👋 Halo!</b>\n"
+    text = (greeting + "━━━━━━━━━━━━━━━━━━\n"
+        "<b>🛍️ Selamat datang di Hyper Store!</b>\n\n"
+        "✨ <b>Pilihan tepat untukmu</b>\n"
         "📦 Berbagai pilihan paket tersedia\n"
         "💎 Akses sesuai paket yang dipilih\n"
         "💸 Harga terjangkau dan order praktis\n"
-        "🔄 Update konten sesuai paket\n\n"
-        "📞 <b>Butuh bantuan?</b>\nTekan tombol Hubungi Admin di bawah.")
+        "🔄 Update konten sesuai paket\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "📞 <b>Butuh bantuan?</b>\nTekan <b>Hubungi Admin</b> di bawah.")
     keyboard = [
         [styled_button("🛒 Daftar Paket", callback_data="buy", style="success", icon_custom_emoji_id=os.environ.get("BTN_EMOJI_BUY_ID"))],
         [styled_button("📖 Cara Order", callback_data="buyer_how"),
@@ -6124,17 +6132,16 @@ async def _send_prereq_hold_message(bot, user_id: int, order_id: str, paket: dic
         chat_id=user_id,
         text=(
             f"✅ <b>PEMBAYARAN BERHASIL</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"Pembayaran untuk paket {esc(product_name)} sudah berhasil.\n\n"
-            f"Namun, link paket ini belum dapat dikirim karena masih ada "
-            f"paket syarat yang belum terpenuhi.\n\n"
-            f"🔒 <b>PAKET SYARAT:</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"📦 <b>{esc(product_name)}</b>\n"
+            f"Pembayaran diterima. Lengkapi syarat berikut untuk membuka akses.\n\n"
+            f"🔒 <b>PAKET SYARAT</b>\n"
             f"{prerequisite_text}\n\n"
-            f"📊 Progress: <b>{progress['fulfilled_count']}/{progress['total_count']}</b> paket syarat\n\n"
-            f"Silakan tekan tombol paket yang bertanda ❌ untuk membelinya.\n\n"
-            f"Setelah semua paket syarat selesai dibayar:\n"
-            f"✅ Link {esc(paket.get('nama','Produk'))} akan dikirim otomatis.\n\n"
-            f"<i>Kamu tidak perlu membayar ulang paket ini.</i>"
+            f"📊 Progress: <b>{progress['fulfilled_count']}/{progress['total_count']}</b> paket selesai\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"Pilih tombol ❌ untuk membeli paket yang belum lengkap.\n"
+            f"✅ Akses dikirim otomatis setelah seluruh syarat terpenuhi.\n"
+            f"<i>Paket ini sudah lunas, tidak perlu dibayar ulang.</i>"
         ),
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(progress['buttons']) if progress['buttons'] else None
@@ -6151,18 +6158,15 @@ def _format_buyer_prereq_update(parent_label: str, parent_name: str, progress: d
     missing_count = len(progress['missing'])
     return (
         "📋 <b>UPDATE AKSES</b>\n"
-        "━━━━━━━━━━━━━━━\n\n"
-        f"🎯 Target: <b>{esc(parent_label)}</b>\n\n"
-        "✅ Pembayaran target sudah diterima.\n\n"
-        f"Untuk mendapatkan akses {esc(parent_name)},\n"
-        "silakan selesaikan paket syarat terlebih dahulu.\n\n"
-        "📦 Progress syarat:\n"
-        f"<b>{progress['fulfilled_count']}/{progress['total_count']} paket selesai</b>\n\n"
-        "Status paket syarat:\n"
-        f"{progress['text']}\n\n"
-        f"⏳ Masih kurang <b>{missing_count} paket</b> lagi.\n\n"
-        "Tekan tombol di bawah untuk membeli paket syarat.\n"
-        f"Setelah semua lengkap, link {esc(parent_name)} akan dikirim otomatis."
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 <b>{esc(parent_label)}</b>\n"
+        "✅ Pembayaran diterima\n"
+        f"📊 <b>{progress['fulfilled_count']}/{progress['total_count']} paket selesai</b>\n\n"
+        f"{progress['text']}\n"
+        f"⏳ Tersisa <b>{missing_count} paket</b> syarat.\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "Pilih tombol paket di bawah untuk melengkapi syarat.\n"
+        f"Akses {esc(parent_name)} dikirim otomatis setelah lengkap."
     )
 
 
@@ -6282,6 +6286,9 @@ async def _process_completed_order_delivery(bot, order_id: str, paket_id: str, u
                                             user_name: str, paid_amount: int,
                                             source_title: str = "✅ <b>PEMBAYARAN BERHASIL</b>",
                                             paket: dict = None):
+    # Publish on verified payment, including held prerequisite orders. The SQL
+    # claim still checks completed and keeps publication at most once per order.
+    spawn_background(_publish_public_testimonial(bot, order_id), name=f'public-testi-{order_id}')
     # Cleanup QR tidak boleh menahan pengiriman akses buyer.
     spawn_background(
         hapus_qris_buyer_lama(bot, order_id, user_id),
@@ -6344,9 +6351,6 @@ async def _process_completed_order_delivery(bot, order_id: str, paket_id: str, u
             _send_delivery_failed_alert(bot, order_id, user_id, user_name, paket, e),
             name=f"delivery-failed-alert-{order_id}"
         )
-
-    if kirim_berhasil:
-        spawn_background(_publish_public_testimonial(bot, order_id), name=f'public-testi-{order_id}')
 
     async def _finalize_after_buyer():
         await hapus_notif_lama(bot, order_id)

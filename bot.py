@@ -289,7 +289,7 @@ TOKEN = os.environ.get("BOT_TOKEN")
 _ADMIN_ID_RAW = os.environ.get("ADMIN_ID", "")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 APP_ENV = os.environ.get("APP_ENV") or os.environ.get("ENV") or "development"
-BOT_RELEASE = "2026-11-08-hyper-store-product-preview-v4"
+BOT_RELEASE = "2026-11-08-hyper-store-catalog-batch-v5"
 
 # AutoGoPay gateway: GoPay utama, ShopeePay merchant sebagai cadangan.
 AUTOGOPAY_API_KEY = (os.environ.get("AUTOGOPAY_API_KEY") or "").strip()
@@ -4029,6 +4029,7 @@ _MENU_PHOTO_BASE64 = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAUDBAQEAwUEBAQFBQUGBwwIBw
 _MENU_PHOTO_FILE_ID = None
 _MENU_PHOTO_LOCK = None
 _catalog_photo_messages = OrderedDict()
+_CATALOG_BATCH_LIMIT = 5
 _MENU_PHOTO_SETTING = "main_menu_photo_" + hashlib.sha256(_MENU_PHOTO_BASE64.encode("ascii")).hexdigest()[:16]
 
 
@@ -4125,14 +4126,11 @@ async def _render_buyer_menu(query, text, reply_markup):
     finally:
         _record_latency('buyer-menu-render', _time.monotonic() - started)
 
-async def _send_main_menu_photo(context, user_id, text, markup, *, reuse_recent=False,
-                                photo_id=None, start_message_id=None):
+async def _send_main_menu_photo(context, user_id, text, markup, *, reuse_recent=False, photo_id=None):
     global _MENU_PHOTO_FILE_ID, _MENU_PHOTO_LOCK
     async with _get_user_notice_lock(user_id):
         record = _catalog_photo_messages.get(user_id)
-        previous_home_id = context.user_data.get('_home_photo_id') or (record or {}).get('message_id')
-        if (reuse_recent and record and record['media_key'] == _MENU_PHOTO_SETTING
-                and (start_message_id is None or 0 < start_message_id - record['message_id'] <= 8)):
+        if reuse_recent and record and record['media_key'] == _MENU_PHOTO_SETTING:
             previous_id = record['message_id']
             try:
                 msg = await context.bot.edit_message_caption(chat_id=user_id, message_id=previous_id,
@@ -4197,15 +4195,22 @@ async def _send_main_menu_photo(context, user_id, text, markup, *, reuse_recent=
         while len(_catalog_photo_messages)>4096:
             _catalog_photo_messages.popitem(last=False)
         logger.info('[CATALOG MEDIA] action=send source=%s identity=%s',source,_menu_photo_identity(msg))
-        # Replace only our last known catalog after the new photo succeeds.
-        # Never delete invoices, access links, or the last catalog on a failed send.
+        # Rotate the entire previous batch only after the new photo succeeds.
+        catalog_ids = context.user_data.setdefault('_catalog_batch_ids', [])
+        if len(catalog_ids) >= _CATALOG_BATCH_LIMIT:
+            old_catalog_ids = tuple(catalog_ids)
+            catalog_ids.clear()
+
+            async def cleanup_catalog_batch():
+                await asyncio.gather(*(
+                    _safe_delete_chat_message(context.bot, user_id, message_id, 'katalog lama')
+                    for message_id in old_catalog_ids
+                ))
+
+            spawn_background(cleanup_catalog_batch(), name=f'cleanup-catalog-batch-{user_id}-{msg.message_id}')
+        catalog_ids.append(msg.message_id)
         context.user_data['_home_photo_id'] = msg.message_id
         context.user_data['_home_photo_at'] = _time.monotonic()
-        if previous_home_id and previous_home_id != msg.message_id:
-            spawn_background(
-                _safe_delete_chat_message(context.bot, user_id, previous_home_id, 'katalog lama'),
-                name=f'cleanup-catalog-{user_id}-{previous_home_id}',
-            )
         await hapus_msg_user_lama(context, user_id, keep_last=0)
         if persist_id:
             try:
@@ -4941,22 +4946,11 @@ async def _start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, tra
     menu_text, menu_keyboard = await build_main_menu_parts(update.effective_user.full_name, settings=settings)
     if trace:
         trace.mark("menu-built")
-    # Edit a nearby catalog in place. Replace one that is missing or far up the chat.
-    start_message_id = getattr(update.message, 'message_id', None)
-    menu = await _send_main_menu_photo(
+    # Every /start opens a fresh catalog at the bottom using the cached photo.
+    await _send_main_menu_photo(
         context, user_id, menu_text, InlineKeyboardMarkup(menu_keyboard),
-        reuse_recent=start_message_id is not None,
-        photo_id=settings[_MENU_PHOTO_SETTING], start_message_id=start_message_id,
+        photo_id=settings[_MENU_PHOTO_SETTING],
     )
-    if menu is None:
-        # Telegram rejected an identical edit. Point /start back to the existing photo.
-        notice = await context.bot.send_message(
-            chat_id=user_id, text="🏠 Katalog sudah terbuka.",
-            reply_to_message_id=context.user_data['_home_photo_id'],
-            allow_sending_without_reply=True,
-        )
-        simpan_msg_user(context, user_id, notice.message_id)
-        await hapus_msg_user_lama(context, user_id, keep_last=1)
     if trace:
         trace.mark("menu-send")
 

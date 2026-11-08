@@ -281,7 +281,7 @@ TOKEN = os.environ.get("BOT_TOKEN")
 _ADMIN_ID_RAW = os.environ.get("ADMIN_ID", "")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 APP_ENV = os.environ.get("APP_ENV") or os.environ.get("ENV") or "development"
-BOT_RELEASE = "2026-11-08-hyper-store-compact-menu"
+BOT_RELEASE = "2026-11-08-hyper-store-welcome-v3"
 
 # AutoGoPay gateway: GoPay utama, ShopeePay merchant sebagai cadangan.
 AUTOGOPAY_API_KEY = (os.environ.get("AUTOGOPAY_API_KEY") or "").strip()
@@ -4189,12 +4189,12 @@ async def build_main_menu_parts(name=None, settings=None):
     group_button_link = settings['main_group_button_link']
     greeting = f"<b>👋 Halo, {esc(name)}!</b>\n" if name else "<b>👋 Halo!</b>\n"
     text = (greeting + "━━━━━━━━━━━━━━━━━━\n"
-        "<b>🛍️ Selamat datang di Hyper Store!</b>\n\n"
-        "✨ <b>Pilihan tepat untukmu</b>\n"
-        "📦 Berbagai pilihan paket tersedia\n"
-        "💎 Akses sesuai paket yang dipilih\n"
-        "💸 Harga terjangkau dan order praktis\n"
-        "🔄 Update konten sesuai paket\n"
+        "<b>💋 Selamat datang di Hyper Store!</b>\n\n"
+        "✨ <b>Keunggulan Hyper Store:</b>\n"
+        " 📦 Berbagai pilihan paket tersedia\n"
+        " 💎 Akses sesuai paket yang dipilih\n"
+        " 💸 Harga terjangkau dan order praktis\n"
+        " 🎥 Update konten sesuai paket\n\n"
         "━━━━━━━━━━━━━━━━━━\n"
         "📞 <b>Butuh bantuan?</b>\nTekan <b>Hubungi Admin</b> di bawah.")
     keyboard = [

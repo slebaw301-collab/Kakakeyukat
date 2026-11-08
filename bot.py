@@ -224,6 +224,14 @@ def normalize_button_url(value):
     return val
 
 
+def normalize_product_preview_url(value):
+    """Accept a link to a specific public Telegram post."""
+    url = str(value or '').strip()
+    if re.fullmatch(r'https://t\.me/[A-Za-z][A-Za-z0-9_]{2,31}/[1-9][0-9]{0,18}(?:\?single)?', url, re.IGNORECASE):
+        return url
+    return None
+
+
 def tg_user_link(user_id, name: str = None) -> str:
     """Membuat nama buyer clickable ke profil Telegram."""
     display_name = esc(name or "Buyer")
@@ -281,7 +289,7 @@ TOKEN = os.environ.get("BOT_TOKEN")
 _ADMIN_ID_RAW = os.environ.get("ADMIN_ID", "")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 APP_ENV = os.environ.get("APP_ENV") or os.environ.get("ENV") or "development"
-BOT_RELEASE = "2026-11-08-hyper-store-welcome-v3"
+BOT_RELEASE = "2026-11-08-hyper-store-product-preview-v4"
 
 # AutoGoPay gateway: GoPay utama, ShopeePay merchant sebagai cadangan.
 AUTOGOPAY_API_KEY = (os.environ.get("AUTOGOPAY_API_KEY") or "").strip()
@@ -2148,6 +2156,13 @@ _products_cache_lock: asyncio.Lock = None
 _products_cache_generation = 0
 _buyer_products_view = None
 _settings_cache_versions: dict = {}
+_PRODUCT_PREVIEW_PREFIX = 'product_preview:'
+_PRODUCTS_WITH_PREVIEW_SQL = f"""
+    SELECT p.*, s.value AS preview_url
+    FROM products p
+    LEFT JOIN settings s ON s.key = '{_PRODUCT_PREVIEW_PREFIX}' || p.paket_id
+    ORDER BY p.harga ASC
+"""
 
 def _settings_cache_get(key):
     entry = _settings_cache.get(key)
@@ -2173,7 +2188,7 @@ def _settings_cache_del(key):
 def _load_all_products_sync():
     with db_session_safe() as conn:
         with conn.cursor() as c:
-            c.execute("SELECT * FROM products ORDER BY harga ASC")
+            c.execute(_PRODUCTS_WITH_PREVIEW_SQL)
             return [dict(r) for r in c.fetchall()]
 
 async def get_all_products():
@@ -2193,7 +2208,7 @@ async def get_all_products():
 
         while True:
             generation = _products_cache_generation
-            data, used_async = await _asyncpg_fetch("SELECT * FROM products ORDER BY harga ASC")
+            data, used_async = await _asyncpg_fetch(_PRODUCTS_WITH_PREVIEW_SQL)
             if not used_async:
                 data = await run_db(_load_all_products_sync)
             # Jika admin mengubah produk saat query berjalan, ulangi agar cache tidak berisi snapshot lama.
@@ -2268,6 +2283,22 @@ async def add_product(paket_id, nama, emoji, deskripsi, harga, link=None, group_
     _invalidate_products_cache()
 
 def _update_product_field_sync(paket_id, field, value):
+    if field == 'preview_url':
+        key = _PRODUCT_PREVIEW_PREFIX + paket_id
+        with db_session_safe() as conn:
+            with conn.cursor() as c:
+                c.execute("SELECT 1 FROM products WHERE paket_id=%s FOR UPDATE", (paket_id,))
+                if c.fetchone() is None:
+                    return False
+                if value is None:
+                    c.execute("DELETE FROM settings WHERE key=%s", (key,))
+                else:
+                    c.execute(
+                        """INSERT INTO settings (key, value) VALUES (%s, %s)
+                           ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value""",
+                        (key, value),
+                    )
+        return True
     field_map = {
         "nama": "nama", "emoji": "emoji", "deskripsi": "deskripsi",
         "harga": "harga", "link": "link", "group_chat_id": "group_chat_id",
@@ -2292,6 +2323,7 @@ def _delete_product_sync(paket_id):
     with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("DELETE FROM products WHERE paket_id=%s", (paket_id,))
+            c.execute("DELETE FROM settings WHERE key=%s", (_PRODUCT_PREVIEW_PREFIX + paket_id,))
 
 async def delete_product(paket_id):
     await run_db_admin(_delete_product_sync, paket_id)
@@ -4093,12 +4125,14 @@ async def _render_buyer_menu(query, text, reply_markup):
     finally:
         _record_latency('buyer-menu-render', _time.monotonic() - started)
 
-async def _send_main_menu_photo(context, user_id, text, markup, *, reuse_recent=False, photo_id=None):
+async def _send_main_menu_photo(context, user_id, text, markup, *, reuse_recent=False,
+                                photo_id=None, start_message_id=None):
     global _MENU_PHOTO_FILE_ID, _MENU_PHOTO_LOCK
     async with _get_user_notice_lock(user_id):
         record = _catalog_photo_messages.get(user_id)
         previous_home_id = context.user_data.get('_home_photo_id') or (record or {}).get('message_id')
-        if reuse_recent and record and record['media_key'] == _MENU_PHOTO_SETTING:
+        if (reuse_recent and record and record['media_key'] == _MENU_PHOTO_SETTING
+                and (start_message_id is None or 0 < start_message_id - record['message_id'] <= 8)):
             previous_id = record['message_id']
             try:
                 msg = await context.bot.edit_message_caption(chat_id=user_id, message_id=previous_id,
@@ -4907,10 +4941,22 @@ async def _start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, tra
     menu_text, menu_keyboard = await build_main_menu_parts(update.effective_user.full_name, settings=settings)
     if trace:
         trace.mark("menu-built")
-    # An explicit /start must place a visible reply after the user's command.
-    # Reuse Telegram's file_id, not an older message that may be off-screen.
-    await _send_main_menu_photo(context, user_id, menu_text, InlineKeyboardMarkup(menu_keyboard),
-                               photo_id=settings[_MENU_PHOTO_SETTING])
+    # Edit a nearby catalog in place. Replace one that is missing or far up the chat.
+    start_message_id = getattr(update.message, 'message_id', None)
+    menu = await _send_main_menu_photo(
+        context, user_id, menu_text, InlineKeyboardMarkup(menu_keyboard),
+        reuse_recent=start_message_id is not None,
+        photo_id=settings[_MENU_PHOTO_SETTING], start_message_id=start_message_id,
+    )
+    if menu is None:
+        # Telegram rejected an identical edit. Point /start back to the existing photo.
+        notice = await context.bot.send_message(
+            chat_id=user_id, text="🏠 Katalog sudah terbuka.",
+            reply_to_message_id=context.user_data['_home_photo_id'],
+            allow_sending_without_reply=True,
+        )
+        simpan_msg_user(context, user_id, notice.message_id)
+        await hapus_msg_user_lama(context, user_id, keep_last=1)
     if trace:
         trace.mark("menu-send")
 
@@ -5047,10 +5093,15 @@ async def pilih_paket(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _callback_feedback(query, context, "❌ Produk tidak ditemukan.")
         return
 
-    status_text = "Tersedia" if paket.get('aktif', True) else "Tidak tersedia"
+    status_text = "🟢 Status: Tersedia" if paket.get('aktif', True) else "🔴 Status: Tidak tersedia"
     detail_desc = str(paket.get('deskripsi') or '-')
     if len(detail_desc) > 300:
         detail_desc = detail_desc[:297] + '...'
+    preview_url = normalize_product_preview_url(paket.get('preview_url'))
+    preview_line = (
+        f'👀 Preview: <b><a href="{esc(preview_url)}">Lihat Foto</a></b> 🔍\n'
+        if preview_url else ''
+    )
     text = (
         f"📦 <b>DETAIL PAKET</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -5058,7 +5109,9 @@ async def pilih_paket(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{esc(paket.get('emoji') or '📦')} Paket: <b>{esc(str(paket.get('nama') or 'Produk')[:60])}</b>\n"
         f"🎬 Isi: {esc(detail_desc)}\n"
         f"💰 Harga: <b>{format_harga(paket.get('harga', 0))}</b>\n"
-        f"♾️ Status: {status_text}"
+        f"♾️ Akses: <b>Permanen &amp; Bergaransi</b>\n"
+        f"{preview_line}"
+        f"{status_text}"
         f"</blockquote>\n"
     )
 
@@ -6757,6 +6810,7 @@ async def produk_detail(update: Update, context: ContextTypes.DEFAULT_TYPE, pake
         pass
 
     paket_id = paket_id or query.data.replace("pd_detail_", "")
+    context.user_data.pop('editing_product', None)
     p = await get_product(paket_id)
     if not p:
         await query.edit_message_text("⚠️ Produk tidak ditemukan.")
@@ -6781,6 +6835,7 @@ async def produk_detail(update: Update, context: ContextTypes.DEFAULT_TYPE, pake
         f"💰 Harga: {format_harga(p['harga'])}\n"
         f"📝 Deskripsi: {esc(p['deskripsi'])}\n"
         f"🔗 Link: <code>{esc(p['link'])}</code>\n"
+        f"👀 Link preview: <code>{esc(p.get('preview_url') or 'Belum diatur')}</code>\n"
         f"{grp_info}"
         f"{req_info}"
         f"📊 Status: {aktif_str}\n\n"
@@ -6801,6 +6856,7 @@ async def produk_detail(update: Update, context: ContextTypes.DEFAULT_TYPE, pake
             InlineKeyboardButton("🏢 Group ID",   callback_data=f"pd_edit_{paket_id}_group_chat_id"),
         ],
         [InlineKeyboardButton("🔒 Syarat (Prerequisite)", callback_data=f"pd_edit_{paket_id}_requires_paket_ids")],
+        [InlineKeyboardButton("👀 Edit Link Preview", callback_data=f"pd_edit_{paket_id}_preview_url")],
         [InlineKeyboardButton(
             "🔴 Nonaktifkan" if p.get('aktif', True) else "✅ Aktifkan",
             callback_data=f"pd_toggle_{paket_id}"
@@ -6929,7 +6985,7 @@ async def produk_edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     raw = query.data.replace("pd_edit_", "")
-    FIELDS = ["nama", "emoji", "harga", "deskripsi", "link", "group_chat_id", "requires_paket_ids"]
+    FIELDS = ["nama", "emoji", "harga", "deskripsi", "link", "group_chat_id", "requires_paket_ids", "preview_url"]
     field = None
     paket_id = None
     for f in FIELDS:
@@ -6957,6 +7013,7 @@ async def produk_edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "harga": "harga (angka saja, contoh: 15000)",
         "deskripsi": "deskripsi",
         "link": "link produk",
+        "preview_url": "link postingan preview publik (contoh: https://t.me/channelpreview/42, ketik 'hapus' untuk kosongkan)",
         "group_chat_id": "ID grup private (contoh: -1001234567890, ketik 'hapus' untuk kosongkan)",
     }
 
@@ -9154,16 +9211,28 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("❌ Harga harus berupa angka. Coba lagi:")
                 return
 
-            if field in ('group_chat_id', 'requires_paket_ids'):
+            if field == 'preview_url':
+                value = None if text.casefold() == 'hapus' else normalize_product_preview_url(text)
+                if value is None and text.casefold() != 'hapus':
+                    await update.message.reply_text(
+                        "❌ Kirim link postingan channel publik, misalnya https://t.me/channelpreview/42, "
+                        "atau ketik hapus untuk mengosongkan preview."
+                    )
+                    return
+            elif field in ('group_chat_id', 'requires_paket_ids'):
                 value = text.strip() if text.strip() and text.strip().lower() != 'hapus' else None
             else:
                 value = int(text) if field == 'harga' else text
 
-            await update_product_field(paket_id, field, value)
+            updated = await update_product_field(paket_id, field, value)
             context.user_data.pop('editing_product', None)
+            if not updated:
+                await update.message.reply_text("❌ Produk tidak ditemukan atau perubahan tidak dapat disimpan.")
+                return
 
+            field_label = "Link Preview" if field == 'preview_url' else field.capitalize()
             await update.message.reply_text(
-                f"✅ <b>{esc(field.capitalize())}</b> berhasil diupdate!\nNilai baru: <code>{esc(str(value) if value else '(kosong)')}</code>",
+                f"✅ <b>{esc(field_label)}</b> berhasil diupdate!\nNilai baru: <code>{esc(str(value) if value else '(kosong)')}</code>",
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("⬅️ Kembali ke Panel", callback_data="admpanel_back")

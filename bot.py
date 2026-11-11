@@ -3794,22 +3794,56 @@ def hitung_durasi(waktu_str):
         logger.debug(f"Gagal menghitung durasi: {e}")
         return waktu_str
 
-def _build_link_section(group_link: str, fallback_link: str) -> str:
-    if group_link:
-        return (
-            f"🔗 <b>Link Bergabung (Khusus Kamu)</b>\n"
-            f"{group_link}\n\n"
-            f"📋 <b>Cara gabung:</b>\n"
-            f"1. Klik link di atas\n"
-            f"2. Pencet <b>\"Minta Bergabung\"</b>\n"
-            f"3. Bot langsung <b>approve otomatis</b> ✅\n\n"
-            f"⚠️ <i>Jangan dishare ke orang lain!</i>"
-        )
-    return (
-        f"🔗 <b>Link Produk</b>\n"
-        f"{fallback_link}\n\n"
-        f"💾 <i>Simpan link ini. Produk dapat diakses kapan saja.</i>"
+def _buyer_access_url(link: str):
+    """Gunakan URL valid untuk inline button; bila tidak valid, tampilkan teks link."""
+    value = str(link or "").strip()
+    if value.lower().startswith(("t.me/", "telegram.me/")):
+        value = "https://" + value
+    return normalize_button_url(value)
+
+
+def _build_buyer_access_text(paket: dict, amount, group_link: str, link: str, *,
+                             title: str = "🎉 <b>PEMBELIAN BERHASIL!</b>") -> str:
+    """Format konsisten untuk akses yang benar-benar dikirim ke buyer."""
+    text = (
+        f"{title}\n"
+        "────────────────────\n\n"
+        "📦 <b>Detail Pembelian</b>\n\n"
+        f"📌 Paket : <b>{esc(paket.get('nama') or 'Produk')}</b>\n"
+        f"💰 Harga : <b>{format_harga(amount or 0)}</b>\n"
+        "✅ Status : <b>Berhasil</b>\n\n"
+        "────────────────────\n\n"
     )
+    if group_link:
+        text += (
+            "🔗 <b>Cara Bergabung</b>\n\n"
+            "1. Tekan tombol di bawah.\n"
+            "2. Pilih <b>Minta Bergabung</b>.\n"
+            "3. Bot akan menyetujui secara otomatis.\n\n"
+            "────────────────────\n\n"
+            "🔒 <i>Link ini khusus untuk kamu. Jangan dibagikan kepada orang lain!</i>"
+        )
+    else:
+        text += (
+            "🔗 <b>Akses Produk</b>\n\n"
+            "Tekan tombol di bawah untuk membuka produk."
+        )
+
+    if not _buyer_access_url(group_link or link):
+        # Fallback: jangan sampai buyer kehilangan akses untuk URL lama/nonstandar.
+        text += f"\n\n🔗 <b>Link Produk</b>\n{esc(link)}"
+    return text
+
+
+def _build_buyer_access_keyboard(group_link: str, link: str, *, extra_rows=None):
+    url = _buyer_access_url(group_link or link)
+    rows = []
+    if url:
+        label = "🔗 GABUNG GRUP VIP" if group_link else "🔗 BUKA PRODUK"
+        rows.append([styled_button(label, style="success", url=url)])
+    rows.extend(extra_rows or [])
+    return InlineKeyboardMarkup(rows) if rows else None
+
 
 # =================== GENERATE GROUP LINK ===================
 
@@ -4406,25 +4440,20 @@ async def _send_single_cooldown_notice(update: Update, context: ContextTypes.DEF
 async def kirim_link_ke_buyer(context, user_id, paket, order_id, amount):
     group_link = await generate_group_link(context.bot, paket, order_id)
     link = group_link or (paket.get("link") or DEFAULT_LINK)
-    link_section = _build_link_section(group_link, link)
 
     msg = await context.bot.send_message(
         chat_id=user_id,
-        text=(
-            f"<b>✅ PEMBAYARAN BERHASIL</b>\n"
-            f"========================\n\n"
-            f"📦 <b>Detail Pesanan</b>\n"
-            f"- Paket: {esc(paket['emoji'])} {esc(paket['nama'])}\n"
-            f"- Order ID: <code>{esc(order_id)}</code>\n"
-            f"- Total: {format_harga(amount)}\n\n"
-            f"========================\n"
-            f"{link_section}\n\n"
-            f"Terima kasih telah berbelanja di Hyper Family Store! 🙏"
-        ),
+        text=_build_buyer_access_text(paket, amount, group_link, link),
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([
-            [styled_button("💬 Chat Admin", style="primary", url=await get_setting('link_admin', ADMIN_URL))]
-        ])
+        reply_markup=_build_buyer_access_keyboard(
+            group_link, link,
+            extra_rows=[[
+                styled_button(
+                    "💬 Chat Admin", style="primary",
+                    url=await get_setting('link_admin', ADMIN_URL)
+                )
+            ]]
+        ),
     )
     simpan_msg_user(context, user_id, msg.message_id)
     await hapus_msg_user_lama(context, user_id, keep_last=2)
@@ -6127,24 +6156,20 @@ async def _send_delivery_failed_alert(bot, order_id: str, user_id: int, user_nam
 async def _send_buyer_product_link(bot, user_id: int, order_id: str, paket: dict, paid_amount: int, title: str) -> tuple:
     group_link = await generate_group_link(bot, paket, order_id)
     link = group_link or (paket.get("link") or DEFAULT_LINK)
-    link_section = _build_link_section(group_link, link)
+    buyer_title = (
+        "🔓 <b>AKSES PRODUK TERBUKA</b>"
+        if "AKSES PRODUK TERBUKA" in title
+        else "🎉 <b>PEMBELIAN BERHASIL!</b>"
+    )
 
     msg = await telegram_send_rate_retry(
         lambda: bot.send_message(
             chat_id=user_id,
-            text=(
-                f"{title}\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📦 <b>Produk</b>\n"
-            f"Paket : {esc(paket.get('emoji','📦'))} {esc(paket.get('nama','Produk'))}\n"
-            f"Total : {format_harga(paid_amount)}\n\n"
-            f"🔖 <b>Order ID</b>\n"
-            f"<code>{esc(order_id)}</code>\n\n"
-            f"{link_section}\n\n"
-            f"Terima kasih telah berbelanja di Hyper Family Store! 🙏"
-        ),
-        parse_mode="HTML",
-            reply_markup=None
+            text=_build_buyer_access_text(
+                paket, paid_amount, group_link, link, title=buyer_title
+            ),
+            parse_mode="HTML",
+            reply_markup=_build_buyer_access_keyboard(group_link, link),
         ),
         label=f"kirim link buyer {order_id}",
     )
@@ -6527,23 +6552,17 @@ async def admin_kirim_link_prereq(update: Update, context: ContextTypes.DEFAULT_
         return
     group_link = await generate_group_link(context.bot, paket, order_id)
     link = group_link or (paket.get("link") or DEFAULT_LINK)
-    link_section = _build_link_section(group_link, link)
 
     kirim_berhasil = False
     try:
         msg = await context.bot.send_message(
             chat_id=user_id,
-            text=(
-                f"<b>✅ LINK PRODUK KAMU SUDAH SIAP!</b>\n"
-                f"========================\n\n"
-                f"📦 Paket: {esc(paket['emoji'])} {esc(paket['nama'])}\n"
-                f"🔖 Order ID: <code>{esc(order_id)}</code>\n\n"
-                f"========================\n"
-                f"{link_section}\n\n"
-                f"Terima kasih telah memenuhi syarat! Nikmati paketmu. 🙏"
+            text=_build_buyer_access_text(
+                paket, order.get('harga_dibayar') or paket.get('harga', 0),
+                group_link, link, title="🔓 <b>AKSES PRODUK TERBUKA</b>"
             ),
             parse_mode="HTML",
-            reply_markup=None
+            reply_markup=_build_buyer_access_keyboard(group_link, link),
         )
         kirim_berhasil = True
     except Exception as e:
@@ -6649,7 +6668,6 @@ async def handle_rate_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     order_id = query.data.split("|")[1]
-
     context.user_data.pop('awaiting_review_text', None)
     context.user_data.pop('temp_rating', None)
 
@@ -6658,38 +6676,16 @@ async def handle_rate_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("⚠️ Data pesanan tidak ditemukan atau bukan milik kamu.")
         return
 
-    paket = await get_product(order['paket_id']) or {"emoji": "📦", "nama": "Produk", "harga": 0}
+    paket = await get_product(order['paket_id']) or {"nama": "Produk", "harga": 0}
     sent_link = order.get('sent_link') or DEFAULT_LINK
-
-    is_group_link = sent_link and "t.me/+" in sent_link
-    if is_group_link:
-        link_section = (
-            f"🔗 <b>Link Bergabung (Khusus Kamu)</b>\n"
-            f"{sent_link}\n\n"
-            f"📋 <b>Cara gabung:</b>\n"
-            f"1. Klik link di atas\n"
-            f"2. Pencet <b>\"Minta Bergabung\"</b>\n"
-            f"3. Bot langsung approve otomatis ✅\n\n"
-            f"⚠️ <i>Link ini sekali pakai, jangan dishare!</i>"
-        )
-    else:
-        link_section = (
-            f"🔗 <b>Link Produk</b>\n"
-            f"{sent_link}\n\n"
-            f"💾 <i>Simpan link ini. Produk dapat diakses kapan saja.</i>"
-        )
-
+    group_link = sent_link if ("t.me/+" in sent_link or "t.me/joinchat/" in sent_link) else None
     await query.edit_message_text(
-        f"<b>✅ PEMBAYARAN BERHASIL</b>\n"
-        f"========================\n\n"
-        f"📦 <b>Detail Pesanan</b>\n"
-        f"- Paket: {esc(paket['emoji'])} {esc(paket['nama'])}\n"
-        f"- Order ID: <code>{esc(order_id)}</code>\n\n"
-        f"========================\n"
-        f"{link_section}\n\n"
-        f"Terima kasih telah berbelanja! 🙏",
+        _build_buyer_access_text(
+            paket, order.get('harga_dibayar') or paket.get('harga', 0),
+            group_link, sent_link
+        ),
         parse_mode="HTML",
-        reply_markup=None
+        reply_markup=_build_buyer_access_keyboard(group_link, sent_link),
     )
 
 async def handle_rate_back_stars(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7943,10 +7939,13 @@ def get_resend_product(paket_id):
             return dict(row) if row else None
 
 
-def _resend_menu_keyboard():
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("🔄 Pilih Produk Lain", callback_data="resend_menu")
-    ]])
+def _resend_menu_keyboard(link=None, group_link=None):
+    return _build_buyer_access_keyboard(
+        group_link, link,
+        extra_rows=[[
+            InlineKeyboardButton("🔄 Pilih Produk Lain", callback_data="resend_menu")
+        ]]
+    )
 
 
 async def _resend_access_allowed(update, context):
@@ -8079,13 +8078,12 @@ async def resend_group_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
         await context.bot.send_message(
             chat_id=user_id,
-            text=(
-                "✅ <b>LINK PRODUK TERBARU</b>\n\n"
-                f"📦 {esc(paket.get('emoji') or '📦')} <b>{esc(paket.get('nama') or order['paket_id'])}</b>\n"
-                f"🔖 Order: <code>{esc(order['order_id'])}</code>\n\n"
-                f"{_build_link_section(esc(group_link) if group_link else None, esc(link))}"
+            text=_build_buyer_access_text(
+                paket, order.get('harga_dibayar') or paket.get('harga', 0),
+                group_link, link, title="🔄 <b>LINK PRODUK TERBARU</b>"
             ),
-            parse_mode="HTML", reply_markup=_resend_menu_keyboard()
+            parse_mode="HTML",
+            reply_markup=_resend_menu_keyboard(link, group_link),
         )
         context.user_data['_resend_last_sent'] = _time.monotonic()
         try:

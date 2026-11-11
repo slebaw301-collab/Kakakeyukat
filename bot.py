@@ -3808,18 +3808,18 @@ def _build_buyer_access_text(paket: dict, amount, group_link: str, link: str, *,
     separator = "━━━━━━━━━━━━━━━━━━━━━━"
     text = (
         f"{title}\n"
-        f"{separator}\n"
+        f"{separator}\n\n"
         f"📌 Paket : <b>{esc(paket.get('nama') or 'Produk')}</b>\n"
         f"💰 Harga : <b>{format_harga(amount or 0)}</b>\n"
         "✅ Status : <b>Berhasil</b>\n"
-        f"{separator}\n"
+        f"{separator}\n\n"
     )
     if group_link:
         text += (
             "🔗 <b>Cara Bergabung</b>\n"
             "1. Tekan tombol di bawah.\n"
             "2. Pilih <b>Minta Bergabung</b>.\n"
-            "3. Bot akan menyetujui otomatis.\n"
+            "3. Bot akan menyetujui otomatis.\n\n"
             f"{separator}\n"
             "🔒 <i>Link ini khusus untuk kamu. Jangan dibagikan kepada orang lain!</i>"
         )

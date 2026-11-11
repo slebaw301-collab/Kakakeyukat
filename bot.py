@@ -3804,34 +3804,34 @@ def _buyer_access_url(link: str):
 
 def _build_buyer_access_text(paket: dict, amount, group_link: str, link: str, *,
                              title: str = "🎉 <b>PEMBELIAN BERHASIL!</b>") -> str:
-    """Format konsisten untuk akses yang benar-benar dikirim ke buyer."""
+    """Format ringkas untuk akses buyer dengan URL fallback bila diperlukan."""
+    separator = "━━━━━━━━━━━━━━━━━━━━━━"
     text = (
         f"{title}\n"
-        "────────────────────\n\n"
-        "📦 <b>Detail Pembelian</b>\n\n"
+        f"{separator}\n"
         f"📌 Paket : <b>{esc(paket.get('nama') or 'Produk')}</b>\n"
         f"💰 Harga : <b>{format_harga(amount or 0)}</b>\n"
-        "✅ Status : <b>Berhasil</b>\n\n"
-        "────────────────────\n\n"
+        "✅ Status : <b>Berhasil</b>\n"
+        f"{separator}\n"
     )
     if group_link:
         text += (
-            "🔗 <b>Cara Bergabung</b>\n\n"
+            "🔗 <b>Cara Bergabung</b>\n"
             "1. Tekan tombol di bawah.\n"
             "2. Pilih <b>Minta Bergabung</b>.\n"
-            "3. Bot akan menyetujui secara otomatis.\n\n"
-            "────────────────────\n\n"
+            "3. Bot akan menyetujui otomatis.\n"
+            f"{separator}\n"
             "🔒 <i>Link ini khusus untuk kamu. Jangan dibagikan kepada orang lain!</i>"
         )
     else:
         text += (
-            "🔗 <b>Akses Produk</b>\n\n"
+            "🔗 <b>Akses Produk</b>\n"
             "Tekan tombol di bawah untuk membuka produk."
         )
 
     if not _buyer_access_url(group_link or link):
         # Fallback: jangan sampai buyer kehilangan akses untuk URL lama/nonstandar.
-        text += f"\n\n🔗 <b>Link Produk</b>\n{esc(link)}"
+        text += f"\n🔗 <b>Link Produk</b>\n{esc(link)}"
     return text
 
 
@@ -4454,6 +4454,7 @@ async def kirim_link_ke_buyer(context, user_id, paket, order_id, amount):
                 )
             ]]
         ),
+        protect_content=True,
     )
     simpan_msg_user(context, user_id, msg.message_id)
     await hapus_msg_user_lama(context, user_id, keep_last=2)
@@ -6170,6 +6171,7 @@ async def _send_buyer_product_link(bot, user_id: int, order_id: str, paket: dict
             ),
             parse_mode="HTML",
             reply_markup=_build_buyer_access_keyboard(group_link, link),
+            protect_content=True,
         ),
         label=f"kirim link buyer {order_id}",
     )

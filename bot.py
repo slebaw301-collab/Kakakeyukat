@@ -5619,7 +5619,8 @@ async def cancel_order_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                     f"Beli paket ❌ di bawah untuk melanjutkan. 👇"
                 ),
                 parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup(buy_buttons)
+                reply_markup=InlineKeyboardMarkup(buy_buttons),
+                protect_content=True,
             )
             simpan_msg_user(context, user_id, msg.message_id)
             await hapus_msg_user_lama(context, user_id, keep_last=1)
@@ -6204,7 +6205,8 @@ async def _send_prereq_hold_message(bot, user_id: int, order_id: str, paket: dic
             f"<i>Paket ini sudah lunas, tidak perlu dibayar ulang.</i>"
         ),
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(progress['buttons']) if progress['buttons'] else None
+        reply_markup=InlineKeyboardMarkup(progress['buttons']) if progress['buttons'] else None,
+        protect_content=True,
     )
     # Simpan ID pesan hold agar update berikutnya mengedit pesan yang sama,
     # bukan mengirim pesan baru yang menumpuk di chat buyer.
@@ -6263,6 +6265,7 @@ async def _edit_or_send_buyer_prereq_update(bot, user_id: int, parent_order: dic
             text=text,
             parse_mode="HTML",
             reply_markup=reply_markup,
+            protect_content=True,
         )
         try:
             await set_buyer_msg_id(parent_order['order_id'], msg.message_id)
@@ -6565,6 +6568,7 @@ async def admin_kirim_link_prereq(update: Update, context: ContextTypes.DEFAULT_
             ),
             parse_mode="HTML",
             reply_markup=_build_buyer_access_keyboard(group_link, link),
+            protect_content=True,
         )
         kirim_berhasil = True
     except Exception as e:
@@ -8086,6 +8090,7 @@ async def resend_group_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ),
             parse_mode="HTML",
             reply_markup=_resend_menu_keyboard(link, group_link),
+            protect_content=True,
         )
         context.user_data['_resend_last_sent'] = _time.monotonic()
         try:

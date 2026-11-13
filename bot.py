@@ -4973,6 +4973,8 @@ async def _start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, tra
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Wrapper tracing untuk mengukur delay /start tanpa mengubah alur bisnis."""
+    if context.args and context.args[0] == 'claim_free':
+        return await _claim_free.show(update, context)
     trace = PerfTrace(
         "start",
         user_id=getattr(getattr(update, "effective_user", None), "id", "-"),
@@ -6613,6 +6615,8 @@ def _check_join_request_sync(user_id, chat_id):
             return c.fetchone()
 
 async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await _claim_free.join_request(update, context):
+        return
     join_req = update.chat_join_request
     if not join_req:
         return
@@ -8792,6 +8796,8 @@ async def blast_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =================== GENERAL MESSAGE HANDLER ===================
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await _claim_free.text_input(update, context):
+        return
     if not update.message or not update.message.from_user:
         return
 
@@ -9440,6 +9446,7 @@ async def admin_konfirmasi(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def build_admin_panel_keyboard(user_id: int = None):
     rows = [
+        [InlineKeyboardButton("🎁 Pengaturan Claim Free", callback_data="cf_admin")],
         [
             InlineKeyboardButton("📦 Produk",        callback_data="admpanel_produk"),
             InlineKeyboardButton("📋 Orders",         callback_data="admpanel_orders"),
@@ -10452,8 +10459,12 @@ def _install_uvloop_if_available():
 
 # =================== MAIN ENTRYPOINT ===================
 
+from claim_free import ClaimFree
+_claim_free = ClaimFree(db_session_safe, run_db, is_admin, is_banned)
+
 def main():
     init_pool()
+    _claim_free.migrate()
     if RUN_DB_MIGRATIONS_ON_STARTUP:
         init_db()
     else:
@@ -10628,6 +10639,7 @@ def main():
 
     # Auto-Approve Join Request Handler
     app.add_handler(ChatJoinRequestHandler(handle_join_request))
+    app.add_handler(CallbackQueryHandler(_claim_free.callback, pattern=r"^cf_(?:admin|testi|free|stats|toggle|verify|cancel)$"))
 
     # Backup & Import Document Handlers
     app.add_handler(MessageHandler(

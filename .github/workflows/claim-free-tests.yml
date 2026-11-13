@@ -1,0 +1,30 @@
+name: Claim Free tests
+on:
+  push:
+    branches: [feature/claim-free]
+  pull_request:
+    paths: [bot.py, claim_free.py, tests/**, .github/workflows/claim-free-tests.yml]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: local_test_only
+          POSTGRES_DB: claim_free_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgresql://postgres:local_test_only@localhost:5432/claim_free_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - run: python -m py_compile bot.py claim_free.py
+      - run: python -m unittest discover -s tests -v

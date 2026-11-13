@@ -16,23 +16,23 @@ UNAVAILABLE = '🎁 Claim Grup Free belum tersedia. Silakan coba kembali nanti.'
 INTRO = (
     f'🎁 <b>CLAIM GRUP FREE</b>\n{LINE}\n\n'
     'Dapatkan akses <b>GRUP FREE</b> secara gratis dengan menyelesaikan persyaratan berikut.\n\n'
-    '📋 <b>SYARAT CLAIM</b>\n✅ Bergabung ke Grup Testimoni Hyper Store.\n\n'
+    '📋 <b>SYARAT CLAIM</b>\n✅ Bergabung ke Grup/Channel Testimoni Hyper Store.\n\n'
     f'{LINE}\n\n📌 <b>CARA CLAIM</b>\n\n'
-    '1. Tekan tombol <b>Gabung Grup Testimoni</b>.\n'
-    '2. Bergabung ke grup tersebut.\n'
+    '1. Tekan tombol <b>Gabung Testimoni</b>.\n'
+    '2. Bergabung ke grup/channel tersebut.\n'
     '3. Kembali ke bot dan tekan <b>Verifikasi &amp; Claim</b>.\n\n'
     f'{LINE}\n🔒 Akses hanya diberikan kepada member yang telah memenuhi persyaratan.'
 )
 FAILED = (
     f'❌ <b>VERIFIKASI GAGAL</b>\n{LINE}\n\n'
-    'Kamu belum bergabung ke Grup Testimoni Hyper Store.\n\n'
+    'Kamu belum bergabung ke Grup/Channel Testimoni Hyper Store.\n\n'
     'Silakan bergabung terlebih dahulu, kemudian tekan <b>Verifikasi &amp; Claim</b> kembali.'
 )
 SUCCESS = (
     f'✅ <b>CLAIM BERHASIL!</b>\n{LINE}\n\n'
     'Selamat! Persyaratan telah berhasil diverifikasi.\n\n'
     '🎁 <b>Akses:</b> GRUP FREE\n✅ <b>Status:</b> Berhasil\n\n'
-    f'{LINE}\n\nTekan tombol di bawah untuk bergabung ke grup gratis.'
+    f'{LINE}\n\nTekan tombol di bawah untuk bergabung ke grup/channel gratis.'
 )
 
 SCHEMA = """
@@ -161,32 +161,32 @@ class ClaimFree:
 
     async def permissions(self, bot, cfg):
         if not all(cfg.get(k) for k in ('testi_chat', 'testi_link', 'free_chat')):
-            raise ValueError('Lengkapi kedua grup terlebih dahulu.')
+            raise ValueError('Lengkapi tujuan testimoni dan akses Free terlebih dahulu (grup/channel).')
         if cfg['testi_chat'] == cfg['free_chat']:
-            raise ValueError('Grup Testimoni dan Grup Free harus berbeda.')
+            raise ValueError('Tujuan Testimoni dan Free harus berbeda.')
         await self.validate_chat(bot, cfg['testi_chat'], cfg['testi_link'])
         await self.validate_chat(bot, cfg['free_chat'], free=True)
 
     async def validate_chat(self, bot, chat_id, link=None, free=False):
         chat, me = await asyncio.gather(bot.get_chat(chat_id), bot.get_chat_member(chat_id, bot.id))
-        if chat.type not in ('group', 'supergroup'):
-            raise ValueError('Chat tujuan harus berupa grup atau supergroup.')
+        if chat.type not in ('group', 'supergroup', 'channel'):
+            raise ValueError('Chat tujuan harus berupa grup, supergroup, atau channel.')
         if me.status not in ('creator', 'administrator'):
-            raise ValueError('Jadikan bot admin di grup terlebih dahulu.')
+            raise ValueError('Jadikan bot admin di grup/channel terlebih dahulu.')
         if free and not (me.status == 'creator' or me.can_invite_users):
-            raise ValueError('Bot memerlukan izin Undang Pengguna di Grup Free.')
+            raise ValueError('Bot memerlukan izin Undang Pengguna di grup/channel Free.')
         if free and chat.username:
-            raise ValueError('Grup Free harus privat agar akses hanya melalui verifikasi bot.')
+            raise ValueError('Grup/channel Free harus privat agar akses hanya melalui verifikasi bot.')
         if link:
             public = 'https://t.me/' + chat.username if chat.username else None
             primary = getattr(chat, 'invite_link', None)
             def normalized(s):
                 return s.replace('/joinchat/', '/+') if s else s
             if not ((public and link.lower() == public.lower()) or normalized(link) == normalized(primary)):
-                raise ValueError('Link tidak cocok dengan grup. Gunakan link publik grup atau link undangan utama yang terbaca oleh bot.')
+                raise ValueError('Link tidak cocok dengan grup/channel. Gunakan link publik atau link undangan utama yang terbaca oleh bot.')
 
     def keyboard(self, cfg):
-        return Markup([[Button('📢 Gabung Grup Testimoni', url=cfg['testi_link'])],
+        return Markup([[Button('📢 Gabung Testimoni', url=cfg['testi_link'])],
                        [Button('✅ Verifikasi & Claim', callback_data='cf_verify')]])
 
     async def reply(self, update, text, markup=None):
@@ -205,7 +205,7 @@ class ClaimFree:
     async def verified_member(self, bot, chat, uid):
         me, member = await asyncio.gather(bot.get_chat_member(chat, bot.id), bot.get_chat_member(chat, uid))
         if me.status not in ('administrator', 'creator'):
-            raise ValueError('Bot bukan admin Grup Testimoni.')
+            raise ValueError('Bot bukan admin grup/channel Testimoni.')
         return member_ok(member)
 
     async def verify(self, update, context):
@@ -229,7 +229,7 @@ class ClaimFree:
                     return await self.reply(update, '⏳ Claim sedang diproses. Coba kembali sebentar lagi.')
                 cached = await self.call('latest', uid, cfg['version'])
                 if cached:
-                    return await self.reply(update, SUCCESS, Markup([[Button('🔗 Masuk Grup Free', url=cached)]]))
+                    return await self.reply(update, SUCCESS, Markup([[Button('🔗 Masuk Grup/Channel Free', url=cached)]]))
                 expires = datetime.now(timezone.utc) + timedelta(minutes=15)
                 invitation = await context.bot.create_chat_invite_link(
                     chat_id=cfg['free_chat'], name='hf-free-' + token[:16],
@@ -237,7 +237,7 @@ class ClaimFree:
                 link = invitation.invite_link
                 if not await self.call('finish', uid, token, link, cfg['free_chat'], cfg['version'], expires):
                     raise ValueError('Konfigurasi berubah saat claim diproses. Silakan ulangi.')
-                await self.reply(update, SUCCESS, Markup([[Button('🔗 Masuk Grup Free', url=link)]]))
+                await self.reply(update, SUCCESS, Markup([[Button('🔗 Masuk Grup/Channel Free', url=link)]]))
             except Exception as exc:
                 # Only type is logged: Telegram exceptions may include private links.
                 log.warning('[CLAIM FREE] verify failed: %s', type(exc).__name__)
@@ -305,8 +305,8 @@ class ClaimFree:
             context.user_data.pop('awaiting_claim_free_edit', None)
             if q.data in ('cf_testi', 'cf_free'):
                 context.user_data['awaiting_claim_free_edit'] = q.data
-                prompt = ('Kirim Chat ID Grup Testimoni pada baris pertama dan link grup pada baris kedua.'
-                          if q.data == 'cf_testi' else 'Kirim Chat ID Grup Free privat. Bot harus admin dengan izin Undang Pengguna.')
+                prompt = ('Kirim Chat ID grup/channel Testimoni pada baris pertama dan link-nya pada baris kedua.'
+                          if q.data == 'cf_testi' else 'Kirim Chat ID grup/channel Free privat. Bot harus admin dengan izin Undang Pengguna.')
                 return await self.reply(update, prompt, Markup([[Button('❌ Batal', callback_data='cf_cancel')]]))
             if q.data == 'cf_stats':
                 r = await self.call('stats')
@@ -327,13 +327,13 @@ class ClaimFree:
         cfg = await self.config()
         text = (f"🎁 <b>Pengaturan Claim Free</b>\n{LINE}\n"
                 f"Status: {'✅ Aktif' if cfg['enabled'] else '🔴 Nonaktif'}\n\n"
-                f"📢 Grup Testimoni: <code>{cfg['testi_chat'] or 'Belum diatur'}</code>\n"
+                f"📢 Testimoni (grup/channel): <code>{cfg['testi_chat'] or 'Belum diatur'}</code>\n"
                 f"Link: {html.escape(cfg['testi_link'] or 'Belum diatur')}\n\n"
-                f"🎁 Grup Free: <code>{cfg['free_chat'] or 'Belum diatur'}</code>\n\n"
+                f"🎁 Free (grup/channel): <code>{cfg['free_chat'] or 'Belum diatur'}</code>\n\n"
                 'Perubahan grup otomatis menonaktifkan fitur. Validasi ulang sebelum mengaktifkan.')
         await self.reply(update, text, Markup([
-            [Button('📢 Atur Grup Testimoni', callback_data='cf_testi')],
-            [Button('🎁 Atur Grup Free', callback_data='cf_free')],
+            [Button('📢 Atur Testimoni (Grup/Channel)', callback_data='cf_testi')],
+            [Button('🎁 Atur Free (Grup/Channel)', callback_data='cf_free')],
             [Button('📊 Statistik Claim', callback_data='cf_stats')],
             [Button('🔘 Nonaktifkan' if cfg['enabled'] else '🔘 Aktifkan', callback_data='cf_toggle')],
             [Button('⬅️ Kembali ke Panel', callback_data='admpanel_back')]]))
@@ -351,14 +351,14 @@ class ClaimFree:
                 lines = (update.effective_message.text or '').strip().splitlines()
                 if mode == 'cf_testi':
                     if len(lines) != 2:
-                        raise ValueError('Kirim tepat dua baris: Chat ID lalu link Grup Testimoni.')
+                        raise ValueError('Kirim tepat dua baris: Chat ID lalu link grup/channel Testimoni.')
                     cfg['testi_chat'], cfg['testi_link'] = parse_chat(lines[0]), parse_link(lines[1])
                     await self.validate_chat(context.bot, cfg['testi_chat'], cfg['testi_link'])
                 else:
                     cfg['free_chat'] = parse_chat('\n'.join(lines))
                     await self.validate_chat(context.bot, cfg['free_chat'], free=True)
                 if cfg['free_chat'] and cfg['testi_chat'] == cfg['free_chat']:
-                    raise ValueError('Grup Testimoni dan Grup Free harus berbeda.')
+                    raise ValueError('Tujuan Testimoni dan Free harus berbeda.')
                 if not await self.call('save', cfg['testi_chat'], cfg['testi_link'], cfg['free_chat'], cfg['version']):
                     raise ValueError('Konfigurasi berubah. Silakan ulangi.')
             context.user_data.pop('awaiting_claim_free_edit', None)

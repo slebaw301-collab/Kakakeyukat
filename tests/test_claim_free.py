@@ -166,6 +166,38 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             await self.f.validate_chat(self.ctx.bot, -10022, free=True)
 
+    async def test_all_supported_testimonial_types(self):
+        for kind in ('group', 'supergroup', 'channel'):
+            with self.subTest(kind=kind):
+                self.ctx.bot.get_chat.return_value = NS(type=kind, username='testigroup', invite_link=None)
+                await self.f.validate_chat(self.ctx.bot, -10011, 'https://t.me/testigroup')
+
+    async def test_all_supported_free_types(self):
+        for kind in ('group', 'supergroup', 'channel'):
+            with self.subTest(kind=kind):
+                self.ctx.bot.get_chat.return_value = NS(type=kind, username=None)
+                self.ctx.bot.get_chat_member.return_value = NS(status='administrator', can_invite_users=True)
+                await self.f.validate_chat(self.ctx.bot, -10022, free=True)
+
+    async def test_channel_free_permissions_and_privacy_required(self):
+        self.ctx.bot.get_chat.return_value = NS(type='channel', username=None)
+        self.ctx.bot.get_chat_member.return_value = NS(status='administrator', can_invite_users=False)
+        with self.assertRaises(ValueError):
+            await self.f.validate_chat(self.ctx.bot, -10022, free=True)
+        self.ctx.bot.get_chat_member.return_value = NS(status='administrator', can_invite_users=True)
+        self.ctx.bot.get_chat.return_value = NS(type='channel', username='publicfree')
+        with self.assertRaises(ValueError):
+            await self.f.validate_chat(self.ctx.bot, -10022, free=True)
+
+    async def test_private_channel_testimonial_link_matches(self):
+        self.ctx.bot.get_chat.return_value = NS(type='channel', username=None, invite_link='https://t.me/+secret')
+        await self.f.validate_chat(self.ctx.bot, -10011, 'https://t.me/+secret')
+
+    async def test_private_user_chat_rejected(self):
+        self.ctx.bot.get_chat.return_value = NS(type='private', username=None)
+        with self.assertRaises(ValueError):
+            await self.f.validate_chat(self.ctx.bot, -10022, free=True)
+
     async def test_missing_invite_permission_rejected(self):
         self.ctx.bot.get_chat.return_value = NS(type='supergroup', username=None)
         self.ctx.bot.get_chat_member.return_value = NS(status='administrator', can_invite_users=False)

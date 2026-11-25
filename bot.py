@@ -10639,7 +10639,7 @@ def main():
 
     # Auto-Approve Join Request Handler
     app.add_handler(ChatJoinRequestHandler(handle_join_request))
-    app.add_handler(CallbackQueryHandler(_claim_free.callback, pattern=r"^cf_(?:admin|testi|free|stats|toggle|verify|cancel)$"))
+    app.add_handler(CallbackQueryHandler(_claim_free.callback, pattern=r"^cf_(?:admin|testi|free|stats|toggle|verify|cancel|backup|backup_toggle)$"))
 
     # Backup & Import Document Handlers
     app.add_handler(MessageHandler(

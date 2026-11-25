@@ -124,7 +124,7 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         self.ctx.bot.create_chat_invite_link.assert_awaited_once()
 
     async def test_admin_callback_denied(self):
-        for data in ('cf_admin', 'cf_testi', 'cf_free', 'cf_stats', 'cf_toggle', 'cf_cancel'):
+        for data in ('cf_admin', 'cf_testi', 'cf_free', 'cf_stats', 'cf_toggle', 'cf_cancel', 'cf_backup', 'cf_backup_toggle'):
             self.u.callback_query.data = data
             await self.f.callback(self.u, self.ctx)
         self.f.config.assert_not_awaited()
@@ -254,6 +254,65 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         req.approve.assert_not_awaited()
         req.decline.assert_awaited_once()
 
+    def enable_backup(self):
+        self.cfg.update(backup_required=True, backup_chat=-10044, backup_link='https://t.me/backupgroup')
+
+    async def test_backup_intro_and_keyboard(self):
+        self.enable_backup()
+        await self.f.show(self.u, self.ctx)
+        self.assertIn('Backup', self.text())
+        rows = self.u.effective_message.reply_text.call_args.kwargs['reply_markup'].inline_keyboard
+        self.assertEqual(rows[1][0].url, self.cfg['backup_link'])
+
+    async def test_backup_missing_membership_blocks_claim(self):
+        self.enable_backup()
+        self.ctx.bot.get_chat_member.side_effect = lambda chat, uid: NS(status='left' if chat == -10044 and uid != 99 else 'administrator')
+        await self.f.verify(self.u, self.ctx)
+        self.assertIn('Backup', self.text())
+        self.ctx.bot.create_chat_invite_link.assert_not_awaited()
+
+    async def test_both_requirements_pass(self):
+        self.enable_backup()
+        await self.f.verify(self.u, self.ctx)
+        self.assertEqual(self.text(), SUCCESS)
+        self.ctx.bot.get_chat_member.assert_any_await(-10044, 123)
+
+    async def test_left_backup_before_join(self):
+        self.enable_backup()
+        self.ctx.bot.get_chat_member.side_effect = lambda chat, uid: NS(status='left' if chat == -10044 and uid != 99 else 'administrator')
+        req = await self.join()
+        req.approve.assert_not_awaited()
+        req.decline.assert_awaited_once()
+
+    async def test_backup_api_error_blocks_claim(self):
+        self.enable_backup()
+        async def member(chat, uid):
+            if chat == -10044:
+                raise TelegramError('offline')
+            return NS(status='administrator')
+        self.ctx.bot.get_chat_member.side_effect = member
+        await self.f.verify(self.u, self.ctx)
+        self.ctx.bot.create_chat_invite_link.assert_not_awaited()
+
+    async def test_admin_saves_backup(self):
+        self.f.is_admin.return_value = True
+        self.f.validate_chat = AsyncMock()
+        self.f.call.side_effect = None
+        self.f.call.return_value = True
+        self.ctx.user_data['awaiting_claim_free_edit'] = 'cf_backup'
+        self.u.effective_message.text = '-10044\nhttps://t.me/backupgroup'
+        await self.f.text_input(self.u, self.ctx)
+        self.f.call.assert_awaited_once_with('save_backup', -10044, 'https://t.me/backupgroup', 1)
+
+    async def test_backup_toggle_retains_config(self):
+        self.enable_backup()
+        self.f.is_admin.return_value = True
+        self.f.call.side_effect = None
+        self.f.call.return_value = True
+        self.u.callback_query.data = 'cf_backup_toggle'
+        await self.f.callback(self.u, self.ctx)
+        self.f.call.assert_awaited_once_with('toggle_backup', False, 1)
+
     async def test_paid_invite_not_intercepted(self):
         self.u.chat_join_request = NS(invite_link=NS(name='Paid product'))
         self.assertFalse(await self.f.join_request(self.u, self.ctx))
@@ -318,7 +377,7 @@ class PostgresTests(unittest.TestCase):
     def setUp(self):
         with self.f.session() as conn, conn.cursor() as c:
             c.execute('TRUNCATE claim_free_invites,claim_free_claims')
-            c.execute('UPDATE claim_free_config SET enabled=TRUE,testi_chat=-10011,testi_link=%s,free_chat=-10022,version=1', ('https://t.me/testigroup',))
+            c.execute('UPDATE claim_free_config SET enabled=TRUE,testi_chat=-10011,testi_link=%s,free_chat=-10022,version=1,backup_chat=NULL,backup_link=NULL,backup_required=FALSE', ('https://t.me/testigroup',))
 
     def test_concurrent_lease_and_unique_right(self):
         from concurrent.futures import ThreadPoolExecutor
@@ -345,6 +404,18 @@ class PostgresTests(unittest.TestCase):
         self.f.migrate()
         self.assertFalse(self.f.db('reserve', 123, 'other'))
         self.assertTrue(self.f.db('config')['enabled'])
+
+    def test_backup_config_migration_and_toggle(self):
+        self.assertTrue(self.f.db('save_backup', -10044, 'https://t.me/backupgroup', 1))
+        self.f.migrate()
+        cfg = self.f.db('config')
+        self.assertFalse(cfg['enabled'])
+        self.assertTrue(cfg['backup_required'])
+        self.assertEqual(cfg['backup_chat'], -10044)
+        self.assertTrue(self.f.db('toggle_backup', False, cfg['version']))
+        cfg = self.f.db('config')
+        self.assertFalse(cfg['backup_required'])
+        self.assertEqual(cfg['backup_chat'], -10044)
 
     def test_recovery_link_consumption_and_config_disable(self):
         self.f.db('reserve', 123, 'pending')

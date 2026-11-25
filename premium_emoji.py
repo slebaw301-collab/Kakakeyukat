@@ -73,6 +73,7 @@ class PremiumEmoji:
             returned = {
                 s.custom_emoji_id: s.emoji for s in stickers
                 if s.custom_emoji_id in candidates and s.emoji
+                and (s.is_animated or s.is_video) and not s.needs_repainting
                 and _base(s.emoji) == _base(candidates[s.custom_emoji_id])
             }
             self.ids = {

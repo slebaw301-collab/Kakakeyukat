@@ -114,6 +114,31 @@ class PremiumEmojiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data['reply_markup'], self.keyboard.to_dict())
         self.assertTrue(data['protect_content'])
 
+    async def test_catalog_buttons_use_premium_badges_and_preserve_normal_fallback(self):
+        labels = ('🎉 Elite', '👠 STW VIP', '📺 OME TV', '✨ Hijabs VIP',
+                  '🍭 Paket', '👑 VVIP', '♠️ Exclusive', '🦊 Produk Baru')
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(label, callback_data=f'pilih_{index}',
+                                  api_kwargs={'style': 'primary'})]
+            for index, label in enumerate(labels)
+        ])
+        self.engine.set_enabled(True)
+        await self.bot.send_message(100, '📌 Detail · ♾️ Akses · 🔗 Link · ➕ Tambah',
+                                    reply_markup=keyboard)
+        payload = self.request.calls[-1][1]
+        self.assertEqual(payload['text'].count('<tg-emoji'), 4)
+        rows = payload['reply_markup']['inline_keyboard']
+        for index, (row, label) in enumerate(zip(rows, labels, strict=True)):
+            button = row[0]
+            source, name = label.split(' ', 1)
+            self.assertEqual(button, {
+                'text': name, 'callback_data': f'pilih_{index}', 'style': 'primary',
+                'icon_custom_emoji_id': self.engine.ids.get(source.rstrip('️'), self.engine.ids['📦']),
+            })
+        self.engine.set_enabled(False)
+        await self.bot.send_message(100, '📦 Produk', reply_markup=keyboard)
+        self.assertEqual(self.request.calls[-1][1]['reply_markup'], keyboard.to_dict())
+
     async def test_html_markup_and_caption_with_file_id(self):
         self.engine.set_enabled(True)
         text = ('<blockquote><b>📦 Paket</b> <tg-spoiler>🔒 Rahasia</tg-spoiler></blockquote>\n'

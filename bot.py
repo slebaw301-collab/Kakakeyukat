@@ -43,7 +43,11 @@ from io import BytesIO
 from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager, AsyncExitStack
 import telegram.error
-from premium_emoji import PremiumEmoji, PremiumEmojiBot, SETTING as PREMIUM_EMOJI_SETTING
+from premium_emoji import (
+    PremiumEmoji, PremiumEmojiBot, SETTING as PREMIUM_EMOJI_SETTING, input_custom_emoji,
+)
+from premium_emoji_slots import SETTINGS_PREFIX as EMOJI_SETTINGS_PREFIX, emoji_surface
+from premium_emoji_manager import EmojiManager
 from telegram import (
     Update, BotCommand, BotCommandScopeChat, BotCommandScopeDefault,
     InlineKeyboardButton as TelegramInlineKeyboardButton, InlineKeyboardMarkup, MessageEntity
@@ -2088,6 +2092,7 @@ def _format_public_transaction(order, paket):
     )
 
 
+@emoji_surface('review_post')
 async def _publish_public_testimonial(bot, order_id, *, manual=False):
     """Best effort public receipt, independent of payment/delivery and admin routing.
 
@@ -2324,15 +2329,52 @@ async def update_product_field(paket_id, field, value):
         _invalidate_products_cache()
     return updated
 
+def _product_emoji_sync(paket_id, fallback, choice):
+    key = EMOJI_SETTINGS_PREFIX + f'product/{paket_id}'
+    updated = "UPDATE products SET emoji=%s WHERE paket_id=%s RETURNING paket_id"
+    with db_session_safe() as conn, conn.cursor() as cursor:
+        if choice is None:
+            cursor.execute(
+                f"""WITH updated AS ({updated}), cleared AS (
+                        DELETE FROM settings WHERE key=%s AND EXISTS (SELECT 1 FROM updated)
+                    ) SELECT 1 FROM updated""",
+                (fallback, paket_id, key),
+            )
+        else:
+            cursor.execute(
+                f"""WITH updated AS ({updated})
+                    INSERT INTO settings (key, value) SELECT %s, %s FROM updated
+                    ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value""",
+                (fallback, paket_id, key, json.dumps(choice, ensure_ascii=False)),
+            )
+        return cursor.rowcount > 0
+
+
+async def _set_product_emoji(paket_id, fallback, choice):
+    async with _premium_emoji_config_lock:
+        if not await run_db_admin(_product_emoji_sync, paket_id, fallback, choice):
+            return False
+        _premium_emoji.set_override(f'product/{paket_id}', choice)
+        _invalidate_products_cache()
+        return True
+
+
+def product_badge(product, glyph):
+    return _premium_emoji.mark_product(product.get('paket_id'), glyph)
+
+
 def _delete_product_sync(paket_id):
     with db_session_safe() as conn:
         with conn.cursor() as c:
             c.execute("DELETE FROM products WHERE paket_id=%s", (paket_id,))
-            c.execute("DELETE FROM settings WHERE key=%s", (_PRODUCT_PREVIEW_PREFIX + paket_id,))
+            c.execute("DELETE FROM settings WHERE key IN (%s, %s)",
+                      (_PRODUCT_PREVIEW_PREFIX + paket_id, EMOJI_SETTINGS_PREFIX + f'product/{paket_id}'))
 
 async def delete_product(paket_id):
-    await run_db_admin(_delete_product_sync, paket_id)
-    _invalidate_products_cache()
+    async with _premium_emoji_config_lock:
+        await run_db_admin(_delete_product_sync, paket_id)
+        _premium_emoji.set_override(f'product/{paket_id}', None)
+        _invalidate_products_cache()
 
 def make_paket_id(nama):
     pid = re.sub(r'[^a-z0-9]+', '_', nama.lower().strip()).strip('_')
@@ -3946,7 +3988,7 @@ def _format_order_notif(judul: str, user_name: str, user_id: int,
         judul,
         "━━━━━━━━━━━━━━━━━━━━",
         f"👤 Buyer   : {tg_user_link(user_id, user_name)} · <code>{esc(user_id)}</code>",
-        f"📦 Paket   : {esc(paket.get('emoji','📦'))} {esc(paket.get('nama','?'))}",
+        f"📦 Paket   : {esc(product_badge(paket, paket.get('emoji','📦')))} {esc(paket.get('nama','?'))}",
     ]
     if amount is not None:
         lines.append(f"💰 Total   : {format_harga(amount)}")
@@ -3984,7 +4026,7 @@ async def build_order_detail_text(order: dict, paket: dict) -> str:
         f"<b>{title}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"👤 Buyer   : {tg_user_link(order.get('user_id'), order.get('user_name', '-'))} · <code>{esc(order.get('user_id', '-'))}</code>\n"
-        f"📦 Paket   : {esc(paket.get('emoji','📦'))} {esc(paket.get('nama','Produk'))}\n"
+        f"📦 Paket   : {esc(product_badge(paket, paket.get('emoji','📦')))} {esc(paket.get('nama','Produk'))}\n"
         f"💰 Total   : {format_harga(amount)}\n"
         f"🔗 Link    : {delivery_label}\n"
         f"🧾 Order   : <code>{esc(order.get('order_id', '-'))}</code>\n"
@@ -4010,6 +4052,7 @@ async def build_order_detail_text(order: dict, paket: dict) -> str:
         text += f"\n\n🔗 <b>Link Terkirim</b>\n{esc(sent_link)}"
     return text
 
+@emoji_surface('order_notification')
 async def kirim_notif(bot, text: str, reply_markup=None):
     channel_id = await get_setting('notif_channel_id')
     target = int(channel_id) if channel_id else ADMIN_ID
@@ -4168,6 +4211,7 @@ async def _render_buyer_menu(query, text, reply_markup):
     finally:
         _record_latency('buyer-menu-render', _time.monotonic() - started)
 
+@emoji_surface('welcome')
 async def _send_main_menu_photo(context, user_id, text, markup, *, reuse_recent=False, photo_id=None):
     global _MENU_PHOTO_FILE_ID, _MENU_PHOTO_LOCK
     async with _get_user_notice_lock(user_id):
@@ -4779,6 +4823,19 @@ async def _post_init_warmup(application: Application):
             logger.debug(f"[POST_INIT] Monitoring dipulihkan: {order['order_id']}")
 
 
+def _read_emoji_overrides_sync():
+    with db_session_safe() as conn, conn.cursor() as cursor:
+        cursor.execute("SELECT key, value FROM settings WHERE key LIKE %s", (EMOJI_SETTINGS_PREFIX + '%',))
+        return {row['key'][len(EMOJI_SETTINGS_PREFIX):]: row['value'] for row in cursor.fetchall()}
+
+
+async def _save_emoji_slot(key, choice):
+    async with _premium_emoji_config_lock:
+        await set_setting(EMOJI_SETTINGS_PREFIX + key,
+                          json.dumps(choice, ensure_ascii=False) if choice is not None else None)
+        _premium_emoji.set_override(key, choice)
+
+
 async def _load_premium_emoji(bot):
     async with _premium_emoji_config_lock:
         try:
@@ -4788,6 +4845,12 @@ async def _load_premium_emoji(bot):
         else:
             _premium_emoji.set_enabled(enabled)
             logger.info('[PREMIUM EMOJI] Setting loaded: %s', 'ON' if enabled else 'OFF')
+        try:
+            _premium_emoji.load_overrides(await run_db_admin(_read_emoji_overrides_sync))
+        except Exception as exc:
+            logger.warning('[PREMIUM EMOJI] Could not load manual selections: %s', type(exc).__name__)
+        else:
+            logger.info('[PREMIUM EMOJI] Manual selections loaded: %d', len(_premium_emoji.overrides))
     await _premium_emoji.validate(bot)
 
 
@@ -4964,7 +5027,7 @@ async def _start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, tra
             f"<b>⏳ ORDER AKTIF</b>\n"
             f"========================\n\n"
             f"Kamu masih punya pesanan yang belum dibayar:\n\n"
-            f"📦 Paket: {esc(paket['emoji'])} {esc(paket['nama'])}\n"
+            f"📦 Paket: {esc(product_badge(paket, paket['emoji']))} {esc(paket['nama'])}\n"
             f"💰 Total: {format_harga(total)}\n"
             f"📝 Order ID: <code>{esc(active['order_id'])}</code>\n\n"
             f"<i>Silakan selesaikan pembayaran atau batalkan pesanan dulu.</i>"
@@ -5042,6 +5105,7 @@ async def cmd_emojiid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+@emoji_surface('help')
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handler untuk /help - menampilkan bantuan penggunaan bot."""
     text = (
@@ -5078,6 +5142,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
     )
 
+@emoji_surface('catalog')
 async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await _fast_callback_ack(query)
@@ -5094,7 +5159,7 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(callback.encode('utf-8')) > 64:
             callback = f"pilih_{product['paket_id']}"
         keyboard.append([styled_button(
-            f"{product.get('emoji') or '📦'} {str(product.get('nama') or 'Produk')[:50]}",
+            f"{product_badge(product, product.get('emoji') or '📦')} {str(product.get('nama') or 'Produk')[:50]}",
             callback_data=callback)])
     if not shown:
         text = "📦 <b>DAFTAR PAKET</b>\n\nBelum ada paket yang tersedia."
@@ -5106,6 +5171,7 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard.append([styled_button("⬅️ Kembali", callback_data=back)])
     await _render_buyer_menu(query, text, InlineKeyboardMarkup(keyboard))
 
+@emoji_surface('product')
 async def pilih_paket(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await _fast_callback_ack(query)
@@ -5141,7 +5207,7 @@ async def pilih_paket(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📦 <b>DETAIL PAKET</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"<blockquote>"
-        f"{esc(paket.get('emoji') or '📦')} Paket: <b>{esc(str(paket.get('nama') or 'Produk')[:60])}</b>\n"
+        f"{esc(product_badge(paket, paket.get('emoji') or '📦'))} Paket: <b>{esc(str(paket.get('nama') or 'Produk')[:60])}</b>\n"
         f"🎬 Isi: {esc(detail_desc)}\n"
         f"💰 Harga: <b>{format_harga(paket.get('harga', 0))}</b>\n"
         f"♾️ Akses: <b>Permanen &amp; Bergaransi</b>\n"
@@ -5164,6 +5230,7 @@ async def pilih_paket(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard.insert(0, [styled_button("📄 Deskripsi lengkap", style="primary", callback_data=f"buyer_desc_{paket_id}")])
     await _render_buyer_menu(query, text, InlineKeyboardMarkup(keyboard))
 
+@emoji_surface('product')
 async def buyer_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await _fast_callback_ack(query)
@@ -5175,6 +5242,7 @@ async def buyer_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for start in range(0, len(desc), 1500):
         await query.message.reply_text(esc(desc[start:start + 1500]), parse_mode="HTML")
 
+@emoji_surface('payment_status')
 async def confirm_buy_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
@@ -5224,7 +5292,7 @@ async def confirm_buy_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             caption = (
                 f"<b>⏳ ORDER AKTIF</b>\n"
                 f"========================\n\n"
-                f"📦 Paket: {esc(paket_active['emoji'])} {esc(paket_active['nama'])}\n"
+                f"📦 Paket: {esc(product_badge(paket_active, paket_active['emoji']))} {esc(paket_active['nama'])}\n"
                 f"💰 Total: {format_harga(total)}\n"
                 f"📝 Order ID: <code>{esc(active['order_id'])}</code>\n\n"
                 f"⚠️ Selesaikan pembayaran atau batalkan dulu."
@@ -5252,6 +5320,7 @@ async def confirm_buy_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         release_invoice_creation(user_id)
         trace.finish()
 
+@emoji_surface('requirements')
 async def prereq_buy_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
@@ -5342,6 +5411,7 @@ async def _post_invoice_created_tasks(bot, context, user_id: int, order_id: str,
         logger.error(f"[ORDER] Gagal menjalankan tugas setelah invoice {order_id}: {e}", exc_info=True)
 
 
+@emoji_surface('invoice')
 async def _buat_order_baru(update, context, query, user_id, user_name, paket, order_changes=0, perf_trace=None):
     # Guard terakhir untuk callback lama/race saat admin mengaktifkan maintenance
     # tepat ketika buyer menekan tombol konfirmasi.
@@ -5477,12 +5547,12 @@ async def _buat_order_baru(update, context, query, user_id, user_name, paket, or
             if parent_paket:
                 prereq_note = (
                     f"\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"📌 <b>Tujuan:</b> Syarat untuk {esc(parent_paket['emoji'])} {esc(parent_paket['nama'])}\n"
+                    f"📌 <b>Tujuan:</b> Syarat untuk {esc(product_badge(parent_paket, parent_paket['emoji']))} {esc(parent_paket['nama'])}\n"
                     f"Setelah lunas, link akan <b>otomatis dikirim</b>. 🚀"
                 )
 
         caption = (
-            f"<b>{esc(paket['emoji'])} {esc(paket['nama']).upper()}</b>\n"
+            f"<b>{esc(product_badge(paket, paket['emoji']))} {esc(paket['nama']).upper()}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"📋 <b>Detail Pembayaran</b>\n"
             f"- Harga: {format_harga(amount)}\n"
@@ -5543,6 +5613,7 @@ async def _buat_order_baru(update, context, query, user_id, user_name, paket, or
 
 # =================== CANCEL ORDER ===================
 
+@emoji_surface('payment_change')
 async def cancel_order_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -5620,7 +5691,7 @@ async def cancel_order_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             buy_buttons = []
             for pid in all_req_ids:
                 p_obj = await get_product(pid)
-                label = f"{p_obj['emoji']} {p_obj['nama']}" if p_obj else pid
+                label = f"{product_badge(p_obj, p_obj['emoji'])} {p_obj['nama']}" if p_obj else pid
                 if pid in missing_set:
                     prereq_lines.append(f"  ❌ {label}")
                     buy_buttons.append([InlineKeyboardButton(
@@ -5636,7 +5707,7 @@ async def cancel_order_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 text=(
                     f"<b>⏸️ Pembelian dibatalkan</b>\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    f"📦 Paket: {esc(parent_paket['emoji'])} {esc(parent_paket['nama'])}\n"
+                    f"📦 Paket: {esc(product_badge(parent_paket, parent_paket['emoji']))} {esc(parent_paket['nama'])}\n"
                     f"🔖 Order ID: <code>{esc(parent_order_id)}</code>\n\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
                     f"📋 Progress syarat <b>({fulfilled_count}/{total_count} terpenuhi)</b>:\n"
@@ -5656,6 +5727,7 @@ async def cancel_order_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # =================== BACK TO MENU ===================
 
+@emoji_surface('welcome')
 async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await _fast_callback_ack(query)
@@ -5665,6 +5737,7 @@ async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await _send_main_menu_photo(context, update.effective_user.id, text, InlineKeyboardMarkup(keyboard))
 
+@emoji_surface('help')
 async def buyer_how(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await _fast_callback_ack(query)
@@ -5675,6 +5748,7 @@ async def buyer_how(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Jika ada kendala, hubungi admin.")
     await _render_buyer_menu(query, text, InlineKeyboardMarkup([[styled_button("⬅️ Kembali", callback_data="back_to_menu", style="primary")]]))
 
+@emoji_surface('history')
 async def buyer_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await _fast_callback_ack(query)
@@ -5682,7 +5756,7 @@ async def buyer_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     labels = {'completed':'✅ Selesai', 'waiting':'⏳ Menunggu Bayar', 'pending':'🔄 Diproses', 'cancelled':'❌ Dibatalkan', 'expired':'⏰ Kedaluwarsa', 'rejected':'🚫 Ditolak'}
     text = "📜 <b>RIWAYAT ORDER</b>\n\n"
     for o in orders[:5]:
-        text += f"{esc(o.get('paket_emoji') or '📦')} <b>{esc(str(o.get('paket_nama') or o['paket_id'])[:60])}</b>\n{esc(labels.get(o['status'], o['status']))} • {format_harga(o.get('harga_dibayar') or o.get('paket_harga') or 0)}\n\n"
+        text += f"{esc(product_badge(o, o.get('paket_emoji') or '📦'))} <b>{esc(str(o.get('paket_nama') or o['paket_id'])[:60])}</b>\n{esc(labels.get(o['status'], o['status']))} • {format_harga(o.get('harga_dibayar') or o.get('paket_harga') or 0)}\n\n"
     if not orders:
         text += "Kamu belum pernah melakukan pembelian."
     else:
@@ -5695,6 +5769,7 @@ async def buyer_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # =================== GANTI PAKET ===================
 
+@emoji_surface('payment_change')
 async def ganti_paket_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
@@ -5731,7 +5806,7 @@ async def ganti_paket_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if p['paket_id'] == current_paket_id:
             continue
         keyboard.append([InlineKeyboardButton(
-            f"{p['emoji']} {p['nama']} - {format_harga(p['harga'])}",
+            f"{product_badge(p, p['emoji'])} {p['nama']} - {format_harga(p['harga'])}",
             callback_data=f"ganti_paket_konfirm|{p['paket_id']}"
         )])
     keyboard.append([InlineKeyboardButton("⬅️ Batal", callback_data="ganti_paket_batal")])
@@ -5745,6 +5820,7 @@ async def ganti_paket_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
+@emoji_surface('payment_change')
 async def ganti_paket_konfirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
@@ -5771,7 +5847,7 @@ async def ganti_paket_konfirm(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"<b>⚠️ KONFIRMASI GANTI PAKET</b>\n"
         f"========================\n\n"
         f"Kamu akan beralih ke:\n"
-        f"{esc(new_paket['emoji'])} <b>{esc(new_paket['nama'])}</b>\n"
+        f"{esc(product_badge(new_paket, new_paket['emoji']))} <b>{esc(new_paket['nama'])}</b>\n"
         f"💰 {format_harga(new_paket['harga'])}\n\n"
         f"📌 Pesanan QRIS lama akan <b>dibatalkan</b> dan invoice baru akan dibuat.\n\n"
         f"Sisa kesempatan ganti setelah ini: <b>{sisa - 1}x</b>\n\n"
@@ -5789,6 +5865,7 @@ async def ganti_paket_konfirm(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception:
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
+@emoji_surface('payment_change')
 async def ganti_paket_exec(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
@@ -5835,6 +5912,7 @@ async def ganti_paket_exec(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _buat_order_baru(update, context, None, user_id, user_name,
                            new_paket, order_changes=changes_used + 1)
 
+@emoji_surface('payment_change')
 async def ganti_paket_batal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
@@ -5854,7 +5932,7 @@ async def ganti_paket_batal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sisa_ganti = 1 - changes_used
 
     caption_back = (
-        f"<b>{esc(paket['emoji'])} {esc(paket['nama']).upper()}</b>\n"
+        f"<b>{esc(product_badge(paket, paket['emoji']))} {esc(paket['nama']).upper()}</b>\n"
         f"========================\n\n"
         f"📝 Order ID: <code>{esc(active['order_id'])}</code>\n\n"
         f"⏳ Menunggu pembayaran..."
@@ -5971,6 +6049,7 @@ async def _check_order_status(order_id):
         return row
     return await run_db(_check_order_status_sync, order_id)
 
+@emoji_surface('payment_status')
 async def _payment_poll_loop(bot, order_id: str, paket_id: str, user_id: int,
                              user_name: str, amount: int, timeout_seconds: int,
                              paket: dict = None):
@@ -6115,7 +6194,7 @@ async def _build_prereq_progress(user_id: int, requires_str: str, parent_order_i
     products_by_id = {p['paket_id']: p for p in await get_all_products()}
     for pid in all_req_ids:
         p_obj = products_by_id.get(pid)
-        label = f"{p_obj['emoji']} {p_obj['nama']}" if p_obj else pid
+        label = f"{product_badge(p_obj, p_obj['emoji'])} {p_obj['nama']}" if p_obj else pid
         if pid in missing_set:
             lines.append(f"❌ {esc(label)}")
             callback_data = (
@@ -6162,6 +6241,7 @@ async def _replace_admin_order_status(bot, order_id: str, text: str, reply_marku
         await set_admin_msg_id(order_id, msg_id)
     return msg_id
 
+@emoji_surface('delivery_alert')
 async def _send_delivery_failed_alert(bot, order_id: str, user_id: int, user_name: str, paket: dict, error: Exception):
     try:
         await bot.send_message(
@@ -6171,7 +6251,7 @@ async def _send_delivery_failed_alert(bot, order_id: str, user_id: int, user_nam
                 "━━━━━━━━━━━━━━━━━━━━\n\n"
                 f"👤 Buyer : {tg_user_link(user_id, user_name)}\n"
                 f"ID      : <code>{esc(user_id)}</code>\n"
-                f"📦 Paket : {esc(paket.get('emoji','📦'))} {esc(paket.get('nama','Produk'))}\n"
+                f"📦 Paket : {esc(product_badge(paket, paket.get('emoji','📦')))} {esc(paket.get('nama','Produk'))}\n"
                 f"🔖 Order : <code>{esc(order_id)}</code>\n\n"
                 "Order sudah lunas, tapi bot gagal mengirim link. Kirim manual secepatnya."
             ),
@@ -6180,6 +6260,7 @@ async def _send_delivery_failed_alert(bot, order_id: str, user_id: int, user_nam
     except Exception as ex:
         logger.error(f"Gagal kirim emergency alert ke admin: {ex}")
 
+@emoji_surface('access')
 async def _send_buyer_product_link(bot, user_id: int, order_id: str, paket: dict, paid_amount: int, title: str) -> tuple:
     group_link = await generate_group_link(bot, paket, order_id)
     link = group_link or (paket.get("link") or DEFAULT_LINK)
@@ -6210,9 +6291,10 @@ async def _send_buyer_product_link(bot, user_id: int, order_id: str, paket: dict
             logger.warning(f"[DELIVERY] Gagal menyimpan buyer_msg_id {order_id}: {exc}")
     return link, bool(group_link)
 
+@emoji_surface('requirements')
 async def _send_prereq_hold_message(bot, user_id: int, order_id: str, paket: dict, paid_amount: int, progress: dict):
     await mark_delivery_held(order_id, 'Syarat belum terpenuhi')
-    product_name = f"{paket.get('emoji','📦')} {paket.get('nama','Produk')}"
+    product_name = f"{product_badge(paket, paket.get('emoji','📦'))} {paket.get('nama','Produk')}"
     prerequisite_text = "\n".join(progress['lines'])
     msg = await bot.send_message(
         chat_id=user_id,
@@ -6267,6 +6349,7 @@ def _format_buyer_prereq_complete(parent_label: str, parent_name: str, progress:
     )
 
 
+@emoji_surface('requirements')
 async def _edit_or_send_buyer_prereq_update(bot, user_id: int, parent_order: dict,
                                             text: str, reply_markup=None) -> bool:
     """Edit pesan hold/update lama; fallback kirim satu pesan jika pesan sudah hilang."""
@@ -6309,7 +6392,7 @@ async def _notify_parent_prereq_progress(bot, user_id: int, user_name: str, pare
         return
 
     parent_name = parent_paket.get('nama', 'Produk')
-    parent_label = f"{parent_paket.get('emoji','📦')} {parent_name}"
+    parent_label = f"{product_badge(parent_paket, parent_paket.get('emoji','📦'))} {parent_name}"
 
     if progress['missing']:
         await _edit_or_send_buyer_prereq_update(
@@ -6462,6 +6545,7 @@ async def _process_completed_order_delivery(bot, order_id: str, paket_id: str, u
     # Semua pekerjaan admin/prerequisite lanjutan tidak menahan critical path buyer.
     spawn_background(_finalize_after_buyer(), name=f"paid-finalize-{order_id}")
 
+@emoji_surface('payment_status')
 async def _handle_payment_success(bot, order_id: str, paket_id: str, user_id: int,
                                   user_name: str, amount: int, trans: dict, paket: dict = None):
     paid_amount = _safe_int(trans.get('amount'), -1)
@@ -6558,6 +6642,7 @@ async def _auto_deliver_pending_prereq_orders(bot, user_id: int, user_name: str,
 # =================== ADMIN: KIRIM LINK PREREQ MANUAL ===================
 
 @admin_callback
+@emoji_surface('requirements')
 async def admin_kirim_link_prereq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await _fast_callback_ack(query)
@@ -6672,6 +6757,7 @@ async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 # =================== USER: TESTIMONI HANDLERS ===================
 
+@emoji_surface('review_admin')
 async def _legacy_review_notice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop('awaiting_review_text', None)
     context.user_data.pop('temp_rating', None)
@@ -6727,6 +6813,7 @@ async def handle_rate_back_stars(update: Update, context: ContextTypes.DEFAULT_T
 # =================== ADMIN: TESTIMONI MODERASI HANDLERS ===================
 
 @admin_callback
+@emoji_surface('review_admin')
 async def admin_testi_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await _fast_callback_ack(query)
@@ -6750,6 +6837,7 @@ async def admin_testi_approve(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.edit_message_text(messages[result], reply_markup=back_kb)
 
 @admin_callback
+@emoji_surface('review_admin')
 async def admin_testi_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await _fast_callback_ack(query)
@@ -6778,6 +6866,7 @@ async def cmd_produk(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await _send_produk_menu(context, chat_id=update.message.from_user.id, message=update.message)
 
+@emoji_surface('admin_products')
 async def _send_produk_menu(context, chat_id, message=None, query=None):
     products = await get_all_products()
 
@@ -6785,14 +6874,14 @@ async def _send_produk_menu(context, chat_id, message=None, query=None):
     if products:
         for p in products:
             aktif_str = "✅" if p.get('aktif', True) else "🔴 Nonaktif"
-            text += f"{esc(p['emoji'])} <b>{esc(p['nama'])}</b> - {format_harga(p['harga'])} {aktif_str}\n"
+            text += f"{esc(product_badge(p, p['emoji']))} <b>{esc(p['nama'])}</b> - {format_harga(p['harga'])} {aktif_str}\n"
     else:
         text += "<i>Belum ada produk.</i>\n"
 
     text += "\nPilih produk untuk diedit, atau tambah produk baru:"
 
     keyboard = [
-        [InlineKeyboardButton(f"{p['emoji']} {p['nama']}", callback_data=f"pd_detail_{p['paket_id']}")]
+        [InlineKeyboardButton(f"{product_badge(p, p['emoji'])} {p['nama']}", callback_data=f"pd_detail_{p['paket_id']}")]
         for p in products
     ]
     keyboard.append([InlineKeyboardButton("➕ Tambah Produk Baru", callback_data="pd_tambah")])
@@ -6811,6 +6900,7 @@ async def _send_produk_menu(context, chat_id, message=None, query=None):
         await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=markup)
 
 @admin_callback
+@emoji_surface('admin_products')
 async def produk_detail(update: Update, context: ContextTypes.DEFAULT_TYPE, paket_id: str = None):
     query = update.callback_query
     try:
@@ -6839,7 +6929,7 @@ async def produk_detail(update: Update, context: ContextTypes.DEFAULT_TYPE, pake
     )
 
     text = (
-        f"<b>{esc(p['emoji'])} {esc(p['nama'])}</b>\n"
+        f"<b>{esc(product_badge(p, p['emoji']))} {esc(p['nama'])}</b>\n"
         f"========================\n\n"
         f"💰 Harga: {format_harga(p['harga'])}\n"
         f"📝 Deskripsi: {esc(p['deskripsi'])}\n"
@@ -6877,6 +6967,7 @@ async def produk_detail(update: Update, context: ContextTypes.DEFAULT_TYPE, pake
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
 @admin_callback
+@emoji_surface('admin_products')
 async def produk_toggle_aktif(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -6895,6 +6986,7 @@ async def produk_toggle_aktif(update: Update, context: ContextTypes.DEFAULT_TYPE
     p['aktif'] = new_aktif
     await produk_detail(update, context)
 
+@emoji_surface('admin_products')
 async def _show_prereq_selector(query, context, paket_id: str, p: dict):
     all_products = await get_all_products()
     current_str = p.get('requires_paket_ids') or ""
@@ -6911,7 +7003,7 @@ async def _show_prereq_selector(query, context, paket_id: str, p: dict):
             continue
         is_selected = prod['paket_id'] in selected
         mark = "✅ " if is_selected else "⬜ "
-        label = f"{mark}{prod.get('emoji', '')} {prod['nama']}"
+        label = f"{mark}{product_badge(prod, prod.get('emoji', ''))} {prod['nama']}"
         buttons.append([InlineKeyboardButton(
             label,
             callback_data=f"pd_req_toggle|{paket_id}|{prod['paket_id']}"
@@ -6930,7 +7022,7 @@ async def _show_prereq_selector(query, context, paket_id: str, p: dict):
     await query.edit_message_text(
         f"<b>🔒 Atur Syarat (Prerequisite)</b>\n"
         f"========================\n\n"
-        f"Produk: <b>{esc(p.get('emoji', ''))} {esc(p['nama'])}</b>\n\n"
+        f"Produk: <b>{esc(product_badge(p, p.get('emoji', '')))} {esc(p['nama'])}</b>\n\n"
         f"Centang produk yang harus sudah dibeli user sebelum bisa membeli produk ini.\n\n"
         f"<b>Dipilih:</b> <code>{esc(selected_label)}</code>",
         parse_mode="HTML",
@@ -6938,6 +7030,7 @@ async def _show_prereq_selector(query, context, paket_id: str, p: dict):
     )
 
 @admin_callback
+@emoji_surface('admin_other')
 async def pd_req_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -6961,6 +7054,7 @@ async def pd_req_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _show_prereq_selector(query, context, paket_id, p)
 
 @admin_callback
+@emoji_surface('admin_other')
 async def pd_req_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer("🗑️ Syarat dikosongkan")
@@ -6974,6 +7068,7 @@ async def pd_req_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _show_prereq_selector(query, context, paket_id, p)
 
 @admin_callback
+@emoji_surface('admin_other')
 async def pd_req_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -6989,6 +7084,7 @@ async def pd_req_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await produk_detail(update, context, paket_id=paket_id)
 
 @admin_callback
+@emoji_surface('admin_products')
 async def produk_edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -7026,10 +7122,11 @@ async def produk_edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "group_chat_id": "ID grup private (contoh: -1001234567890, ketik 'hapus' untuk kosongkan)",
     }
 
+    context.user_data.pop('awaiting_custom_emoji', None)
     context.user_data['editing_product'] = {'paket_id': paket_id, 'field': field}
 
     await query.edit_message_text(
-        f"<b>✍️ Edit {field.upper()} - {esc(p['emoji'])} {esc(p['nama'])}</b>\n"
+        f"<b>✍️ Edit {field.upper()} - {esc(product_badge(p, p['emoji']))} {esc(p['nama'])}</b>\n"
         f"========================\n\n"
         f"Nilai saat ini: <code>{esc(str(p.get(field) or '-'))}</code>\n\n"
         f"<i>Kirim {esc(label_map.get(field, field))} baru sekarang:</i>",
@@ -7040,6 +7137,7 @@ async def produk_edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 @admin_callback
+@emoji_surface('admin_products')
 async def produk_hapus_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -7053,7 +7151,7 @@ async def produk_hapus_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.edit_message_text(
         f"<b>⚠️ Hapus Produk?</b>\n"
         f"========================\n\n"
-        f"Kamu yakin mau hapus <b>{esc(p['emoji'])} {esc(p['nama'])}</b>?\n"
+        f"Kamu yakin mau hapus <b>{esc(product_badge(p, p['emoji']))} {esc(p['nama'])}</b>?\n"
         f"Tindakan ini tidak bisa dibatalkan.",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([
@@ -7065,6 +7163,7 @@ async def produk_hapus_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 @admin_callback
+@emoji_surface('admin_products')
 async def produk_hapus_exec(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -7077,12 +7176,13 @@ async def produk_hapus_exec(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await delete_product(paket_id)
     await query.edit_message_text(
-        f"✅ Produk <b>{esc(p['emoji'])} {esc(p['nama'])}</b> berhasil dihapus.",
+        f"✅ Produk <b>{esc(product_badge(p, p['emoji']))} {esc(p['nama'])}</b> berhasil dihapus.",
         parse_mode="HTML"
     )
     await _send_produk_menu(context, chat_id=query.from_user.id)
 
 @admin_callback
+@emoji_surface('admin_products')
 async def produk_tambah_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -7101,6 +7201,7 @@ async def produk_tambah_start(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
 @admin_callback
+@emoji_surface('admin_products')
 async def produk_tambah_batal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -7151,7 +7252,7 @@ async def _build_active_orders_text_and_keyboard(page: int = 0):
     keyboard = []
     for o in orders:
         paket_nama = o.get('paket_nama') or o['paket_id']
-        paket_emoji = o.get('paket_emoji') or '📦'
+        paket_emoji = product_badge(o, o.get('paket_emoji') or '📦')
         paket_harga = o.get('paket_harga') or 0
         durasi = hitung_durasi(o["waktu"])
         text += (
@@ -7185,7 +7286,7 @@ async def _build_pending_orders_text_and_keyboard(page: int = 0, back_callback: 
     text = f"<b>📋 ORDER PENDING ({total})</b>\n========================\n📄 Halaman {page + 1}/{total_pages}\n\n"
     keyboard = []
     for o in orders:
-        paket_emoji = o.get('paket_emoji') or '📦'
+        paket_emoji = product_badge(o, o.get('paket_emoji') or '📦')
         paket_nama = o.get('paket_nama') or o['paket_id']
         durasi = hitung_durasi(o["waktu"])
         text += f"- {esc(paket_emoji)} {esc(o['user_name'])} - {esc(paket_nama)} - {durasi}\n"
@@ -7220,6 +7321,7 @@ def _check_waiting_order_sync(order_id):
             return c.fetchone()
 
 @admin_callback
+@emoji_surface('admin_other')
 async def admin_cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await _fast_callback_ack(query)
@@ -7289,13 +7391,14 @@ async def admin_cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.edit_message_text(
         f"✅ <b>Order Dibatalkan</b>\n\n"
         f"👤 Buyer: {esc(order.get('user_name', '-'))}\n"
-        f"📦 Paket: {esc(paket['emoji'])} {esc(paket['nama'])}\n"
+        f"📦 Paket: {esc(product_badge(paket, paket['emoji']))} {esc(paket['nama'])}\n"
         f"📝 Order ID: <code>{esc(order_id)}</code>",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali ke Orders", callback_data="admpanel_orders")]])
     )
 
 @admin_callback
+@emoji_surface('admin_other')
 async def admin_manual_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -7351,7 +7454,7 @@ async def admin_manual_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.edit_message_text(
         f"✅ <b>Pembayaran Dikonfirmasi Manual</b>\n\n"
         f"👤 Buyer: {tg_user_link(target_user_id, order.get('user_name', '-'))}\n"
-        f"📦 Paket: {esc(paket['emoji'])} {esc(paket['nama'])}\n"
+        f"📦 Paket: {esc(product_badge(paket, paket['emoji']))} {esc(paket['nama'])}\n"
         f"📝 Order ID: <code>{esc(order_id)}</code>\n"
         f"🔗 Status: {delivery_label}",
         parse_mode="HTML",
@@ -7425,7 +7528,7 @@ def _build_stats_text(s: dict, now: datetime) -> str:
         max_cnt_pb = s['products_breakdown'][0]['cnt'] or 1
         total_rev = s['total_revenue'] or 1
         for p in s['products_breakdown']:
-            emoji = p.get('emoji') or '📦'
+            emoji = product_badge(p, p.get('emoji') or '📦')
             nama = esc(p.get('nama') or p['paket_id'])
             bars = round((p['cnt'] / max_cnt_pb) * 7)
             bar = '█' * bars + '░' * (7 - bars)
@@ -7536,6 +7639,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # =================== USER: RIWAYAT ORDER ===================
 
+@emoji_surface('history')
 async def cmd_riwayat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     orders = await get_buyer_history_with_products(user_id)
@@ -7561,7 +7665,7 @@ async def cmd_riwayat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = "<b>📋 RIWAYAT ORDER (10 terakhir)</b>\n========================\n\n"
     for o in orders:
-        paket_emoji = o.get('paket_emoji') or '📦'
+        paket_emoji = product_badge(o, o.get('paket_emoji') or '📦')
         paket_nama = o.get('paket_nama') or o['paket_id']
         status = STATUS_LABEL.get(o['status'], o['status'])
         harga = o.get('harga_dibayar') or o.get('paket_harga') or 0
@@ -7997,6 +8101,7 @@ async def _resend_access_allowed(update, context):
     return True
 
 
+@emoji_surface('resend_menu')
 async def show_resend_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """New and legacy resend buttons first open the buyer's product selector."""
     if not await _resend_access_allowed(update, context):
@@ -8017,9 +8122,11 @@ async def show_resend_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             rows = await get_resend_product_page(update.effective_user.id, page)
         keyboard = []
         for row in rows[:RESEND_PAGE_SIZE]:
-            label = f"{row.get('emoji') or '📦'} {row.get('nama') or row['paket_id']}"
+            glyph = row.get('emoji') or '📦'
+            name = str(row.get('nama') or row['paket_id'])
+            label = f"{product_badge(row, glyph[:80])}{(' ' + name)[:max(0, 80 - len(glyph))]}"
             keyboard.append([InlineKeyboardButton(
-                label[:80], callback_data=f"resend_select|{row['id']}"
+                label, callback_data=f"resend_select|{row['id']}"
             )])
         navigation = []
         if page:
@@ -8056,6 +8163,7 @@ async def show_resend_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+@emoji_surface('resend_access')
 async def resend_group_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not await _resend_access_allowed(update, context):
@@ -8146,6 +8254,7 @@ def _get_buyers_for_reminder_sync(hari: int):
             )
             return [dict(r) for r in c.fetchall()]
 
+@emoji_surface('buyer_reminder')
 async def _send_buyer_reminders(bot):
     buyers = await run_db_admin(_get_buyers_for_reminder_sync, REMINDER_HARI)
     if not buyers:
@@ -8510,6 +8619,7 @@ def _blast_panel(job):
     return text, InlineKeyboardMarkup(keyboard)
 
 
+@emoji_surface('broadcast')
 async def _blast_publish(bot, job, force_new=False, destination=None):
     text, keyboard = _blast_panel(job)
     chat_id = destination or job['admin_id']
@@ -8556,6 +8666,7 @@ def _blast_send_options(bot):
     return options
 
 
+@emoji_surface('broadcast')
 async def _blast_worker_inner(bot, job_id, token, body, state, pacer):
     while not state['stop']:
         if not await pacer.wait(state):
@@ -8700,6 +8811,7 @@ async def _blast_admin_allowed(update,context):
 
 
 @admin_callback
+@emoji_surface('broadcast')
 async def cmd_blast_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _blast_admin_allowed(update,context):
         return
@@ -8713,6 +8825,7 @@ async def cmd_blast_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _blast_publish(context.bot,job,force_new=True,destination=update.effective_user.id)
 
 
+@emoji_surface('broadcast')
 async def cmd_blast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _blast_admin_allowed(update,context):
         return
@@ -8740,6 +8853,7 @@ async def blast_batal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.edit_message_text('✅ Draft blast dibatalkan. Blast yang sudah berjalan dapat dikontrol lewat /blast_status.')
 
 
+@emoji_surface('broadcast')
 async def _blast_preview(update,context,text):
     # Validate the actual message with Telegram in admin chat only; never probe recipients.
     if not await _blast_admin_allowed(update,context):
@@ -8762,6 +8876,7 @@ async def _blast_preview(update,context,text):
 
 
 @admin_callback
+@emoji_surface('broadcast')
 async def blast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _blast_admin_allowed(update,context):
         return
@@ -8783,6 +8898,7 @@ async def blast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @admin_callback
+@emoji_surface('broadcast')
 async def blast_control(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _blast_admin_allowed(update,context):
         return
@@ -8819,6 +8935,8 @@ async def blast_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =================== GENERAL MESSAGE HANDLER ===================
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await _emoji_manager.text_input(update, context):
+        return
     if await _claim_free.text_input(update, context):
         return
     if not update.message or not update.message.from_user:
@@ -9238,7 +9356,23 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 value = int(text) if field == 'harga' else text
 
-            updated = await update_product_field(paket_id, field, value)
+            if field == 'emoji':
+                if not text:
+                    await update.message.reply_text("❌ Kirim emoji standar atau Premium dari keyboard Telegram.")
+                    return
+                try:
+                    choice = await input_custom_emoji(context.bot, update.message)
+                except (ValueError, telegram.error.TelegramError) as exc:
+                    error = str(exc) if isinstance(exc, ValueError) else 'Telegram gagal memvalidasi emoji.'
+                    await update.message.reply_text(f"❌ {error}")
+                    return
+                try:
+                    updated = await _set_product_emoji(paket_id, value, choice)
+                except psycopg2.Error:
+                    await update.message.reply_text("❌ Emoji produk gagal disimpan. Coba lagi.")
+                    return
+            else:
+                updated = await update_product_field(paket_id, field, value)
             context.user_data.pop('editing_product', None)
             if not updated:
                 await update.message.reply_text("❌ Produk tidak ditemukan atau perubahan tidak dapat disimpan.")
@@ -9267,15 +9401,16 @@ async def cmd_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for p in products:
         grp = p.get('group_chat_id')
         if grp:
-            text += f"{esc(p['emoji'])} <b>{esc(p['nama'])}</b>\n- 🏢 Group: <code>{esc(grp)}</code>\n- 🔗 Fallback: <code>{esc(p['link'])}</code>\n\n"
+            text += f"{esc(product_badge(p, p['emoji']))} <b>{esc(p['nama'])}</b>\n- 🏢 Group: <code>{esc(grp)}</code>\n- 🔗 Fallback: <code>{esc(p['link'])}</code>\n\n"
         else:
-            text += f"{esc(p['emoji'])} <b>{esc(p['nama'])}</b>\n- <code>{esc(p['link'])}</code>\n\n"
+            text += f"{esc(product_badge(p, p['emoji']))} <b>{esc(p['nama'])}</b>\n- <code>{esc(p['link'])}</code>\n\n"
     text += "<i>Ketik /produk untuk mengubah link atau Group ID.</i>"
     await update.message.reply_text(text, parse_mode="HTML")
 
 # =================== ADMIN: PENDING ORDERS ===================
 
 
+@emoji_surface('admin_other')
 async def admin_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update.message.from_user.id, context):
         return
@@ -9297,6 +9432,7 @@ def _get_pending_order_sync(user_id):
             return c.fetchone()
 
 @admin_callback
+@emoji_surface('admin_other')
 async def admin_proses_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -9314,7 +9450,7 @@ async def admin_proses_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
     durasi = hitung_durasi(order["waktu"])
 
     caption = (
-        f"<b>{esc(paket['emoji'])} {esc(paket['nama']).upper()}</b>\n"
+        f"<b>{esc(product_badge(paket, paket['emoji']))} {esc(paket['nama']).upper()}</b>\n"
         f"========================\n\n"
         f"👤 Pembeli: {esc(order['user_name'])} (<code>{order['user_id']}</code>)\n"
         f"📦 Konten: {esc(paket['deskripsi'])}\n"
@@ -9365,6 +9501,7 @@ async def back_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 @admin_callback
+@emoji_surface('admin_other')
 async def admin_konfirmasi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -9411,7 +9548,7 @@ async def admin_konfirmasi(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ <b>Dikonfirmasi</b>\n"
             f"========================\n\n"
             f"👤 Pembeli: {tg_user_link(user_id, order.get('user_name', '-'))}\n"
-            f"📦 Paket: {esc(paket['emoji'])} {esc(paket['nama'])}\n\n"
+            f"📦 Paket: {esc(product_badge(paket, paket['emoji']))} {esc(paket['nama'])}\n\n"
             f"🔗 Status: {delivery_label}",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali ke Panel", callback_data="admpanel_back")]])
@@ -9442,7 +9579,7 @@ async def admin_konfirmasi(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"❌ <b>Ditolak</b>\n"
             f"========================\n\n"
             f"👤 Pembeli: {esc(order['user_name'])}\n"
-            f"📦 Paket: {esc(paket['emoji'])} {esc(paket['nama'])}",
+            f"📦 Paket: {esc(product_badge(paket, paket['emoji']))} {esc(paket['nama'])}",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali ke Panel", callback_data="admpanel_back")]])
         )
@@ -9493,10 +9630,12 @@ def build_admin_panel_keyboard(user_id: int = None):
     rows.append([InlineKeyboardButton("💎 Pengaturan Premium Emoji", callback_data="admpanel_emoji")])
     return InlineKeyboardMarkup(rows)
 
+@emoji_surface('admin_main')
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.message.from_user.id
     if not await is_admin(uid, context):
         return
+    context.user_data.pop('awaiting_custom_emoji', None)
     await update.message.reply_text(
         "<b>⚙️ PANEL ADMIN</b>\n"
         "========================\n\n"
@@ -9506,7 +9645,9 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 @admin_callback
+@emoji_surface('admin_main')
 async def admpanel_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop('awaiting_custom_emoji', None)
     query = update.callback_query
     await query.answer()
     await query.edit_message_text(
@@ -9518,12 +9659,14 @@ async def admpanel_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 @admin_callback
+@emoji_surface('admin_other')
 async def admpanel_produk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     await _send_produk_menu(context, chat_id=query.from_user.id, query=query)
 
 @admin_callback
+@emoji_surface('admin_other')
 async def admpanel_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -9544,6 +9687,7 @@ async def admpanel_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 @admin_callback
+@emoji_surface('admin_other')
 async def admpanel_orders_aktif(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await _fast_callback_ack(query)
@@ -9562,6 +9706,7 @@ async def admpanel_orders_aktif(update: Update, context: ContextTypes.DEFAULT_TY
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
 @admin_callback
+@emoji_surface('admin_other')
 async def admpanel_orders_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await _fast_callback_ack(query)
@@ -9579,6 +9724,7 @@ async def admpanel_orders_pending(update: Update, context: ContextTypes.DEFAULT_
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
 @admin_callback
+@emoji_surface('admin_other')
 async def admpanel_orders_cari(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -9593,6 +9739,7 @@ async def admpanel_orders_cari(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 @admin_callback
+@emoji_surface('admin_other')
 async def admpanel_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -9610,6 +9757,7 @@ async def admpanel_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[styled_button("⬅️ Kembali", style="primary", callback_data="admpanel_back")]]))
 
 @admin_callback
+@emoji_surface('admin_other')
 async def admpanel_blast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await cmd_blast(update, context)
 
@@ -9629,6 +9777,7 @@ async def blast_retype(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @admin_callback
+@emoji_surface('admin_other')
 async def admpanel_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -9650,6 +9799,7 @@ async def admpanel_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 @admin_callback
+@emoji_surface('admin_other')
 async def admpanel_data_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer("⏳ Membuat backup...")
@@ -9660,6 +9810,7 @@ async def admpanel_data_backup(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 @admin_callback
+@emoji_surface('admin_other')
 async def admpanel_data_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer("⏳ Membuat export JSON...")
@@ -9693,6 +9844,7 @@ async def admpanel_data_export(update: Update, context: ContextTypes.DEFAULT_TYP
         )
 
 @admin_callback
+@emoji_surface('admin_other')
 async def admpanel_data_import(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -9707,6 +9859,7 @@ async def admpanel_data_import(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 @admin_callback
+@emoji_surface('admin_other')
 async def admpanel_data_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -9715,15 +9868,16 @@ async def admpanel_data_link(update: Update, context: ContextTypes.DEFAULT_TYPE)
     for p in products:
         grp = p.get('group_chat_id')
         if grp:
-            text += f"{esc(p['emoji'])} <b>{esc(p['nama'])}</b>\n- 🏢 Group: <code>{esc(grp)}</code>\n\n"
+            text += f"{esc(product_badge(p, p['emoji']))} <b>{esc(p['nama'])}</b>\n- 🏢 Group: <code>{esc(grp)}</code>\n\n"
         else:
-            text += f"{esc(p['emoji'])} <b>{esc(p['nama'])}</b>\n- <code>{esc(p['link'])}</code>\n\n"
+            text += f"{esc(product_badge(p, p['emoji']))} <b>{esc(p['nama'])}</b>\n- <code>{esc(p['link'])}</code>\n\n"
     await query.edit_message_text(
         text, parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[styled_button("⬅️ Kembali", style="primary", callback_data="admpanel_data")]])
     )
 
 @admin_callback
+@emoji_surface('admin_other')
 async def admpanel_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -9744,6 +9898,7 @@ async def admpanel_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 @admin_callback
+@emoji_surface('admin_other')
 async def admpanel_user_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -9759,6 +9914,7 @@ async def admpanel_user_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['awaiting_ban'] = True
 
 @admin_callback
+@emoji_surface('admin_other')
 async def admpanel_user_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -9773,6 +9929,7 @@ async def admpanel_user_unban(update: Update, context: ContextTypes.DEFAULT_TYPE
     context.user_data['awaiting_unban'] = True
 
 @admin_callback
+@emoji_surface('admin_other')
 async def admpanel_user_daftar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await _fast_callback_ack(query)
@@ -9803,6 +9960,7 @@ async def admpanel_user_daftar(update: Update, context: ContextTypes.DEFAULT_TYP
 # =================== ADMIN: CEK & KICK USER DI GRUP ===================
 
 @admin_callback
+@emoji_surface('admin_other')
 async def admpanel_kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -9850,6 +10008,7 @@ async def admpanel_kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 @admin_callback
+@emoji_surface('admin_other')
 async def kick_cek_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -9864,6 +10023,7 @@ async def kick_cek_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 @admin_callback
+@emoji_surface('admin_other')
 async def kick_select_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     try:
@@ -9922,6 +10082,7 @@ async def kick_select_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(result_text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
 
 @admin_callback
+@emoji_surface('admin_other')
 async def kick_one(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await _fast_callback_ack(query, "⏳ Memproses kick...")
@@ -9946,6 +10107,7 @@ async def kick_one(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await kick_select_user(update, context)
 
 @admin_callback
+@emoji_surface('admin_other')
 async def kick_add_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -9960,6 +10122,7 @@ async def kick_add_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 @admin_callback
+@emoji_surface('admin_other')
 async def kick_del_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -9984,6 +10147,7 @@ async def kick_del_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 @admin_callback
+@emoji_surface('admin_other')
 async def kick_del_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -9995,6 +10159,7 @@ async def kick_del_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await admpanel_kick(update, context)
 
 @admin_callback
+@emoji_surface('admin_other')
 async def kick_do_kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -10068,11 +10233,23 @@ def _premium_emoji_panel(status=None):
         [InlineKeyboardButton("🔘 Matikan Premium Emoji" if on else "🔘 Aktifkan Premium Emoji",
                               callback_data="admpanel_emoji|off" if on else "admpanel_emoji|on")],
         [InlineKeyboardButton("👀 Preview Emoji", callback_data="admpanel_emoji|preview")],
+        [InlineKeyboardButton("🎨 Custom Emoji Manager", callback_data="cem")],
         [InlineKeyboardButton("⬅️ Kembali ke Panel", callback_data="admpanel_back")],
     ])
     return text, markup
 
 
+_emoji_manager = EmojiManager(
+    lambda: _premium_emoji, _save_emoji_slot, is_admin, clear_user_state, InlineKeyboardButton,
+)
+
+
+@admin_callback
+async def admpanel_custom_emoji(update, context):
+    await _emoji_manager.callback(update, context)
+
+
+@emoji_surface('preview')
 async def _preview_premium_emoji(message, bot):
     await _premium_emoji.validate(bot)
     if not _premium_emoji.ready:
@@ -10109,7 +10286,9 @@ async def _preview_premium_emoji(message, bot):
 
 
 @admin_callback
+@emoji_surface('admin_emoji')
 async def admpanel_emoji(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop('awaiting_custom_emoji', None)
     query = update.callback_query
     if update.effective_chat is None or update.effective_chat.type != 'private':
         await query.answer("Buka pengaturan ini di chat pribadi bot.", show_alert=True)
@@ -10149,6 +10328,7 @@ async def admpanel_emoji(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @admin_callback
+@emoji_surface('admin_settings')
 async def admpanel_setting(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -10214,6 +10394,7 @@ async def admpanel_setting(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
 
 @admin_callback
+@emoji_surface('admin_settings')
 async def admpanel_setting_maintenance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -10232,6 +10413,7 @@ async def admpanel_setting_maintenance(update: Update, context: ContextTypes.DEF
     )
 
 @admin_callback
+@emoji_surface('admin_settings')
 async def admpanel_setting_channel_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -10247,6 +10429,7 @@ async def admpanel_setting_channel_set(update: Update, context: ContextTypes.DEF
     )
 
 @admin_callback
+@emoji_surface('admin_settings')
 async def admpanel_setting_channel_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -10258,6 +10441,7 @@ async def admpanel_setting_channel_off(update: Update, context: ContextTypes.DEF
     )
 
 @admin_callback
+@emoji_surface('admin_settings')
 async def admpanel_setting_testich_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -10273,6 +10457,7 @@ async def admpanel_setting_testich_set(update: Update, context: ContextTypes.DEF
     )
 
 @admin_callback
+@emoji_surface('admin_settings')
 async def admpanel_setting_testich_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -10284,6 +10469,7 @@ async def admpanel_setting_testich_off(update: Update, context: ContextTypes.DEF
     )
 
 @admin_callback
+@emoji_surface('admin_settings')
 async def admpanel_setting_channel_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -10307,6 +10493,7 @@ async def admpanel_setting_channel_test(update: Update, context: ContextTypes.DE
         await query.answer(f"❌ Gagal: {str(e)[:100]}", show_alert=True)
 
 @admin_callback
+@emoji_surface('admin_settings')
 async def admpanel_setting_link_testi(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -10322,6 +10509,7 @@ async def admpanel_setting_link_testi(update: Update, context: ContextTypes.DEFA
     )
 
 @admin_callback
+@emoji_surface('admin_settings')
 async def admpanel_setting_link_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -10338,6 +10526,7 @@ async def admpanel_setting_link_admin(update: Update, context: ContextTypes.DEFA
 
 
 @admin_callback
+@emoji_surface('admin_settings')
 async def admpanel_setting_group_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -10357,6 +10546,7 @@ async def admpanel_setting_group_name(update: Update, context: ContextTypes.DEFA
 
 
 @admin_callback
+@emoji_surface('admin_settings')
 async def admpanel_setting_group_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -10456,6 +10646,7 @@ async def cmd_cari(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =================== ADMIN: KELOLA ADMIN (SUPER ADMIN ONLY) ===================
 
 @admin_callback
+@emoji_surface('admin_other')
 async def admpanel_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -10484,6 +10675,7 @@ async def admpanel_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
 
 @admin_callback
+@emoji_surface('admin_other')
 async def admpanel_admin_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -10502,6 +10694,7 @@ async def admpanel_admin_add(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 @admin_callback
+@emoji_surface('admin_other')
 async def admpanel_admin_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -10531,6 +10724,7 @@ async def admpanel_admin_remove(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
 @admin_callback
+@emoji_surface('admin_other')
 async def admpanel_admin_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -10736,6 +10930,7 @@ def main():
     app.add_handler(CallbackQueryHandler(kick_do_kick,     pattern="^kick_do_kick\\|"))
 
     # Admin Settings Configuration Flow
+    app.add_handler(CallbackQueryHandler(admpanel_custom_emoji, pattern=r"^cem(?:\|[a-z0-9_|-]+)?$"))
     app.add_handler(CallbackQueryHandler(admpanel_emoji, pattern=r"^admpanel_emoji(?:\|(on|off|preview))?$"))
     app.add_handler(CallbackQueryHandler(admpanel_setting,              pattern="^admpanel_setting$"))
     app.add_handler(CallbackQueryHandler(admpanel_setting_channel_set,  pattern="^admpanel_setting_channel_set$"))

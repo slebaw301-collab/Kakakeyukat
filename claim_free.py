@@ -7,6 +7,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
+from premium_emoji_slots import emoji_surface
 from telegram import InlineKeyboardButton as Button, InlineKeyboardMarkup as Markup
 from telegram.error import TelegramError, RetryAfter
 
@@ -279,6 +280,7 @@ class ClaimFree:
         await update.effective_message.reply_text(text, parse_mode='HTML', reply_markup=markup,
                                                   protect_content=True, disable_web_page_preview=True)
 
+    @emoji_surface('claim_intro')
     async def show(self, update, context):
         if update.effective_chat.type != 'private':
             return
@@ -293,6 +295,7 @@ class ClaimFree:
             raise ValueError('Bot bukan admin grup/channel persyaratan.')
         return member_ok(member)
 
+    @emoji_surface('claim_verify')
     async def verify(self, update, context):
         uid = update.effective_user.id
         if await self.is_banned(uid):
@@ -386,6 +389,7 @@ class ClaimFree:
                     and (not cfg.get('backup_required') or
                          (cfg.get('backup_chat') and cfg.get('backup_link'))))
 
+    @emoji_surface('auto_kick')
     async def enforce_member(self, bot, cfg, uid):
         if not self.kick_active(cfg) or uid == bot.id:
             return False
@@ -480,6 +484,7 @@ class ClaimFree:
                 log.warning('[CLAIM FREE] reconciliation paused: %s', type(exc).__name__)
             await asyncio.sleep(delay)
 
+    @emoji_surface('claim_admin')
     async def callback(self, update, context):
         q = update.callback_query
         if update.effective_chat.type != 'private':
@@ -532,6 +537,7 @@ class ClaimFree:
             text = str(exc) if isinstance(exc, ValueError) else 'Telegram gagal memvalidasi grup atau izin bot. Coba lagi.'
             await self.reply(update, '❌ ' + html.escape(text))
 
+    @emoji_surface('claim_admin')
     async def admin_panel(self, update, context):
         cfg = await self.config()
         text = (f"🎁 <b>Pengaturan Claim Free</b>\n{LINE}\n"
@@ -554,6 +560,7 @@ class ClaimFree:
             [Button('🔘 Nonaktifkan' if cfg['enabled'] else '🔘 Aktifkan', callback_data='cf_toggle')],
             [Button('⬅️ Kembali ke Panel', callback_data='admpanel_back')]]))
 
+    @emoji_surface('claim_admin')
     async def text_input(self, update, context):
         mode = context.user_data.get('awaiting_claim_free_edit')
         if not mode:

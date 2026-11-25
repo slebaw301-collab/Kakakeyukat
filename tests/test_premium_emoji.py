@@ -12,8 +12,10 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Messag
 from telegram.error import NetworkError, TimedOut
 from telegram.request import BaseRequest
 
-from premium_emoji import PremiumEmoji, PremiumEmojiBot, SETTING
+from premium_emoji import PremiumEmoji, PremiumEmojiBot, SETTING, input_custom_emoji
 from premium_emoji_catalog import EMOJI_CATALOG
+from premium_emoji_manager import STATE, slots_for
+from premium_emoji_slots import button_key, glyph_key, surface
 
 with patch.dict(os.environ, {
     'BOT_TOKEN': '123:offline', 'ADMIN_ID': '456',
@@ -138,6 +140,115 @@ class PremiumEmojiTests(unittest.IsolatedAsyncioTestCase):
         self.engine.set_enabled(False)
         await self.bot.send_message(100, '📦 Produk', reply_markup=keyboard)
         self.assertEqual(self.request.calls[-1][1]['reply_markup'], keyboard.to_dict())
+
+    async def test_screen_message_button_and_product_overrides_are_independent(self):
+        self.engine.set_enabled(True)
+        self.engine.set_override(glyph_key('claim_intro', 'text', '📢'), ('777', '⭐'))
+        self.engine.set_override(glyph_key('claim_intro', 'button', '📢'), ('888', '⭐'))
+        self.engine.set_override(button_key('claim_intro', 'join_review'), ('999', '⭐'))
+        self.engine.set_override('product/first', ('111', '📦'))
+        self.engine.set_override('product/second', ('222', '📦'))
+        plain = InlineKeyboardMarkup([
+            [InlineKeyboardButton('📢 Gabung Testimoni', url='https://example.test/')],
+            [InlineKeyboardButton('📢 Syarat', callback_data='requirements')],
+        ])
+        token = surface.set('claim_intro')
+        try:
+            await self.bot.send_message(100, '📢 Claim', reply_markup=plain)
+            payload = self.request.calls[-1][1]
+            self.assertIn('emoji-id="777"', payload['text'])
+            keyboard = payload['reply_markup']['inline_keyboard']
+            self.assertEqual([row[0]['icon_custom_emoji_id'] for row in keyboard], ['999', '888'])
+            self.engine.set_override(button_key('claim_intro', 'join_review'), None)
+            await self.bot.send_message(100, '📢 Claim', reply_markup=plain)
+            keyboard = self.request.calls[-1][1]['reply_markup']['inline_keyboard']
+            self.assertEqual([row[0]['icon_custom_emoji_id'] for row in keyboard], ['888', '888'])
+        finally:
+            surface.reset(token)
+        first, second = (self.engine.mark_product(key, '📦') for key in ('first', 'second'))
+        await self.bot.send_message(100, '📢 Notifikasi')
+        self.assertNotIn('emoji-id="777"', self.request.calls[-1][1]['text'])
+        products = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f'{first} Satu', callback_data='pilih_first', api_kwargs={'style': 'success'})],
+            [InlineKeyboardButton(f'{second} Dua', callback_data='pilih_second')],
+        ])
+        await self.bot.send_photo(100, 'file', caption=f'{first} Satu · {second} Dua',
+                                  reply_markup=products)
+        payload = self.request.calls[-1][1]
+        self.assertIn('emoji-id="111"', payload['caption'])
+        self.assertIn('emoji-id="222"', payload['caption'])
+        keyboard = payload['reply_markup']['inline_keyboard']
+        self.assertEqual([row[0]['icon_custom_emoji_id'] for row in keyboard], ['111', '222'])
+        self.assertEqual(keyboard[0][0]['style'], 'success')
+
+        self.request.behavior = 'reject'
+        await self.bot.send_message(100, f'{first} Satu', reply_markup=products)
+        payload = self.request.calls[-1][1]
+        self.assertEqual(payload['text'], '📦 Satu')
+        self.assertEqual(payload['reply_markup']['inline_keyboard'][0][0]['text'], '📦 Satu')
+        self.engine.set_enabled(False)
+        await self.bot.send_message(100, f'{second} Dua', reply_markup=products)
+        self.assertEqual(self.request.calls[-1][1]['text'], '📦 Dua')
+
+    async def test_manager_reads_telegram_entity_and_returns_to_slot_list(self):
+        from premium_emoji_manager import EmojiManager
+
+        emoji_id, alt = EMOJI_CATALOG['💎']
+        message = Message.de_json({
+            'message_id': 1, 'date': 1, 'chat': {'id': 100, 'type': 'private'},
+            'text': alt, 'entities': [{
+                'type': 'custom_emoji', 'offset': 0, 'length': len(alt.encode('utf-16-le')) // 2,
+                'custom_emoji_id': emoji_id,
+            }],
+        }, self.bot)
+        user = SimpleNamespace(id=100)
+        query = SimpleNamespace(data='cem|e|welcome|t|g_1f44b', answer=AsyncMock(), edit_message_text=AsyncMock())
+        outgoing = SimpleNamespace(entities=message.entities, text=message.text,
+                                   parse_entity=message.parse_entity, reply_text=AsyncMock())
+        update = SimpleNamespace(effective_user=user, effective_message=outgoing,
+                                 effective_chat=message.chat, callback_query=query)
+        context = SimpleNamespace(bot=self.bot, user_data={})
+        save = AsyncMock(side_effect=self.engine.set_override)
+        manager = EmojiManager(lambda: self.engine, save, AsyncMock(return_value=True),
+                               lambda ctx: ctx.user_data.pop(STATE, None), InlineKeyboardButton)
+        slot = slots_for('welcome', 't')[0]
+        await manager.callback(update, context)
+        self.assertTrue(await manager.text_input(update, context))
+        save.assert_awaited_once_with(slot.key, (emoji_id, alt))
+        self.assertIn('Emoji disimpan', outgoing.reply_text.call_args.args[0])
+        self.assertNotIn(STATE, context.user_data)
+        query.data = 'cem|r|welcome|t|g_1f44b'
+        await manager.callback(update, context)
+        self.assertNotIn(slot.key, self.engine.overrides)
+        self.assertEqual(await input_custom_emoji(self.bot, SimpleNamespace(entities=[])), None)
+
+    async def test_existing_product_edit_handler_accepts_premium_and_standard(self):
+        emoji_id, alt = EMOJI_CATALOG['💎']
+        message = Message.de_json({
+            'message_id': 1, 'date': 1, 'chat': {'id': 100, 'type': 'private'},
+            'text': alt, 'entities': [{
+                'type': 'custom_emoji', 'offset': 0, 'length': len(alt.encode('utf-16-le')) // 2,
+                'custom_emoji_id': emoji_id,
+            }],
+        }, self.bot)
+        outgoing = SimpleNamespace(
+            from_user=SimpleNamespace(id=store.ADMIN_ID), entities=message.entities,
+            text=message.text, parse_entity=message.parse_entity, reply_text=AsyncMock(),
+        )
+        update = SimpleNamespace(message=outgoing)
+        context = SimpleNamespace(bot=self.bot, user_data={})
+        with patch.object(store._claim_free, 'text_input', AsyncMock(return_value=False)), \
+             patch.object(store, '_set_product_emoji', AsyncMock(return_value=True)) as save, \
+             patch.object(store, 'get_product', AsyncMock(return_value=None)):
+            context.user_data['editing_product'] = {'paket_id': 'basic', 'field': 'emoji'}
+            await store.message_handler(update, context)
+            save.assert_awaited_once_with('basic', alt, (emoji_id, alt))
+            self.assertNotIn('editing_product', context.user_data)
+
+            context.user_data['editing_product'] = {'paket_id': 'basic', 'field': 'emoji'}
+            outgoing.text, outgoing.entities = '⭐', ()
+            await store.message_handler(update, context)
+            save.assert_awaited_with('basic', '⭐', None)
 
     async def test_html_markup_and_caption_with_file_id(self):
         self.engine.set_enabled(True)
@@ -357,6 +468,47 @@ class PremiumEmojiTests(unittest.IsolatedAsyncioTestCase):
 
 @unittest.skipUnless(os.environ.get('TEST_DATABASE_URL'), 'Set TEST_DATABASE_URL to an isolated PostgreSQL database')
 class PremiumEmojiSettingsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_manual_selections_and_product_standard_reset_persist(self):
+        import psycopg2
+        from psycopg2.extras import RealDictCursor
+
+        @contextmanager
+        def session():
+            conn = psycopg2.connect(os.environ['TEST_DATABASE_URL'], cursor_factory=RealDictCursor)
+            conn.autocommit = True
+            try:
+                yield conn
+            finally:
+                conn.close()
+
+        engine = PremiumEmoji()
+        first, second = glyph_key('claim_intro', 'text', '✅'), glyph_key('access', 'text', '✅')
+        with session() as conn, conn.cursor() as cur:
+            cur.execute('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)')
+            cur.execute('CREATE TABLE IF NOT EXISTS products (paket_id TEXT PRIMARY KEY, emoji TEXT)')
+            cur.execute("INSERT INTO products VALUES ('test_emoji_123', '📦') ON CONFLICT DO NOTHING")
+        try:
+            with patch.object(store, '_premium_emoji', engine), patch.object(store, 'db_session_safe', session):
+                await store._save_emoji_slot(first, ('123', '✅'))
+                await store._save_emoji_slot(second, ('456', '✅'))
+                self.assertTrue(await store._set_product_emoji('test_emoji_123', '📦', ('789', '📦')))
+                await store._save_emoji_slot(first, None)
+                restarted = PremiumEmoji()
+                restarted.load_overrides(store._read_emoji_overrides_sync())
+                self.assertNotIn(first, restarted.overrides)
+                self.assertEqual(restarted.overrides[second][:2], ('456', '✅'))
+                self.assertEqual(restarted.overrides['product/test_emoji_123'][:2], ('789', '📦'))
+                self.assertTrue(await store._set_product_emoji('test_emoji_123', '⭐', None))
+                self.assertNotIn('product/test_emoji_123', store._read_emoji_overrides_sync())
+                with session() as conn, conn.cursor() as cur:
+                    cur.execute("SELECT emoji FROM products WHERE paket_id='test_emoji_123'")
+                    self.assertEqual(cur.fetchone()['emoji'], '⭐')
+        finally:
+            with session() as conn, conn.cursor() as cur:
+                cur.execute("DELETE FROM products WHERE paket_id='test_emoji_123'")
+                cur.execute("DELETE FROM settings WHERE key IN (%s,%s,%s)",
+                            tuple(store.EMOJI_SETTINGS_PREFIX + key for key in (first, second, 'product/test_emoji_123')))
+
     async def test_admin_toggle_persists_and_boot_loads_same_setting(self):
         import psycopg2
         from psycopg2.extras import RealDictCursor
@@ -381,7 +533,7 @@ class PremiumEmojiSettingsTests(unittest.IsolatedAsyncioTestCase):
             cursor.execute('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)')
             cursor.execute('DELETE FROM settings WHERE key=%s', (SETTING,))
         with patch.object(store, '_premium_emoji', engine), patch.object(store, 'db_session_safe', session):
-            await store.admpanel_emoji(update, SimpleNamespace(bot=bot))
+            await store.admpanel_emoji(update, SimpleNamespace(bot=bot, user_data={}))
             self.assertTrue(engine.enabled)
             self.assertEqual(store._get_setting_sync(SETTING), '1')
             restarted = PremiumEmoji()
@@ -389,7 +541,7 @@ class PremiumEmojiSettingsTests(unittest.IsolatedAsyncioTestCase):
                 await store._load_premium_emoji(bot)
                 self.assertTrue(restarted.enabled)
                 query.data = 'admpanel_emoji|off'
-                await store.admpanel_emoji(update, SimpleNamespace(bot=bot))
+                await store.admpanel_emoji(update, SimpleNamespace(bot=bot, user_data={}))
                 self.assertFalse(restarted.enabled)
                 self.assertEqual(store._get_setting_sync(SETTING), '0')
 

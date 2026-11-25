@@ -41,6 +41,9 @@ CREATE TABLE IF NOT EXISTS claim_free_config (
  testi_chat BIGINT, testi_link TEXT, free_chat BIGINT,
  version BIGINT NOT NULL DEFAULT 0
 );
+ALTER TABLE claim_free_config ADD COLUMN IF NOT EXISTS backup_chat BIGINT;
+ALTER TABLE claim_free_config ADD COLUMN IF NOT EXISTS backup_link TEXT;
+ALTER TABLE claim_free_config ADD COLUMN IF NOT EXISTS backup_required BOOLEAN NOT NULL DEFAULT FALSE;
 INSERT INTO claim_free_config(id) VALUES(1) ON CONFLICT DO NOTHING;
 CREATE TABLE IF NOT EXISTS claim_free_claims (
  user_id BIGINT PRIMARY KEY, claimed_at TIMESTAMPTZ,
@@ -102,6 +105,14 @@ class ClaimFree:
                     if action == 'save':
                         testi, link, free, version = args
                         c.execute('UPDATE claim_free_config SET testi_chat=%s,testi_link=%s,free_chat=%s,enabled=FALSE,version=version+1 WHERE id=1 AND version=%s RETURNING id', (testi, link, free, version))
+                        return bool(c.fetchone())
+                    if action == 'save_backup':
+                        chat, link, version = args
+                        c.execute('UPDATE claim_free_config SET backup_chat=%s,backup_link=%s,backup_required=TRUE,enabled=FALSE,version=version+1 WHERE id=1 AND version=%s RETURNING id', (chat, link, version))
+                        return bool(c.fetchone())
+                    if action == 'toggle_backup':
+                        required, version = args
+                        c.execute('UPDATE claim_free_config SET backup_required=%s,enabled=FALSE,version=version+1 WHERE id=1 AND version=%s RETURNING id', (required, version))
                         return bool(c.fetchone())
                     if action == 'toggle':
                         enabled, version = args
@@ -166,6 +177,15 @@ class ClaimFree:
             raise ValueError('Tujuan Testimoni dan Free harus berbeda.')
         await self.validate_chat(bot, cfg['testi_chat'], cfg['testi_link'])
         await self.validate_chat(bot, cfg['free_chat'], free=True)
+        if cfg.get('backup_required'):
+            await self.validate_backup(bot, cfg)
+
+    async def validate_backup(self, bot, cfg):
+        if not cfg.get('backup_chat') or not cfg.get('backup_link'):
+            raise ValueError('Atur Chat ID dan link Backup terlebih dahulu.')
+        if cfg['backup_chat'] in (cfg['testi_chat'], cfg['free_chat']):
+            raise ValueError('Tujuan Backup harus berbeda dari Testimoni dan Free.')
+        await self.validate_chat(bot, cfg['backup_chat'], cfg['backup_link'])
 
     async def validate_chat(self, bot, chat_id, link=None, free=False):
         chat, me = await asyncio.gather(bot.get_chat(chat_id), bot.get_chat_member(chat_id, bot.id))
@@ -186,8 +206,34 @@ class ClaimFree:
                 raise ValueError('Link tidak cocok dengan grup/channel. Gunakan link publik atau link undangan utama yang terbaca oleh bot.')
 
     def keyboard(self, cfg):
-        return Markup([[Button('📢 Gabung Testimoni', url=cfg['testi_link'])],
-                       [Button('✅ Verifikasi & Claim', callback_data='cf_verify')]])
+        rows = [[Button('📢 Gabung Testimoni', url=cfg['testi_link'])]]
+        if cfg.get('backup_required'):
+            rows.append([Button('🔰 Gabung Backup', url=cfg['backup_link'])])
+        rows.append([Button('✅ Verifikasi & Claim', callback_data='cf_verify')])
+        return Markup(rows)
+
+    def intro(self, cfg):
+        if not cfg.get('backup_required'):
+            return INTRO
+        return (INTRO.replace('✅ Bergabung ke Grup/Channel Testimoni Hyper Store.',
+                              '✅ Bergabung ke Grup/Channel Testimoni Hyper Store.\n✅ Bergabung ke Grup/Channel Backup Hyper Store.')
+                     .replace('1. Tekan tombol <b>Gabung Testimoni</b>.\n2. Bergabung ke grup/channel tersebut.',
+                              '1. Tekan tombol <b>Gabung Testimoni</b> dan <b>Gabung Backup</b>.\n2. Bergabung ke kedua grup/channel tersebut.'))
+
+    def failed(self, cfg):
+        if not cfg.get('backup_required'):
+            return FAILED
+        return FAILED.replace('Kamu belum bergabung ke Grup/Channel Testimoni Hyper Store.',
+                              'Kamu belum memenuhi semua syarat. Pastikan sudah bergabung ke Grup/Channel Testimoni dan Backup Hyper Store.')
+
+    async def verified_requirements(self, bot, cfg, uid):
+        if not await self.verified_member(bot, cfg['testi_chat'], uid):
+            return False
+        if cfg.get('backup_required'):
+            if not cfg.get('backup_chat') or not cfg.get('backup_link'):
+                return False
+            return await self.verified_member(bot, cfg['backup_chat'], uid)
+        return True
 
     async def reply(self, update, text, markup=None):
         # Dedicated messages; never edits the normal catalog or purchased access.
@@ -200,12 +246,12 @@ class ClaimFree:
         cfg = await self.config()
         if await self.is_banned(update.effective_user.id) or not cfg['enabled']:
             return await self.reply(update, UNAVAILABLE)
-        await self.reply(update, INTRO, self.keyboard(cfg))
+        await self.reply(update, self.intro(cfg), self.keyboard(cfg))
 
     async def verified_member(self, bot, chat, uid):
         me, member = await asyncio.gather(bot.get_chat_member(chat, bot.id), bot.get_chat_member(chat, uid))
         if me.status not in ('administrator', 'creator'):
-            raise ValueError('Bot bukan admin grup/channel Testimoni.')
+            raise ValueError('Bot bukan admin grup/channel persyaratan.')
         return member_ok(member)
 
     async def verify(self, update, context):
@@ -222,8 +268,8 @@ class ClaimFree:
             token, link = uuid.uuid4().hex, None
             reserved = False
             try:
-                if not await self.verified_member(context.bot, cfg['testi_chat'], uid):
-                    return await self.reply(update, FAILED, self.keyboard(cfg))
+                if not await self.verified_requirements(context.bot, cfg, uid):
+                    return await self.reply(update, self.failed(cfg), self.keyboard(cfg))
                 reserved = await self.call('reserve', uid, token)
                 if not reserved:
                     return await self.reply(update, '⏳ Claim sedang diproses. Coba kembali sebentar lagi.')
@@ -270,8 +316,8 @@ class ClaimFree:
                        and row['chat_id'] == req.chat.id == cfg['free_chat']
                        and row['config_version'] == cfg['version'] and cfg['enabled'])
             if allowed:
-                allowed = not await self.is_banned(uid) and await self.verified_member(
-                    context.bot, cfg['testi_chat'], uid)
+                allowed = not await self.is_banned(uid) and await self.verified_requirements(
+                    context.bot, cfg, uid)
             if allowed:
                 # Refresh after API call so admin changes during verification fail closed.
                 fresh = await self.config()
@@ -303,14 +349,24 @@ class ClaimFree:
             if q.data == 'cf_verify':
                 return await self.verify(update, context)
             context.user_data.pop('awaiting_claim_free_edit', None)
-            if q.data in ('cf_testi', 'cf_free'):
+            if q.data in ('cf_testi', 'cf_free', 'cf_backup'):
                 context.user_data['awaiting_claim_free_edit'] = q.data
                 prompt = ('Kirim Chat ID grup/channel Testimoni pada baris pertama dan link-nya pada baris kedua.'
-                          if q.data == 'cf_testi' else 'Kirim Chat ID grup/channel Free privat. Bot harus admin dengan izin Undang Pengguna.')
+                          if q.data == 'cf_testi' else
+                          'Kirim Chat ID grup/channel Backup pada baris pertama dan link-nya pada baris kedua.'
+                          if q.data == 'cf_backup' else 'Kirim Chat ID grup/channel Free privat. Bot harus admin dengan izin Undang Pengguna.')
                 return await self.reply(update, prompt, Markup([[Button('❌ Batal', callback_data='cf_cancel')]]))
             if q.data == 'cf_stats':
                 r = await self.call('stats')
                 return await self.reply(update, f"📊 <b>Statistik Claim</b>\n{LINE}\nTotal berhasil: {r['total']}\nHari ini (WIB): {r['today']}\nPengguna unik berhak akses: {r['unique_users']}", Markup([[Button('⬅️ Kembali', callback_data='cf_admin')]]))
+            if q.data == 'cf_backup_toggle':
+                async with self.config_lock:
+                    cfg = await self.config()
+                    required = not cfg.get('backup_required', False)
+                    if required:
+                        await self.validate_backup(context.bot, cfg)
+                    if not await self.call('toggle_backup', required, cfg['version']):
+                        raise ValueError('Konfigurasi berubah. Silakan ulangi.')
             if q.data == 'cf_toggle':
                 async with self.config_lock:
                     cfg = await self.config()
@@ -329,10 +385,15 @@ class ClaimFree:
                 f"Status: {'✅ Aktif' if cfg['enabled'] else '🔴 Nonaktif'}\n\n"
                 f"📢 Testimoni (grup/channel): <code>{cfg['testi_chat'] or 'Belum diatur'}</code>\n"
                 f"Link: {html.escape(cfg['testi_link'] or 'Belum diatur')}\n\n"
+                f"🔰 Backup (grup/channel): <code>{cfg.get('backup_chat') or 'Belum diatur'}</code>\n"
+                f"Link: {html.escape(cfg.get('backup_link') or 'Belum diatur')}\n"
+                f"Syarat Backup: {'✅ Aktif' if cfg.get('backup_required') else '🔴 Nonaktif'}\n\n"
                 f"🎁 Free (grup/channel): <code>{cfg['free_chat'] or 'Belum diatur'}</code>\n\n"
                 'Perubahan grup otomatis menonaktifkan fitur. Validasi ulang sebelum mengaktifkan.')
         await self.reply(update, text, Markup([
             [Button('📢 Atur Testimoni (Grup/Channel)', callback_data='cf_testi')],
+            [Button('🔰 Atur Backup (Grup/Channel)', callback_data='cf_backup')],
+            [Button('🔘 Nonaktifkan Syarat Backup' if cfg.get('backup_required') else '🔘 Aktifkan Syarat Backup', callback_data='cf_backup_toggle')],
             [Button('🎁 Atur Free (Grup/Channel)', callback_data='cf_free')],
             [Button('📊 Statistik Claim', callback_data='cf_stats')],
             [Button('🔘 Nonaktifkan' if cfg['enabled'] else '🔘 Aktifkan', callback_data='cf_toggle')],
@@ -354,12 +415,23 @@ class ClaimFree:
                         raise ValueError('Kirim tepat dua baris: Chat ID lalu link grup/channel Testimoni.')
                     cfg['testi_chat'], cfg['testi_link'] = parse_chat(lines[0]), parse_link(lines[1])
                     await self.validate_chat(context.bot, cfg['testi_chat'], cfg['testi_link'])
+                elif mode == 'cf_backup':
+                    if len(lines) != 2:
+                        raise ValueError('Kirim tepat dua baris: Chat ID lalu link grup/channel Backup.')
+                    cfg['backup_chat'], cfg['backup_link'] = parse_chat(lines[0]), parse_link(lines[1])
+                    await self.validate_backup(context.bot, cfg)
                 else:
                     cfg['free_chat'] = parse_chat('\n'.join(lines))
                     await self.validate_chat(context.bot, cfg['free_chat'], free=True)
                 if cfg['free_chat'] and cfg['testi_chat'] == cfg['free_chat']:
                     raise ValueError('Tujuan Testimoni dan Free harus berbeda.')
-                if not await self.call('save', cfg['testi_chat'], cfg['testi_link'], cfg['free_chat'], cfg['version']):
+                if cfg.get('backup_chat') and cfg['backup_chat'] in (cfg['testi_chat'], cfg['free_chat']):
+                    raise ValueError('Tujuan Backup harus berbeda dari Testimoni dan Free.')
+                if mode == 'cf_backup':
+                    saved = await self.call('save_backup', cfg['backup_chat'], cfg['backup_link'], cfg['version'])
+                else:
+                    saved = await self.call('save', cfg['testi_chat'], cfg['testi_link'], cfg['free_chat'], cfg['version'])
+                if not saved:
                     raise ValueError('Konfigurasi berubah. Silakan ulangi.')
             context.user_data.pop('awaiting_claim_free_edit', None)
             await self.reply(update, '✅ Pengaturan tersimpan permanen. Fitur nonaktif sampai diaktifkan kembali.')

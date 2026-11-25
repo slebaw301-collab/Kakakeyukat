@@ -44,7 +44,7 @@ class TelegramRequest(BaseRequest):
             items = [
                 {'custom_emoji_id': emoji_id, 'emoji': alt, 'type': 'custom_emoji',
                  'file_id': emoji_id, 'file_unique_id': emoji_id, 'width': 100,
-                 'height': 100, 'is_animated': False, 'is_video': False}
+                 'height': 100, 'is_animated': True, 'is_video': False}
                 for emoji_id, alt in dict(EMOJI_CATALOG.values()).items()
                 if emoji_id in data['custom_emoji_ids']
             ]
@@ -209,17 +209,28 @@ class PremiumEmojiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.request.calls[-1][1]['parse_mode'], 'HTML')
         self.assertEqual(self.request.calls[-1][1]['message_id'], 1)
 
-    async def test_validation_batched_cached_and_rejects_wrong_metadata(self):
+    async def test_validation_batched_cached_and_rejects_static_repainted_or_wrong_alt(self):
         engine = PremiumEmoji()
-        package_id = EMOJI_CATALOG['📦'][0]
-        diamond_id = EMOJI_CATALOG['💎'][0]
+
+        def sticker(symbol, *, animated=True, video=False, repaint=False, alt=None):
+            emoji_id, original_alt = EMOJI_CATALOG[symbol]
+            return SimpleNamespace(custom_emoji_id=emoji_id, emoji=alt or original_alt,
+                                   is_animated=animated, is_video=video, needs_repainting=repaint)
+
+        package = sticker('📦')
+        video = sticker('✅', animated=False, video=True)
         bot = SimpleNamespace(get_custom_emoji_stickers=AsyncMock(return_value=[
-            SimpleNamespace(custom_emoji_id=package_id, emoji='📦'),
-            SimpleNamespace(custom_emoji_id=diamond_id, emoji='🚫'),
+            package,
+            video,
+            sticker('💎', alt='🚫'),
+            sticker('👋', repaint=True),
+            sticker('⭐', animated=False),
         ]))
         await asyncio.gather(engine.validate(bot), engine.validate(bot))
         bot.get_custom_emoji_stickers.assert_awaited_once()
-        self.assertEqual(engine.ids, {'📦': package_id})
+        self.assertEqual(engine.ids['📦'], package.custom_emoji_id)
+        self.assertEqual(engine.ids['✅'], video.custom_emoji_id)
+        self.assertEqual(set(engine.ids.values()), {package.custom_emoji_id, video.custom_emoji_id})
         self.assertLessEqual(len(bot.get_custom_emoji_stickers.call_args.args[0]), 200)
 
     async def test_preview_verifies_text_caption_and_button_while_off(self):

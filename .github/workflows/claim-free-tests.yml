@@ -3,7 +3,7 @@ on:
   push:
     branches: [feature/claim-free]
   pull_request:
-    paths: [bot.py, claim_free.py, tests/**, .github/workflows/claim-free-tests.yml]
+    paths: [bot.py, claim_free.py, premium_emoji*.py, tests/**, .github/workflows/claim-free-tests.yml]
 permissions:
   contents: read
 jobs:
@@ -26,5 +26,5 @@ jobs:
         with:
           python-version: '3.11'
       - run: pip install -r requirements.txt
-      - run: python -m py_compile bot.py claim_free.py
+      - run: python -m py_compile bot.py claim_free.py premium_emoji.py premium_emoji_catalog.py
       - run: python -m unittest discover -s tests -v

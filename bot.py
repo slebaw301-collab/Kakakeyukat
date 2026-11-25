@@ -43,6 +43,7 @@ from io import BytesIO
 from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager, AsyncExitStack
 import telegram.error
+from premium_emoji import PremiumEmoji, PremiumEmojiBot, SETTING as PREMIUM_EMOJI_SETTING
 from telegram import (
     Update, BotCommand, BotCommandScopeChat, BotCommandScopeDefault,
     InlineKeyboardButton as TelegramInlineKeyboardButton, InlineKeyboardMarkup, MessageEntity
@@ -688,6 +689,8 @@ async def _latency_reporter_loop():
 _telegram_transport_state = ContextVar("telegram_transport_state", default=None)
 _telegram_transport_probe = ContextVar("telegram_transport_probe", default=False)
 _navigation_timing = ContextVar("navigation_timing", default=None)
+_premium_emoji = PremiumEmoji()
+_premium_emoji_config_lock = asyncio.Lock()
 
 
 class TelegramHTTPXRequest(HTTPXRequest):
@@ -1133,6 +1136,8 @@ if BaseUpdateProcessor is not None:
             if trace is not None:
                 trace['processor_ns'] = _time.perf_counter_ns()
             chat = getattr(update, "effective_chat", None)
+            if chat is not None and chat.id < 0:
+                _premium_emoji.remember_chat(chat.id, chat.type)
             user = getattr(update, "effective_user", None)
             key = (("chat", chat.id) if chat is not None else ("user", user.id) if user is not None
                    else ("update", getattr(update, "update_id", id(update))))
@@ -4132,7 +4137,7 @@ async def _render_buyer_menu(query, text, reply_markup):
     # Include API extension fields (style/custom emoji), which PTB equality ignores.
     markup_data = reply_markup.to_dict() if reply_markup is not None else None
     signature = hashlib.sha256(json.dumps(
-        (text, markup_data), sort_keys=True, ensure_ascii=False, separators=(',', ':')
+        (text, markup_data, _premium_emoji.revision), sort_keys=True, ensure_ascii=False, separators=(',', ':')
     ).encode('utf-8')).digest()
     cache_fresh = cached is not None and started < cached[1]
     if cache_fresh and cached[0] == signature:
@@ -4141,8 +4146,12 @@ async def _render_buyer_menu(query, text, reply_markup):
     try:
         message = query.message
         current_html = getattr(message, 'caption_html', None) if getattr(message, 'photo', None) else getattr(message, 'text_html', None)
-        if not cache_fresh and current_html == text and getattr(message, 'reply_markup', None) == reply_markup:
-            return message
+        if not cache_fresh and not _premium_emoji.enabled and current_html == text:
+            current_markup = getattr(message, 'reply_markup', None)
+            if current_markup == reply_markup and (
+                current_markup is None or current_markup.to_dict() == markup_data
+            ):
+                return message
         if query.message and query.message.photo:
             result = await query.edit_message_caption(caption=text, parse_mode="HTML", reply_markup=reply_markup)
         else:
@@ -4770,6 +4779,18 @@ async def _post_init_warmup(application: Application):
             logger.debug(f"[POST_INIT] Monitoring dipulihkan: {order['order_id']}")
 
 
+async def _load_premium_emoji(bot):
+    async with _premium_emoji_config_lock:
+        try:
+            enabled = await get_setting(PREMIUM_EMOJI_SETTING, '0') == '1'
+        except Exception as exc:
+            logger.warning('[PREMIUM EMOJI] Could not load setting: %s', type(exc).__name__)
+        else:
+            _premium_emoji.set_enabled(enabled)
+            logger.info('[PREMIUM EMOJI] Setting loaded: %s', 'ON' if enabled else 'OFF')
+    await _premium_emoji.validate(bot)
+
+
 async def post_init(application: Application):
     global _current_bot
     _current_bot = application.bot
@@ -4785,6 +4806,7 @@ async def post_init(application: Application):
     # tidak lagi menahan update pertama setelah bot hidup.
     await asyncio.gather(get_http_session(), init_async_db_pool())
     spawn_background(_post_init_warmup(application), name="post-init-warmup")
+    spawn_background(_load_premium_emoji(application.bot), name="premium-emoji-warmup")
     spawn_background(_claim_free.reconciliation_loop(application.bot), name="claim-free-reconciliation")
 
     spawn_background(_auto_backup_loop(), name="auto-backup-loop")
@@ -9468,6 +9490,7 @@ def build_admin_panel_keyboard(user_id: int = None):
     ]
     if user_id and is_super_admin(user_id):
         rows.append([InlineKeyboardButton("👥 Kelola Admin", callback_data="admpanel_admins")])
+    rows.append([InlineKeyboardButton("💎 Pengaturan Premium Emoji", callback_data="admpanel_emoji")])
     return InlineKeyboardMarkup(rows)
 
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -10029,6 +10052,102 @@ async def kick_do_kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # =================== ADMIN: PENGATURAN ===================
 
+def _premium_emoji_panel(status=None):
+    on = _premium_emoji.enabled
+    verified = _premium_emoji.preview_allowed()
+    text = (
+        "<b>💎 Pengaturan Premium Emoji</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"Premium Emoji: <b>{'ON' if on else 'OFF'}</b>\n"
+        "Automatic Fallback: <b>Aktif</b>\n"
+        f"Preview Telegram: <b>{'Terverifikasi' if verified else 'Belum dipastikan'}</b>"
+    )
+    if status:
+        text += f"\n\n{status}"
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔘 Matikan Premium Emoji" if on else "🔘 Aktifkan Premium Emoji",
+                              callback_data="admpanel_emoji|off" if on else "admpanel_emoji|on")],
+        [InlineKeyboardButton("👀 Preview Emoji", callback_data="admpanel_emoji|preview")],
+        [InlineKeyboardButton("⬅️ Kembali ke Panel", callback_data="admpanel_back")],
+    ])
+    return text, markup
+
+
+async def _preview_premium_emoji(message, bot):
+    await _premium_emoji.validate(bot)
+    if not _premium_emoji.ready:
+        return False
+    diamond_id = _premium_emoji.ids.get('💎')
+    package_id = _premium_emoji.ids.get('📦')
+    button_id = _premium_emoji.ids.get('✅')
+    if not all((diamond_id, package_id, button_id)):
+        return False
+    scope = _premium_emoji.preview_target.set(message.chat_id)
+    try:
+        sample = await message.reply_text(
+            "<b>💎 Preview Emoji</b>\n<blockquote>📦 Katalog  ·  🔒 Akses  ·  ✨ Hyper Store</blockquote>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Pengaturan Premium Emoji", callback_data="admpanel_emoji"),
+            ]]),
+        )
+        if not any(e.custom_emoji_id == diamond_id for e in sample.entities):
+            return False
+        if (not sample.reply_markup
+                or sample.reply_markup.inline_keyboard[0][0].api_kwargs.get('icon_custom_emoji_id') != button_id):
+            return False
+        photo = _MENU_PHOTO_FILE_ID or await get_setting(_MENU_PHOTO_SETTING, '')
+        if not photo:
+            photo = BytesIO(base64.b64decode(_MENU_PHOTO_BASE64))
+        caption = await bot.send_photo(
+            chat_id=message.chat_id, photo=photo, caption="<b>📦 Preview Caption Katalog</b>",
+            parse_mode="HTML",
+        )
+        return any(e.custom_emoji_id == package_id for e in caption.caption_entities)
+    finally:
+        _premium_emoji.preview_target.reset(scope)
+
+
+@admin_callback
+async def admpanel_emoji(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if update.effective_chat is None or update.effective_chat.type != 'private':
+        await query.answer("Buka pengaturan ini di chat pribadi bot.", show_alert=True)
+        return
+    await query.answer()
+    action = query.data.partition('|')[2]
+    status = None
+    if action == 'preview':
+        try:
+            verified = await _preview_premium_emoji(query.message, context.bot)
+        except (telegram.error.TelegramError, psycopg2.Error) as exc:
+            logger.info('[PREMIUM EMOJI] Preview unavailable: %s', type(exc).__name__)
+            verified = False
+        _premium_emoji.record_preview(verified)
+        status = ("✅ Telegram mengembalikan emoji Premium pada teks, caption, dan tombol." if verified
+                  else "⚠️ Telegram belum mengonfirmasi dukungan emoji Premium pada teks, caption, dan tombol.")
+    elif action in ('on', 'off'):
+        desired = action == 'on'
+        async with _premium_emoji_config_lock:
+            if desired and not _premium_emoji.preview_allowed():
+                status = "Jalankan Preview Emoji dan pastikan Telegram mendukungnya sebelum mengaktifkan."
+            elif desired != _premium_emoji.enabled:
+                try:
+                    await set_setting(PREMIUM_EMOJI_SETTING, '1' if desired else '0')
+                except Exception as exc:
+                    logger.warning('[PREMIUM EMOJI] Could not save setting: %s', type(exc).__name__)
+                    status = "⚠️ Pengaturan gagal disimpan. Silakan coba lagi."
+                else:
+                    _premium_emoji.set_enabled(desired)
+
+    text, markup = _premium_emoji_panel(status)
+    try:
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+    except telegram.error.BadRequest as exc:
+        if 'message is not modified' not in str(exc).lower():
+            raise
+
+
 @admin_callback
 async def admpanel_setting(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -10472,29 +10591,33 @@ def main():
     else:
         logger.info("[DB] Startup migrations dilewati (RUN_DB_MIGRATIONS_ON_STARTUP=0).")
 
-    builder = (
-        Application.builder()
-        .token(TOKEN)
-        .post_init(post_init)
-        .post_shutdown(post_shutdown)
-        .update_queue(CallbackTimingQueue())
-        .get_updates_request(PollingHTTPXRequest())
-        .request(TelegramHTTPXRequest(connection_pool_size=TELEGRAM_CONNECTION_POOL_SIZE,
-                                    pool_timeout=TELEGRAM_POOL_TIMEOUT_SECONDS))
-    )
-    if hasattr(builder, 'post_stop'):
-        builder = builder.post_stop(_stop_blast_before_shutdown)
+    rate_limiter = None
     if BuyerPriorityRateLimiter is not None:
-        builder = builder.rate_limiter(BuyerPriorityRateLimiter())
+        rate_limiter = BuyerPriorityRateLimiter()
         logger.info('[TELEGRAM] Limiter aktif: buyer priority, background dibatasi.')
     elif AIORateLimiter is not None:
         try:
-            builder = builder.rate_limiter(
-                AIORateLimiter(overall_max_rate=28, overall_time_period=1, max_retries=1)
-            )
+            rate_limiter = AIORateLimiter(overall_max_rate=28, overall_time_period=1, max_retries=1)
             logger.info("[TELEGRAM] AIORateLimiter aktif.")
         except Exception as exc:
             logger.info(f"[TELEGRAM] Rate limiter opsional tidak aktif: {exc}")
+    bot = PremiumEmojiBot(
+        token=TOKEN,
+        premium_emoji=_premium_emoji,
+        rate_limiter=rate_limiter,
+        get_updates_request=PollingHTTPXRequest(),
+        request=TelegramHTTPXRequest(connection_pool_size=TELEGRAM_CONNECTION_POOL_SIZE,
+                                     pool_timeout=TELEGRAM_POOL_TIMEOUT_SECONDS),
+    )
+    builder = (
+        Application.builder()
+        .bot(bot)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .update_queue(CallbackTimingQueue())
+    )
+    if hasattr(builder, 'post_stop'):
+        builder = builder.post_stop(_stop_blast_before_shutdown)
     if PerChatUpdateProcessor is not None:
         builder = builder.concurrent_updates(PerChatUpdateProcessor(BOT_CONCURRENT_UPDATES))
     else:
@@ -10613,6 +10736,7 @@ def main():
     app.add_handler(CallbackQueryHandler(kick_do_kick,     pattern="^kick_do_kick\\|"))
 
     # Admin Settings Configuration Flow
+    app.add_handler(CallbackQueryHandler(admpanel_emoji, pattern=r"^admpanel_emoji(?:\|(on|off|preview))?$"))
     app.add_handler(CallbackQueryHandler(admpanel_setting,              pattern="^admpanel_setting$"))
     app.add_handler(CallbackQueryHandler(admpanel_setting_channel_set,  pattern="^admpanel_setting_channel_set$"))
     app.add_handler(CallbackQueryHandler(admpanel_setting_channel_off,  pattern="^admpanel_setting_channel_off$"))

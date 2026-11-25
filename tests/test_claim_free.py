@@ -124,7 +124,7 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         self.ctx.bot.create_chat_invite_link.assert_awaited_once()
 
     async def test_admin_callback_denied(self):
-        for data in ('cf_admin', 'cf_testi', 'cf_free', 'cf_stats', 'cf_toggle', 'cf_cancel', 'cf_backup', 'cf_backup_toggle'):
+        for data in ('cf_admin', 'cf_testi', 'cf_free', 'cf_stats', 'cf_toggle', 'cf_cancel', 'cf_backup', 'cf_backup_toggle', 'cf_kick_toggle'):
             self.u.callback_query.data = data
             await self.f.callback(self.u, self.ctx)
         self.f.config.assert_not_awaited()
@@ -319,6 +319,104 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         self.f.call.assert_not_awaited()
 
 
+class AutoKickTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        await FlowTests.asyncSetUp(self)
+        self.cfg.update(auto_kick=True, backup_required=True, backup_chat=-10044,
+                        backup_link='https://t.me/backupgroup')
+        self.f.paid_access = AsyncMock(return_value=False)
+        self.f.call = AsyncMock(return_value=True)
+        self.ctx.bot.unban_chat_member = AsyncMock(return_value=True)
+        self.ctx.bot.send_message = AsyncMock()
+        self.ctx.bot.get_chat.return_value = NS(type='supergroup', username=None)
+        self.missing = {-10044}
+        self.target_status = 'member'
+        def member(chat, uid):
+            if uid == 99:
+                return NS(status='administrator', can_restrict_members=True, can_invite_users=True)
+            return NS(status=self.target_status if chat == -10022 else ('left' if chat in self.missing else 'member'))
+        self.ctx.bot.get_chat_member.side_effect = member
+
+    def event(self, chat=-10044, old='member', new='left', uid=123):
+        self.u.chat_member = NS(chat=NS(id=chat), old_chat_member=NS(status=old),
+                                new_chat_member=NS(status=new, user=NS(id=uid)))
+        return self.u
+
+    async def test_backup_leave_kicks_without_ban_and_notifies(self):
+        await self.f.membership_changed(self.event(), self.ctx)
+        self.ctx.bot.unban_chat_member.assert_awaited_once_with(-10022, 123, only_if_banned=False)
+        self.assertEqual(self.ctx.bot.send_message.call_args.args[0], 123)
+        self.assertEqual(self.ctx.bot.send_message.call_args.kwargs['reply_markup'].inline_keyboard[0][0].callback_data, 'cf_verify')
+
+    async def test_testimonial_leave_kicks(self):
+        self.missing = {-10011}
+        await self.f.membership_changed(self.event(chat=-10011), self.ctx)
+        self.ctx.bot.unban_chat_member.assert_awaited_once()
+
+    async def test_stale_leave_or_rejoin_no_kick(self):
+        self.missing.clear()
+        await self.f.membership_changed(self.event(), self.ctx)
+        self.ctx.bot.unban_chat_member.assert_not_awaited()
+
+    async def test_unapproved_member_no_kick(self):
+        self.f.call.return_value = False
+        await self.f.membership_changed(self.event(), self.ctx)
+        self.ctx.bot.unban_chat_member.assert_not_awaited()
+
+    async def test_paid_member_no_kick(self):
+        self.f.paid_access.return_value = True
+        await self.f.membership_changed(self.event(), self.ctx)
+        self.ctx.bot.unban_chat_member.assert_not_awaited()
+
+    async def test_off_disabled_unrelated_or_backup_not_required(self):
+        for change in ({'auto_kick': False}, {'enabled': False}, {'backup_required': False}):
+            previous = dict(self.cfg)
+            self.cfg.update(change)
+            await self.f.membership_changed(self.event(), self.ctx)
+            self.cfg = previous
+        await self.f.membership_changed(self.event(chat=-10077), self.ctx)
+        await self.f.membership_changed(self.event(old='left', new='member'), self.ctx)
+        self.ctx.bot.unban_chat_member.assert_not_awaited()
+
+    async def test_admin_and_manually_banned_members_protected(self):
+        for status in ('administrator', 'creator', 'kicked', 'left'):
+            self.target_status = status
+            await self.f.membership_changed(self.event(), self.ctx)
+        self.ctx.bot.unban_chat_member.assert_not_awaited()
+
+    async def test_api_failure_does_not_kick(self):
+        self.ctx.bot.get_chat_member.side_effect = TelegramError('offline')
+        await self.f.membership_changed(self.event(), self.ctx)
+        self.ctx.bot.unban_chat_member.assert_not_awaited()
+
+    async def test_notification_failure_does_not_reverse_removal(self):
+        self.ctx.bot.send_message.side_effect = TelegramError('blocked')
+        await self.f.membership_changed(self.event(), self.ctx)
+        self.ctx.bot.unban_chat_member.assert_awaited_once()
+
+    async def test_sweep_uses_approved_history_and_cursor(self):
+        self.f.call.side_effect = lambda action, *args: [123] if action == 'approved_batch' else True
+        await self.f.reconcile(self.ctx.bot, batch_size=1)
+        self.f.call.assert_any_await('approved_batch', -10022, 0, 1)
+        self.assertEqual(self.f.sweep_cursor, 123)
+        self.ctx.bot.unban_chat_member.assert_awaited_once()
+
+    async def test_auto_kick_admin_enable_requires_permissions(self):
+        self.cfg['auto_kick'] = False
+        self.f.is_admin.return_value = True
+        self.f.permissions = AsyncMock()
+        self.f.validate_kick_permissions = AsyncMock(side_effect=ValueError('no permission'))
+        self.u.callback_query.data = 'cf_kick_toggle'
+        await self.f.callback(self.u, self.ctx)
+        self.f.call.assert_not_awaited()
+
+    async def test_auto_kick_toggle_preserves_claim_config(self):
+        self.f.is_admin.return_value = True
+        self.u.callback_query.data = 'cf_kick_toggle'
+        await self.f.callback(self.u, self.ctx)
+        self.f.call.assert_awaited_once_with('toggle_auto_kick', False, 1)
+
+
 class ValidationTests(unittest.TestCase):
     def test_membership_statuses(self):
         for status in ('creator', 'administrator', 'member'):
@@ -377,7 +475,7 @@ class PostgresTests(unittest.TestCase):
     def setUp(self):
         with self.f.session() as conn, conn.cursor() as c:
             c.execute('TRUNCATE claim_free_invites,claim_free_claims')
-            c.execute('UPDATE claim_free_config SET enabled=TRUE,testi_chat=-10011,testi_link=%s,free_chat=-10022,version=1,backup_chat=NULL,backup_link=NULL,backup_required=FALSE', ('https://t.me/testigroup',))
+            c.execute('UPDATE claim_free_config SET enabled=TRUE,testi_chat=-10011,testi_link=%s,free_chat=-10022,version=1,backup_chat=NULL,backup_link=NULL,backup_required=FALSE,auto_kick=FALSE', ('https://t.me/testigroup',))
 
     def test_concurrent_lease_and_unique_right(self):
         from concurrent.futures import ThreadPoolExecutor
@@ -416,6 +514,24 @@ class PostgresTests(unittest.TestCase):
         cfg = self.f.db('config')
         self.assertFalse(cfg['backup_required'])
         self.assertEqual(cfg['backup_chat'], -10044)
+
+    def test_auto_kick_only_approved_invites_and_config(self):
+        self.assertTrue(self.f.db('toggle_auto_kick', True, 1))
+        self.f.migrate()
+        cfg = self.f.db('config')
+        self.assertTrue(cfg['enabled'])
+        self.assertTrue(cfg['auto_kick'])
+        self.assertEqual(cfg['version'], 1)
+        self.f.db('reserve', 123, 'pending')
+        self.f.db('finish', 123, 'pending', 'https://t.me/+ok', -10022, 1, datetime.now(timezone.utc)+timedelta(minutes=15))
+        self.assertFalse(self.f.db('approved', 123, -10022))
+        self.assertEqual(self.f.db('approved_batch', -10022, 0, 10), [])
+        self.f.db('consume', 'https://t.me/+ok')
+        self.assertTrue(self.f.db('approved', 123, -10022))
+        self.assertFalse(self.f.db('approved', 123, -10033))
+        self.assertEqual(self.f.db('approved_batch', -10022, 0, 10), [123])
+        self.assertEqual(self.f.db('approved_batch', -10022, 123, 10), [])
+        self.assertEqual(self.f.db('stats')['total'], 1)
 
     def test_recovery_link_consumption_and_config_disable(self):
         self.f.db('reserve', 123, 'pending')

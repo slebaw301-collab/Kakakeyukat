@@ -49,7 +49,7 @@ from telegram import (
 )
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
-    MessageHandler, ChatJoinRequestHandler, filters, ContextTypes
+    MessageHandler, ChatJoinRequestHandler, ChatMemberHandler, filters, ContextTypes
 )
 
 try:
@@ -4785,6 +4785,7 @@ async def post_init(application: Application):
     # tidak lagi menahan update pertama setelah bot hidup.
     await asyncio.gather(get_http_session(), init_async_db_pool())
     spawn_background(_post_init_warmup(application), name="post-init-warmup")
+    spawn_background(_claim_free.reconciliation_loop(application.bot), name="claim-free-reconciliation")
 
     spawn_background(_auto_backup_loop(), name="auto-backup-loop")
     spawn_background(_buyer_reminder_loop(_current_bot), name="buyer-reminder-loop")
@@ -10460,7 +10461,8 @@ def _install_uvloop_if_available():
 # =================== MAIN ENTRYPOINT ===================
 
 from claim_free import ClaimFree
-_claim_free = ClaimFree(db_session_safe, run_db, is_admin, is_banned)
+_claim_free = ClaimFree(db_session_safe, run_db, is_admin, is_banned,
+                        paid_access=lambda uid, chat: run_db(_check_join_request_sync, uid, str(chat)))
 
 def main():
     init_pool()
@@ -10639,7 +10641,8 @@ def main():
 
     # Auto-Approve Join Request Handler
     app.add_handler(ChatJoinRequestHandler(handle_join_request))
-    app.add_handler(CallbackQueryHandler(_claim_free.callback, pattern=r"^cf_(?:admin|testi|free|stats|toggle|verify|cancel|backup|backup_toggle)$"))
+    app.add_handler(CallbackQueryHandler(_claim_free.callback, pattern=r"^cf_(?:admin|testi|free|stats|toggle|verify|cancel|backup|backup_toggle|kick_toggle)$"))
+    app.add_handler(ChatMemberHandler(_claim_free.membership_changed, ChatMemberHandler.CHAT_MEMBER))
 
     # Backup & Import Document Handlers
     app.add_handler(MessageHandler(
@@ -10657,7 +10660,7 @@ def main():
         f"Bot Hyper Family Store berjalan | concurrent={BOT_CONCURRENT_UPDATES} | "
         f"telegram_pool={TELEGRAM_CONNECTION_POOL_SIZE} | db_pool={DB_POOL_MAX}"
     )
-    app.run_polling(allowed_updates=["message", "callback_query", "chat_join_request"])
+    app.run_polling(allowed_updates=["message", "callback_query", "chat_join_request", "chat_member"])
 
 if __name__ == "__main__":
     _install_uvloop_if_available()

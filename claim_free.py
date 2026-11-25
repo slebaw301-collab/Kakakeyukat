@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
 from telegram import InlineKeyboardButton as Button, InlineKeyboardMarkup as Markup
-from telegram.error import TelegramError
+from telegram.error import TelegramError, RetryAfter
 
 log = logging.getLogger(__name__)
 LINE = '━━━━━━━━━━━━━━━━━━━━━━'
@@ -35,6 +35,13 @@ SUCCESS = (
     f'{LINE}\n\nTekan tombol di bawah untuk bergabung ke grup/channel gratis.'
 )
 
+ACCESS_REVOKED = (
+    f'⚠️ <b>AKSES GRUP FREE DICABUT</b>\n{LINE}\n\n'
+    'Akses kamu telah dicabut karena tidak lagi memenuhi persyaratan Claim Grup Free.\n\n'
+    'Silakan bergabung kembali ke grup/channel persyaratan untuk memulihkan akses.\n\n'
+    f'{LINE}'
+)
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS claim_free_config (
  id SMALLINT PRIMARY KEY CHECK (id=1), enabled BOOLEAN NOT NULL DEFAULT FALSE,
@@ -44,6 +51,7 @@ CREATE TABLE IF NOT EXISTS claim_free_config (
 ALTER TABLE claim_free_config ADD COLUMN IF NOT EXISTS backup_chat BIGINT;
 ALTER TABLE claim_free_config ADD COLUMN IF NOT EXISTS backup_link TEXT;
 ALTER TABLE claim_free_config ADD COLUMN IF NOT EXISTS backup_required BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE claim_free_config ADD COLUMN IF NOT EXISTS auto_kick BOOLEAN NOT NULL DEFAULT FALSE;
 INSERT INTO claim_free_config(id) VALUES(1) ON CONFLICT DO NOTHING;
 CREATE TABLE IF NOT EXISTS claim_free_claims (
  user_id BIGINT PRIMARY KEY, claimed_at TIMESTAMPTZ,
@@ -56,6 +64,8 @@ CREATE TABLE IF NOT EXISTS claim_free_invites (
  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS claim_free_invites_user_idx ON claim_free_invites(user_id);
+CREATE INDEX IF NOT EXISTS claim_free_approved_chat_user_idx
+ ON claim_free_invites(chat_id,user_id) WHERE consumed_at IS NOT NULL;
 """
 
 
@@ -82,11 +92,14 @@ def parse_link(value):
 
 
 class ClaimFree:
-    def __init__(self, session, run_db, is_admin, is_banned):
+    def __init__(self, session, run_db, is_admin, is_banned, paid_access=None):
         self.session, self.run_db = session, run_db
         self.is_admin, self.is_banned = is_admin, is_banned
         self.locks = [asyncio.Lock() for _ in range(64)]
         self.config_lock = asyncio.Lock()
+        self.paid_access = paid_access
+        self.sweep_cursor = 0
+        self.sweep_scope = None
 
     def migrate(self):
         with self.session() as conn:
@@ -118,6 +131,20 @@ class ClaimFree:
                         enabled, version = args
                         c.execute('UPDATE claim_free_config SET enabled=%s,version=version+1 WHERE id=1 AND version=%s RETURNING id', (enabled, version))
                         return bool(c.fetchone())
+                    if action == 'toggle_auto_kick':
+                        enabled, version = args
+                        c.execute('UPDATE claim_free_config SET auto_kick=%s WHERE id=1 AND version=%s RETURNING id', (enabled, version))
+                        return bool(c.fetchone())
+                    if action == 'approved':
+                        uid, chat = args
+                        c.execute('SELECT 1 FROM claim_free_invites WHERE user_id=%s AND chat_id=%s AND consumed_at IS NOT NULL LIMIT 1', (uid, chat))
+                        return bool(c.fetchone())
+                    if action == 'approved_batch':
+                        chat, cursor, limit = args
+                        c.execute('''SELECT DISTINCT user_id FROM claim_free_invites
+                            WHERE chat_id=%s AND user_id>%s AND consumed_at IS NOT NULL
+                            ORDER BY user_id LIMIT %s''', (chat, cursor, limit))
+                        return [r['user_id'] for r in c.fetchall()]
                     if action == 'reserve':
                         uid, token = args
                         c.execute("""INSERT INTO claim_free_claims(user_id,lease_token,lease_until)
@@ -179,6 +206,18 @@ class ClaimFree:
         await self.validate_chat(bot, cfg['free_chat'], free=True)
         if cfg.get('backup_required'):
             await self.validate_backup(bot, cfg)
+        if cfg.get('auto_kick'):
+            await self.validate_kick_permissions(bot, cfg)
+
+    async def validate_kick_permissions(self, bot, cfg):
+        if not cfg.get('free_chat'):
+            raise ValueError('Atur Grup/Channel Free terlebih dahulu.')
+        chat, me = await asyncio.gather(bot.get_chat(cfg['free_chat']),
+                                       bot.get_chat_member(cfg['free_chat'], bot.id))
+        if chat.type not in ('supergroup', 'channel'):
+            raise ValueError('Auto-kick memerlukan supergroup/channel Free agar pengguna dapat bergabung kembali.')
+        if me.status != 'creator' and not (me.status == 'administrator' and getattr(me, 'can_restrict_members', False)):
+            raise ValueError('Aktifkan izin Ban Users / Batasi Anggota untuk bot di Grup/Channel Free.')
 
     async def validate_backup(self, bot, cfg):
         if not cfg.get('backup_chat') or not cfg.get('backup_link'):
@@ -308,6 +347,10 @@ class ClaimFree:
         # Only feature-owned links are intercepted; existing paid handler is untouched.
         if not (invite.name or '').startswith('hf-free-'):
             return False
+        async with self.locks[req.from_user.id % len(self.locks)]:
+            return await self._owned_join_request(req, invite, context)
+
+    async def _owned_join_request(self, req, invite, context):
         try:
             row = await self.call('invite', invite.invite_link)
             cfg = await self.config()
@@ -335,6 +378,107 @@ class ClaimFree:
             except TelegramError:
                 pass
         return True
+
+    @staticmethod
+    def kick_active(cfg):
+        return bool(cfg.get('enabled') and cfg.get('auto_kick') and cfg.get('free_chat')
+                    and cfg.get('testi_chat')
+                    and (not cfg.get('backup_required') or
+                         (cfg.get('backup_chat') and cfg.get('backup_link'))))
+
+    async def enforce_member(self, bot, cfg, uid):
+        if not self.kick_active(cfg) or uid == bot.id:
+            return False
+        async with self.locks[uid % len(self.locks)]:
+            if not await self.call('approved', uid, cfg['free_chat']):
+                return False
+            current = await self.config()
+            if not self.kick_active(current) or current['version'] != cfg['version']:
+                return False
+            target = await bot.get_chat_member(cfg['free_chat'], uid)
+            if not member_ok(target) or target.status in ('administrator', 'creator'):
+                return False
+            # Fail closed if paid access cannot be checked; never remove a paid buyer.
+            if self.paid_access is None or await self.paid_access(uid, cfg['free_chat']):
+                return False
+            if await self.verified_requirements(bot, current, uid):
+                return False
+            async with self.config_lock:
+                fresh = await self.config()
+                if not self.kick_active(fresh) or fresh['version'] != cfg['version']:
+                    return False
+                await self.validate_kick_permissions(bot, fresh)
+                # Never unban a manually banned user, or kick an administrator.
+                target = await bot.get_chat_member(fresh['free_chat'], uid)
+                if not member_ok(target) or target.status in ('administrator', 'creator'):
+                    return False
+                if await self.paid_access(uid, fresh['free_chat']):
+                    return False
+                # Recheck current membership to avoid acting on stale leave updates.
+                if await self.verified_requirements(bot, fresh, uid):
+                    return False
+                # Telegram unban with only_if_banned=False removes a current member
+                # without leaving a permanent ban; no two-step ban/unban failure.
+                if not await bot.unban_chat_member(fresh['free_chat'], uid, only_if_banned=False):
+                    return False
+            try:
+                await bot.send_message(uid, ACCESS_REVOKED, parse_mode='HTML',
+                    reply_markup=Markup([[Button('🔄 Pulihkan Akses', callback_data='cf_verify')]]),
+                    protect_content=True, disable_web_page_preview=True)
+            except TelegramError:
+                log.info('[CLAIM FREE] removal notification unavailable')
+            return True
+
+    async def membership_changed(self, update, context):
+        event = update.chat_member
+        if not event or not member_ok(event.old_chat_member) or member_ok(event.new_chat_member):
+            return
+        try:
+            cfg = await self.config()
+            if not self.kick_active(cfg):
+                return
+            required = {cfg['testi_chat']}
+            if cfg.get('backup_required'):
+                required.add(cfg['backup_chat'])
+            if event.chat.id not in required:
+                return
+            await self.enforce_member(context.bot, cfg, event.new_chat_member.user.id)
+        except Exception as exc:
+            log.warning('[CLAIM FREE] membership event deferred: %s', type(exc).__name__)
+
+    async def reconcile(self, bot, batch_size=10):
+        cfg = await self.config()
+        if not self.kick_active(cfg):
+            self.sweep_cursor, self.sweep_scope = 0, None
+            return
+        scope = (cfg['free_chat'], cfg['version'])
+        if self.sweep_scope != scope:
+            self.sweep_cursor, self.sweep_scope = 0, scope
+        ids = await self.call('approved_batch', cfg['free_chat'], self.sweep_cursor, batch_size)
+        for uid in ids:
+            try:
+                await self.enforce_member(bot, cfg, uid)
+            except RetryAfter:
+                # Resume from last completed user on next interval.
+                raise
+            except Exception as exc:
+                log.warning('[CLAIM FREE] reconciliation deferred: %s', type(exc).__name__)
+            self.sweep_cursor = uid
+            await asyncio.sleep(0.5)
+        if len(ids) < batch_size:
+            self.sweep_cursor = 0
+
+    async def reconciliation_loop(self, bot):
+        # Bounded, sequential sweep; catches missed events after downtime.
+        while True:
+            delay = 30
+            try:
+                await self.reconcile(bot)
+            except RetryAfter as exc:
+                delay = max(delay, float(exc.retry_after) + 1)
+            except Exception as exc:
+                log.warning('[CLAIM FREE] reconciliation paused: %s', type(exc).__name__)
+            await asyncio.sleep(delay)
 
     async def callback(self, update, context):
         q = update.callback_query
@@ -367,6 +511,15 @@ class ClaimFree:
                         await self.validate_backup(context.bot, cfg)
                     if not await self.call('toggle_backup', required, cfg['version']):
                         raise ValueError('Konfigurasi berubah. Silakan ulangi.')
+            if q.data == 'cf_kick_toggle':
+                async with self.config_lock:
+                    cfg = await self.config()
+                    active = not cfg.get('auto_kick', False)
+                    if active:
+                        await self.permissions(context.bot, cfg)
+                        await self.validate_kick_permissions(context.bot, cfg)
+                    if not await self.call('toggle_auto_kick', active, cfg['version']):
+                        raise ValueError('Konfigurasi berubah. Silakan ulangi.')
             if q.data == 'cf_toggle':
                 async with self.config_lock:
                     cfg = await self.config()
@@ -388,13 +541,15 @@ class ClaimFree:
                 f"🔰 Backup (grup/channel): <code>{cfg.get('backup_chat') or 'Belum diatur'}</code>\n"
                 f"Link: {html.escape(cfg.get('backup_link') or 'Belum diatur')}\n"
                 f"Syarat Backup: {'✅ Aktif' if cfg.get('backup_required') else '🔴 Nonaktif'}\n\n"
-                f"🎁 Free (grup/channel): <code>{cfg['free_chat'] or 'Belum diatur'}</code>\n\n"
+                f"🎁 Free (grup/channel): <code>{cfg['free_chat'] or 'Belum diatur'}</code>\n"
+                f"Auto-kick: {'✅ Aktif' if cfg.get('auto_kick') and cfg['enabled'] else '⏸ Dijeda (Claim nonaktif)' if cfg.get('auto_kick') else '🔴 Nonaktif'}\n\n"
                 'Perubahan grup otomatis menonaktifkan fitur. Validasi ulang sebelum mengaktifkan.')
         await self.reply(update, text, Markup([
             [Button('📢 Atur Testimoni (Grup/Channel)', callback_data='cf_testi')],
             [Button('🔰 Atur Backup (Grup/Channel)', callback_data='cf_backup')],
             [Button('🔘 Nonaktifkan Syarat Backup' if cfg.get('backup_required') else '🔘 Aktifkan Syarat Backup', callback_data='cf_backup_toggle')],
             [Button('🎁 Atur Free (Grup/Channel)', callback_data='cf_free')],
+            [Button('🔘 Nonaktifkan Auto-kick' if cfg.get('auto_kick') else '🔘 Aktifkan Auto-kick', callback_data='cf_kick_toggle')],
             [Button('📊 Statistik Claim', callback_data='cf_stats')],
             [Button('🔘 Nonaktifkan' if cfg['enabled'] else '🔘 Aktifkan', callback_data='cf_toggle')],
             [Button('⬅️ Kembali ke Panel', callback_data='admpanel_back')]]))

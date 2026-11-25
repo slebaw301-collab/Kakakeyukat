@@ -33,6 +33,15 @@ _SYMBOL = re.compile(
     r'(?<!\u200d)[' + re.escape(''.join(EMOJI_CATALOG))
     + r']\ufe0f?(?![\u200d\ufe0e\ufe0f\u20e3\U0001f3fb-\U0001f3ff])'
 )
+# Product emoji are editable in the admin panel. Unknown product glyphs use
+# the catalog icon while retaining the original button payload for OFF/fallback.
+_PRODUCT_CALLBACKS = ('pilih_', 'ganti_paket_konfirm|', 'resend_select|', 'pd_detail_',
+                      'pd_req_toggle|', 'prereq_buy_')
+_EMOJI_PART = r'[\u2194-\u2199\u21a9\u21aa\u23e9-\u23fa\u25aa-\u27bf\u2b05-\u2b55\U0001f300-\U0001faff]\ufe0f?[\U0001f3fb-\U0001f3ff]?'
+_PRODUCT_EMOJI = re.compile(
+    rf'^(?:[\U0001f1e6-\U0001f1ff]{{2}}|[#*0-9]\ufe0f?\u20e3|'
+    rf'{_EMOJI_PART}(?:\u200d{_EMOJI_PART})*)\s(?=\s*\S)'
+)
 _HTML_TAG = re.compile(r"""<(/?)([a-z][a-z0-9-]*)(?=[\s/>])(?:[^<"'>]|"[^"]*"|'[^']*')*>""", re.I)
 _BARE_URL = re.compile(r'(?:https?://|tg://)[^\s<>]+', re.I)
 _REJECTION = re.compile(
@@ -186,7 +195,11 @@ class PremiumEmoji:
         value, ids = self._format_html(text if parse_mode else escape(text, quote=False))
         return (value, ids) if ids else (text, None)
 
-    def _button_icon(self, label):
+    def _button_icon(self, label, product_fallback=False):
+        if product_fallback:
+            prefix = _PRODUCT_EMOJI.match(label)
+            emoji_id = self.ids.get('📦')
+            return (label[prefix.end():], emoji_id) if prefix and emoji_id else None
         # Telegram has room for one custom icon before the label. Retain other
         # symbols, and keep labels consisting only of an emoji unchanged.
         for match in _SYMBOL.finditer(label):
@@ -209,6 +222,9 @@ class PremiumEmoji:
                 if button.api_kwargs.get('icon_custom_emoji_id'):
                     continue
                 icon = self.button_cache(button.text)
+                callback = button.callback_data
+                if icon is None and isinstance(callback, str) and callback.startswith(_PRODUCT_CALLBACKS):
+                    icon = self.button_cache(button.text, True)
                 if icon is None:
                     continue
                 if rows is None:

@@ -41,7 +41,7 @@ class AccountMonitorPanelTests(unittest.IsolatedAsyncioTestCase):
         self.client.call.side_effect = summary
         await self.panel.callback(item, None)
         edit = item.callback_query.edit_message_text.call_args
-        self.assertIn("Total akun <b>1</b>", edit.args[0])
+        self.assertIn("<b>1 akun</b>", edit.args[0])
         self.assertIn("admpanel_back", [b.callback_data for row in edit.kwargs["reply_markup"].inline_keyboard for b in row])
 
     async def test_owner_can_return_when_service_is_offline(self):

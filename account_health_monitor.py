@@ -14,10 +14,10 @@ from urllib.parse import urlsplit
 from uuid import uuid4
 
 import aiohttp
-from telegram import InputMediaPhoto
+from telegram import ForceReply, InputMediaPhoto
 from telegram import InlineKeyboardButton as Button, InlineKeyboardMarkup
 from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
-from telegram.ext import CallbackQueryHandler, CommandHandler
+from telegram.ext import CallbackQueryHandler, CommandHandler, MessageHandler, filters
 
 
 logger = logging.getLogger(__name__)
@@ -33,7 +33,7 @@ STATES = {
 CATEGORIES = {
     "frozen": "Akun Frozen", "deactivated": "Akun Deactivated", "restricted": "Pembatasan akun",
     "spam": "Spam Limited", "invalid": "Session invalid", "offline": "Koneksi akun",
-    "peer": "Akses channel atau grup", "recovered": "Akun kembali normal",
+    "peer": "Akses channel atau grup", "role": "Perubahan peran", "recovered": "Akun kembali normal",
     "system": "Gangguan service", "appeal": "Tenggat banding", "daily": "Laporan harian",
 }
 APPEALS = {
@@ -41,14 +41,39 @@ APPEALS = {
     "rejected": "Ditolak", "withdrawn": "Ditarik",
 }
 INCIDENTS = {
-    "all": "Semua", "critical": "Critical", "warning": "Warning", "unknown": "Unknown", "resolved": "Resolved",
+    "all": "Semua", "critical": "Critical", "warning": "Peringatan", "unknown": "Belum pasti", "resolved": "Selesai",
 }
 SETTINGS = {
     "automatic": "Automatic Monitoring", "channels": "Channel Monitor",
     "notifications": "Instant Notification", "daily": "Daily Report",
     "interval_minutes": "Interval monitoring", "retention_days": "Retensi riwayat",
-    "concurrency": "Pemeriksaan paralel", "max_clients": "Batas client", "kill_switch": "Kill Switch",
+    "peer_limit": "Batas channel dan grup", "concurrency": "Pemeriksaan paralel", "max_clients": "Batas client", "kill_switch": "Kill Switch",
 }
+ACCOUNT_FILTERS = {"all": "Semua akun", "normal": "Normal", "spam_limited": "Spam Limited",
+                   "restricted": "Restricted", "frozen": "Frozen", "deactivated": "Deactivated",
+                   "invalid": "Session Invalid", "disconnected": "Disconnected", "unknown": "Unknown"}
+PEER_TYPES = {"all": "Semua jenis", "channel": "Channel", "group": "Grup"}
+PEER_ROLES = {"all": "Semua peran", "owner": "Owner", "admin": "Admin", "member": "Member"}
+CHECK_REASONS = {
+    "invalid": "Session Invalid. Autentikasi ulang akun.",
+    "deactivated": "Telegram mengonfirmasi akun dinonaktifkan.",
+    "disconnected": "Koneksi Telegram terputus. Coba lagi nanti.",
+    "no_session": "Session hilang. Autentikasi ulang akun.",
+    "removed": "Item telah dihapus dari monitor.",
+    "unknown": "Status belum terkonfirmasi. Lihat detail akun.",
+    "service_error": "Service sempat terganggu. Coba ulang.",
+    "peer_unknown": "Akses belum terverifikasi. Coba periksa ulang.",
+}
+SPAM_REASONS = {
+    "identitas": "Identitas bot resmi belum terverifikasi.",
+    "menunggu": "Telegram belum mengirim respons terbaru.",
+    "kedaluwarsa": "Respons terbaru sudah lebih dari 24 jam.",
+    "format": "Respons Telegram belum dapat dikenali dengan pasti.",
+    "belum_ada": "Belum ada respons di chat @SpamBot.",
+    "akun": "Sesi atau kondisi akun tidak mendukung pemeriksaan.",
+    "koneksi": "Telegram gagal dijangkau. Coba lagi.",
+}
+
 UNAVAILABLE = "Account Monitor sedang tidak tersedia."
 
 
@@ -176,15 +201,7 @@ def state(value):
 
 
 def account_line(row):
-    value = row["health"]
-    spam_at, until = row["spam_at"], row["spam_until"]
-    now = datetime.now(timezone.utc)
-    if value == "normal" and row["spam_status"] == "limited" and spam_at and (
-        (now - datetime.fromisoformat(spam_at)).total_seconds() < 604800
-        and (until is None or datetime.fromisoformat(until) > now)
-    ):
-        value = "spam_limited"
-    return state(value)
+    return state(row.get("display_status", row.get("latest_health", row["health"])))
 
 
 def fresh(value, seconds):
@@ -204,7 +221,7 @@ def pagination(route, args, page, more):
 
 
 def panel(title, text="", rows=(), back=None):
-    header = f"<b>{title}</b>\n========================"
+    header = f"<b>{escape(title)}</b>\n========================"
     markup = list(rows)
     if back:
         markup.append([back])
@@ -220,6 +237,13 @@ class AccountMonitorPanel:
         self.background_options = background_options
         self.task = None
         self.active_notice = None
+        self.selections = {}
+        self.view_version = 0
+        self.refresh_task = None
+        self.prompt = None
+        self.confirm_remove = None
+        self.confirm_account = None
+        self.run_back = {}
         self.qr_flow = None
         self.qr_runner = None
         self.qr_start_lock = asyncio.Lock()
@@ -242,6 +266,19 @@ class AccountMonitorPanel:
     def register(self, app):
         app.add_handler(CallbackQueryHandler(self.callback, pattern=r"^am:"))
         app.add_handler(CommandHandler("monitor_input", self.message))
+        panel = self
+
+        class PanelReply(filters.MessageFilter):
+            def filter(self, message):
+                return bool(panel.prompt and message.reply_to_message
+                            and message.reply_to_message.message_id == panel.prompt[0]
+                            and panel.prompt[3].message.chat_id == message.chat_id
+                            and panel.prompt[4] == panel.view_version and panel.prompt[5] > monotonic())
+
+        app.add_handler(MessageHandler(
+            filters.User(self.owner) & filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND & PanelReply(),
+            self.reply_input,
+        ))
 
     def authorized(self, update):
         return (update.effective_user is not None and update.effective_user.id == self.owner
@@ -273,20 +310,60 @@ class AccountMonitorPanel:
                 except (MonitorInput, MonitorPaused, MonitorUnavailable) as exc:
                     await query.message.reply_text(str(exc))
             return
+        self.view_version += 1
+        if route != "confirmremove":
+            self.confirm_account = None
+        if route != "pickconfirm":
+            self.confirm_remove = None
+        if self.refresh_task and not self.refresh_task.done():
+            self.refresh_task.cancel()
         try:
+            if route == "input":
+                await self.request_input(query, args)
+                return
+            if route in {"checkall", "checkone", "runpick", "peercheck"}:
+                fields = {"kind": "account"}
+                destination = ("home", [])
+                if route == "checkone":
+                    fields["ids"] = [int(args[0])]
+                    destination = ("account", args)
+                if route == "peercheck":
+                    fields = {"kind": "peer", "ids": [int(args[0])]}
+                    destination = ("peer", args)
+                if route == "runpick":
+                    key = (args[0], int(args[1]), args[2])
+                    fields = {"kind": "account" if args[0] == "a" else "peer",
+                              "ids": sorted(self.view_state(key)["selected"])}
+                    destination = ("picks", args)
+                request = await self.client.call("run_start", **fields)
+                if len(self.run_back) >= 20:
+                    self.run_back.pop(next(iter(self.run_back)))
+                self.run_back[request["run"]] = destination
+                route, args = "run", [str(request["run"]), "0"]
+            if route == "spamcheck":
+                await self.client.call("read_spam", id=int(args[0]))
+                route = "spam"
             text, markup = await self.render(route, args)
         except (MonitorUnavailable, MonitorInput, MonitorPaused) as exc:
+            back = button("⬅️ Account Monitor", "home")
+            if route.startswith("pick") and len(args) >= 3:
+                back = button("⬅️ Kembali ke pilihan", "picks", *args[:3])
             text, markup = panel("📡 Account Monitor", escape(str(exc)),
-                                 [[button("🖥 Status Sistem", "system"), button("⚙️ Pengaturan", "settings")]],
-                                 back=Button("⬅️ Kembali", callback_data=BACK))
+                                 [[button("🖥 Diagnostik", "system"), button("⚙️ Pengaturan", "settings")]],
+                                 back=back)
         except (ValueError, TypeError, KeyError, IndexError):
             text, markup = panel("📡 Account Monitor", "Menu sudah berubah. Buka ulang Account Monitor.",
                                  back=button("⬅️ Account Monitor", "home"))
+        await self.edit(query, text, markup)
+        if route in {"run", "pickdiscover", "spam"}:
+            self.refresh_task = asyncio.create_task(self.refresh_panel(query, route, args, self.view_version))
+
+    async def edit(self, query, text, markup):
         with self.scope("admin"):
             try:
                 await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup, disable_web_page_preview=True)
             except BadRequest as exc:
-                if "Message is not modified" not in str(exc):
+                if "message is not modified" not in str(exc).lower():
                     raise
 
     async def render(self, route, args):
@@ -296,35 +373,48 @@ class AccountMonitorPanel:
 
         if route == "home":
             rows = [
-                [button("👥 Kelola Akun", "accounts", "account", 0), button("🔄 Check All Accounts", "checkall")],
+                [button("👥 Kelola Akun", "accounts", "account", 0), button("🔄 Periksa semua", "checkall")],
                 [button("⚠️ Incident Center", "incidents", "all", 0)],
                 [button("📡 Channel & Group Monitor", "accounts", "peers", 0)],
                 [button("📜 Riwayat Status", "accounts", "history", 0), button("📝 Appeal Manager", "accounts", "appeals", 0)],
-                [button("🔔 Notifikasi", "notify"), button("🖥 Status Sistem", "system")],
+                [button("🔔 Pusat notifikasi", "notices", "all", 0), button("🖥 Diagnostik", "system")],
                 [button("⚙️ Pengaturan", "settings")],
             ]
             try:
                 summary = await call("summary")
                 counts = " • ".join(f"{escape(state(key))} {value}" for key, value in summary["counts"].items())
-                text = f"Total akun <b>{summary['total']}</b>\n{counts or 'Belum ada akun'}\nTerakhir diperiksa {fmt_time(summary['latest'])}"
+                text = f"<b>{summary['total']} akun</b> · {summary.get('peers', 0)} channel &amp; grup\n{counts or 'Belum ada akun'}"
+                if "automatic" in summary:
+                    text += f"\nGlobal {yn(summary['automatic'])} · Individual {summary['enabled']}/{summary['total']}"
+                    text += f"\nChannel {yn(summary['channels'])} · Kill Switch {yn(summary['kill_switch'])}"
+                    text += f"\nInsiden aktif {summary['open_incidents']}"
+                text += f"\nTerakhir diperiksa {fmt_time(summary['latest'])}"
             except (MonitorUnavailable, MonitorPaused) as exc:
                 text = escape(str(exc))
             return panel("📡 Account Monitor", text, rows, Button("⬅️ Kembali", callback_data=BACK))
 
-        if route == "checkall":
-            result = await call("check")
-            return panel("🔄 Check All Accounts", f"{result['queued']} akun dijadwalkan. Akun yang sedang FloodWait menunggu giliran.", back=home)
-
+        if route == "run":
+            return await self.run_page(args)
+        if route == "runback":
+            target_route, target_args = self.run_back.get(int(arg), ("home", []))
+            return await self.render(target_route, target_args)
+        if route.startswith("pick"):
+            if route == "picksearchclear":
+                self.view_state((args[0], int(args[1]), args[2])).update(query=None, page=0)
+                route = "picks"
+            return await self.selection_page(route, args)
         if route == "accounts":
             category, page = arg, int(args[1])
+            if category in {"account", "peers"}:
+                key = ("a", 0, category)
+                return await self.selection_page("picks", ["a", "0", category,
+                                                            str(self.view_state(key)["page"] if not page else page)])
             result = await call("accounts", page=page)
             rows = []
-            for item in result["rows"]:
-                suffix = () if category == "account" else (0,) if category in {"peers", "appeals"} else (7, "all", 0)
-                rows.append([button(f"{account_line(item)} · {item['alias']}"[:62], category, item["id"], *suffix)])
+            for row in result["rows"]:
+                suffix = (0,) if category == "appeals" else (7, "all", 0)
+                rows.append([button(f"{account_line(row)} · {row['alias']}"[:62], category, row["id"], *suffix)])
             rows += pagination(route, (category,), page, result["next"])
-            if category == "account":
-                rows.append([button("➕ Tambah akun", "enroll")])
             return panel("👥 Pilih akun", "Belum ada akun terdaftar." if not result["rows"] else "", rows, home)
 
         if route == "enroll":
@@ -343,11 +433,11 @@ class AccountMonitorPanel:
 
         if route == "enroll_qr":
             return panel("📷 Login QR Code",
-                         "Untuk memilih alias, kirim <code>/monitor_input qr Alias akun</code>. "
-                         "QR akan muncul di chat ini dan diperbarui otomatis.",
-                         [[button("Tampilkan QR · Akun Telegram", "qr_generate")]], back=button("⬅️ Kembali", "enroll"))
+                         "QR muncul di chat ini dan diperbarui otomatis.",
+                         [[button("Pilih alias & tampilkan QR", "input", "qr")],
+                          [button("Tampilkan QR · Akun Telegram", "qr_generate")]], back=button("⬅️ Kembali", "enroll"))
 
-        if route in {"account", "checkone", "toggle", "remove", "confirmremove", "alias", "spam"}:
+        if route in {"account", "checkone", "toggle", "remove", "confirmremove", "alias", "spam", "accountmore"}:
             return await self.account_page(route, args)
 
         if route in {"peers", "peer", "discover", "choices", "peeradd", "peerremove", "peerdelete"}:
@@ -362,8 +452,19 @@ class AccountMonitorPanel:
         if route in {"appeals", "appealstate"}:
             return await self.appeal_page(route, args)
 
+        if route == "limits":
+            conf = await call("settings")
+            return panel("◈ Batas & retensi", "Perubahan berlaku saat pemeriksaan berikutnya.",
+                         [[button(f"Retensi · {conf['retention_days']} hari", "input", "retention")],
+                          [button(f"Channel/grup per akun · {conf['peer_limit']}", "input", "peer_limit")],
+                          [button(f"Pemeriksaan paralel · {conf['concurrency']}", "input", "concurrency"),
+                           button(f"Batas client · {conf['max_clients']}", "input", "clients")]],
+                         button("⬅️ Kembali", "settings"))
         if route in {"settings", "set", "notify", "mute", "interval", "time", "kill"}:
             return await self.settings_page(route, args)
+
+        if route in {"notices", "notice"}:
+            return await self.notification_page(route, args)
 
         if route == "system":
             health = await call("system")
@@ -384,60 +485,87 @@ class AccountMonitorPanel:
         account_id = int(args[0])
         call = self.client.call
         back = button("⬅️ Kelola Akun", "accounts", "account", 0)
-        notice = ""
-        if route == "checkone":
-            checked = await call("check", id=account_id)
-            notice = "Pemeriksaan dijadwalkan.\n\n" if checked["queued"] else "Pemeriksaan belum bisa dijadwalkan.\n\n"
         if route == "toggle":
             await call("toggle", id=account_id, value=int(args[1]))
         if route == "remove":
+            self.confirm_account = account_id
             return panel("🗑 Hapus akun",
                          "Session, channel atau grup, incident, riwayat status, dan catatan banding akun ini akan dihapus dari monitor. "
                          "Untuk mencabut sesi di Telegram, buka Pengaturan → Perangkat.",
                          [[button("Hapus dari monitor", "confirmremove", account_id)]], button("⬅️ Batal", "account", account_id))
         if route == "confirmremove":
+            if self.confirm_account != account_id:
+                raise MonitorInput("Buka ulang konfirmasi penghapusan akun.")
+            self.confirm_account = None
             await call("remove", id=account_id)
             return panel("👥 Kelola Akun", "Akun telah dihapus dari monitor.", back=back)
         row = await call("account", id=account_id)
         if route == "alias":
-            return panel("✏️ Ubah alias", f"Kirim <code>/monitor_input alias {account_id} Alias baru</code>.",
-                         back=button("⬅️ Kembali", "account", account_id))
+            return panel("✏️ Ubah alias", escape(row["alias"]),
+                         [[button("Masukkan alias baru", "input", "alias", account_id)]],
+                         button("⬅️ Kembali", "account", account_id))
         if route == "spam":
-            return panel(
-                "🟡 Hasil @SpamBot",
-                f"Periksa dari sesi {escape(row['alias'])}, lalu catat hasil yang dikonfirmasi.\n\n"
-                f"<code>/monitor_input spam {account_id} limited</code>\n"
-                f"<code>/monitor_input spam {account_id} limited | jenis | YYYY-MM-DD HH:MM</code>\n"
-                f"<code>/monitor_input spam {account_id} clear</code>\n"
-                f"<code>/monitor_input spam {account_id} unknown</code>",
-                [[Button("Buka @SpamBot", url="https://t.me/SpamBot")]], button("⬅️ Kembali", "account", account_id),
-            )
+            evidence = row["spam_at"]
+            expiry = row["spam_until"]
+            last = row.get("spam_check_reason")
+            status = state(row["spam_status"]) if (evidence and fresh(evidence, 86400) == "aktual"
+                and (not expiry or datetime.fromisoformat(expiry) > datetime.now(timezone.utc))
+                and last in {None, "terkonfirmasi"}) else state("unknown")
+            text = (f"<b>{escape(row['alias'])} · {escape(status)}</b>\n"
+                    f"Pemeriksaan terakhir {fmt_time(row.get('spam_checked_at'))}\n"
+                    f"Bukti terakhir {escape(state(row['spam_status']))} · {fmt_time(evidence)}")
+            if expiry:
+                text += f"\nTenggat terakhir {fmt_time(expiry)}"
+            if row.get("spam_pending"):
+                text += "\n⏳ Menunggu pemeriksaan."
+            elif status == state("unknown"):
+                text += "\n" + SPAM_REASONS.get(last, "Belum ada respons terkini yang terkonfirmasi.")
+            text += ("\n\nBaca hasil mengambil balasan terbaru dari @SpamBot resmi. "
+                     "Kalau belum ada, buka bot tersebut dari akun yang dipantau dan jalankan /start.")
+            return panel("🟡 Status spam", text,
+                         [[button("🔄 Baca hasil @SpamBot", "spamcheck", account_id)],
+                          [Button("Buka @SpamBot", url="https://t.me/SpamBot")]],
+                         button("⬅️ Kembali", "account", account_id))
 
         settings = await call("settings")
-        freshness = max(7200 if row["health"] == "frozen" else 0, settings["interval_minutes"] * 120)
+        interval = row.get("interval_minutes") or settings["interval_minutes"]
+        freshness = max(7200 if row["health"] == "frozen" else 0, interval * 120)
+        last_status = escape(state(row["health"]))
+        current = account_line(row)
+        active = settings["automatic"] and row["enabled"] and not settings["kill_switch"] and row["auth"] != "invalid" and row["health"] != "deactivated"
         text = (
-            f"{notice}<b>{escape(row['alias'])}</b> • ID <code>{row['user_id']}</code>\n"
-            f"Akun {escape(account_line(row))} • Koneksi {escape(state(row['connection']))}\n"
-            f"Sesi {escape(state(row['auth']))} • Monitor {yn(row['enabled'])}\n"
-            f"Status akun diperbarui {fmt_time(row['health_at'])} ({fresh(row['health_at'], freshness)})\n"
-            f"Pemeriksaan terakhir {fmt_time(row['checked_at'])} • {escape(row['check_source'] or '—')}\n"
-            f"Sumber status akun {escape(row['health_source'] or '—')}"
+            f"<b>{escape(row['alias'])}</b>\n"
+            f"Nama Telegram {escape(row.get('telegram_name') or '—')}\n"
+            f"Username {escape('@' + row['telegram_username'] if row.get('telegram_username') else '—')}\n"
+            f"User ID <code>{row['user_id']}</code>\n\n"
+            f"Terbaru {escape(current)} · {fmt_time(row['checked_at'])}\n"
+            f"Terkonfirmasi {last_status} · {fmt_time(row['health_at'])} ({fresh(row['health_at'], freshness)})\n"
+            f"Koneksi {escape(state(row['connection']))} · Sesi {escape(state(row['auth']))}\n"
+            f"Global {yn(settings['automatic'])} · Individual {yn(row['enabled'])} · Kill Switch {yn(settings['kill_switch'])}\n"
+            f"Interval {interval} menit {'(individual)' if row.get('interval_minutes') else '(global)'}\n"
+            f"Pemeriksaan berikutnya {fmt_time(row.get('next_check')) if active else 'Dijeda'}"
         )
+        if row["health"] == "normal":
+            text += "\nNormal berarti pemeriksaan kesehatan tidak menemukan pembatasan yang dikenali. Status spam terpisah."
         if row["flood_until"] and datetime.fromisoformat(row["flood_until"]) > datetime.now(timezone.utc):
-            text += f"\nFloodWait sampai {fmt_time(row['flood_until'])}"
+            text += f"\nTelegram menunda pemeriksaan sampai {fmt_time(row['flood_until'])}."
         if row["health"] == "frozen":
-            text += (f"\n\nFrozen sejak {fmt_time(row['freeze_since'])} • Pertama terdeteksi {fmt_time(row['first_frozen_at'])}"
-                     f"\nTenggat {fmt_time(row['freeze_until'])} • {count_down(row['freeze_until'])}")
-        text += (f"\n\n@SpamBot {escape(state(row['spam_status']))} • {fmt_time(row['spam_at'])}"
-                 f" ({fresh(row['spam_at'], 604800)})"
-                 f"\nJenis {escape(row['spam_kind'] or '—')} • Sampai {fmt_time(row['spam_until'])}")
+            text += (f"\n\nFrozen sejak {fmt_time(row['freeze_since'])} · Pertama terdeteksi {fmt_time(row['first_frozen_at'])}"
+                     f"\nTenggat {fmt_time(row['freeze_until'])} · {count_down(row['freeze_until'])}")
         rows = [
-            [button("🔄 Periksa status & koneksi", "checkone", account_id)],
-            [button("✏️ Alias", "alias", account_id), button("Monitor " + yn(not row["enabled"]), "toggle", account_id, int(not row["enabled"]))],
-            [button("🔑 Autentikasi ulang", "enroll", account_id), button("🟡 Hasil @SpamBot", "spam", account_id)],
+            [button("🔄 Periksa sekarang", "checkone", account_id), button("🟡 Status spam", "spam", account_id)],
+            [button("✏️ Ubah alias", "input", "alias", account_id), button("⏱ Interval", "input", "account_interval", account_id)],
+            [button("Individual " + yn(not row["enabled"]), "toggle", account_id, int(not row["enabled"])),
+             button("🔑 Autentikasi ulang", "enroll", account_id)],
             [button("📜 Riwayat", "history", account_id, 7, "all", 0), button("📝 Banding", "appeals", account_id, 0)],
-            [button("📡 Channel & grup", "peers", account_id, 0), button("🗑 Hapus", "remove", account_id)],
+            [button("📡 Channel & grup", "peers", account_id, 0), button("⋯ Lainnya", "accountmore", account_id)],
         ]
+        if route == "accountmore":
+            return panel("⋯ Detail lanjutan", f"Sumber pemeriksaan {escape(row['check_source'] or '—')}\n"
+                         f"Sumber status {escape(row['health_source'] or '—')}\n"
+                         "Cabut sesi Telegram melalui Pengaturan → Perangkat pada akun terkait.",
+                         [[button("🗑 Hapus dari monitor", "remove", account_id)]],
+                         button("⬅️ Kembali", "account", account_id))
         if row["health"] == "frozen" and link(row["appeal_url"]):
             rows.insert(0, [Button("Buka tautan banding Telegram", url=row["appeal_url"])])
         return panel("👤 Detail akun", text, rows, back)
@@ -447,39 +575,11 @@ class AccountMonitorPanel:
         call = self.client.call
         back = button("⬅️ Pilih akun", "accounts", "peers", 0)
         if route == "peers":
-            page = int(args[1])
-            result = await call("peers", id=item_id, page=page)
-            rows = [[button(f"{state(row['access'])} · {row['title']}"[:64], "peer", row["id"])] for row in result["rows"]]
-            rows += pagination(route, (item_id,), page, result["next"])
-            rows.append([button("➕ Pilih channel atau grup", "discover", item_id)])
-            return panel("📡 Channel & Group Monitor", "Belum ada yang dipantau." if not result["rows"] else "", rows, back)
-        if route in {"discover", "choices"}:
-            if route == "discover":
-                queued = await call("discover", id=item_id)
-                return panel("📡 Pilih channel atau grup",
-                             "Daftar sedang dimuat." if queued["queued"] else "Akun belum bisa diperiksa.",
-                             [[button("🔄 Tampilkan daftar", "choices", item_id, 0)]], button("⬅️ Kembali", "peers", item_id, 0))
-            page = int(args[1])
-            result = await call("choices", id=item_id, page=page)
-            rows = [[button(row["title"][:64], "peeradd", item_id, row["index"], row["chat_id"])] for row in result["rows"]]
-            rows += pagination("choices", (item_id,), page, result["next"])
-            text = ""
-            if result["pending"]:
-                text = "Pemeriksaan masih dalam antrean."
-                if result.get("flood_until"):
-                    text += f" FloodWait sampai {fmt_time(result['flood_until'])}."
-                rows.append([button("🔄 Perbarui", "choices", item_id, page)])
-            elif not result["available"]:
-                text = "Daftar belum tersedia atau sudah kedaluwarsa."
-                rows.append([button("🔄 Muat ulang dari Telegram", "discover", item_id)])
-            elif not result["rows"]:
-                text = "Tidak ada channel atau grup di halaman ini."
-            return panel("📡 Pilih channel atau grup", text, rows, button("⬅️ Kembali", "peers", item_id, 0))
-
-        if route == "peeradd":
-            row = await call("peer_add", id=item_id, index=int(args[1]), chat=int(args[2]))
-        else:
-            row = await call("peer", id=item_id)
+            return await self.selection_page("picks", ["p", str(item_id), "saved"])
+        if route in {"discover", "choices", "peeradd"}:
+            return await self.selection_page("pickdiscover" if route == "discover" else "picks",
+                                             ["p", str(item_id), "add"])
+        row = await call("peer", id=item_id)
         account_id = row["account_id"]
         peer_id = row["id"]
         back_to_peers = button("⬅️ Kembali", "peers", account_id, 0)
@@ -491,10 +591,11 @@ class AccountMonitorPanel:
             return panel("📡 Channel & Group Monitor", "Channel atau grup telah dihapus dari monitor.", back=back_to_peers)
         return panel("📡 Akses channel atau grup",
                      f"<b>{escape(row['title'])}</b> • <code>{row['chat_id']}</code>\n"
-                     f"Akses {escape(state(row['access']))} • Keanggotaan {escape(state(row['membership']))}\n"
-                     f"Peran {escape(state(row['role']))}\n"
-                     f"Sumber {escape(row['source'] or '—')}\nTerakhir diperiksa {fmt_time(row['checked_at'])}",
-                     [[button("📜 Riwayat akses", "history", account_id, 7, "all", 0, peer_id),
+                     f"Terbaru {escape(state(row.get('latest_access')))} · {fmt_time(row['checked_at'])}\n"
+                     f"Akses terkonfirmasi {escape(state(row['access']))} · {fmt_time(row.get('confirmed_at'))}\n"
+                     f"Keanggotaan {escape(state(row['membership']))} · Peran {escape(state(row['role']))}",
+                     [[button("🔄 Periksa akses", "peercheck", peer_id)],
+                      [button("📜 Riwayat akses", "history", account_id, 7, "all", 0, peer_id),
                        button("🗑 Hapus", "peerremove", peer_id)]], back_to_peers)
 
     async def history_page(self, args):
@@ -552,7 +653,7 @@ class AccountMonitorPanel:
         subject = row["alias"] or "Sistem"
         if row["title"]:
             subject += f" • {row['title']}"
-        category = "Resolved" if row["resolved_at"] else INCIDENTS.get(row["category"], row["category"])
+        category = "Selesai" if row["resolved_at"] else INCIDENTS.get(row["category"], row["category"])
         text = (f"<b>#{item_id} {escape(category)}</b> • {escape(row['kind'])}\n"
                 f"Komponen {escape(subject)}\n"
                 f"Pertama terdeteksi {fmt_time(row['created_at'])}\nTerakhir diperiksa {fmt_time(row['checked_at'])}\n"
@@ -574,14 +675,13 @@ class AccountMonitorPanel:
                             f" • Pengajuan {fmt_time(item['submitted_at'])}" for item in result["rows"])
         content = (f"<b>{escape(info['alias'])}</b>\n"
                    f"Tenggat resmi {fmt_time(info['freeze_until'])} • {count_down(info['freeze_until'])}\n\n"
-                   f"{history or 'Belum ada catatan banding.'}\n\nStatus banding dicatat oleh admin.\n"
-                   f"Untuk mencatat tanggal sebelumnya, kirim "
-                   f"<code>/monitor_input appeal {account_id} submitted YYYY-MM-DD HH:MM</code> (WIB).")
+                   f"{history or 'Belum ada catatan banding.'}\n\nStatus banding dicatat oleh admin berdasarkan informasi Telegram.")
         rows = [[button(title, "appealstate", account_id, key) for key, title in list(APPEALS.items())[i:i+3]]
                 for i in (0, 3)]
         if link(info["appeal_url"]):
             rows.insert(0, [Button("Buka tautan banding Telegram", url=info["appeal_url"])])
-        rows.append([button("🔄 Periksa status akun", "checkone", account_id)])
+        rows.append([button("🗓 Catat waktu pengajuan", "input", "appeal", account_id),
+                     button("🔄 Periksa akun", "checkone", account_id)])
         rows += pagination("appeals", (account_id,), page, result["next"])
         return panel("📝 Appeal Manager", content, rows, button("⬅️ Account Monitor", "home"))
 
@@ -604,13 +704,12 @@ class AccountMonitorPanel:
         if route == "interval":
             rows = [[button(f"{value} menit", "set", "interval_minutes", value) for value in (5, 15, 30, 60)]]
             return panel("⏱ Interval monitoring",
-                         "Untuk interval 5–1440 menit, kirim <code>/monitor_input interval 20</code>.",
-                         rows, back)
+                         "5–1440 menit.",
+                         rows + [[button("Interval khusus", "input", "interval")]], back)
         if route == "time":
             return panel("🕗 Jam laporan harian",
-                         f"Saat ini {settings['daily_hour']:02}:{settings['daily_minute']:02} WIB. "
-                         "Untuk mengubahnya, kirim <code>/monitor_input daily 08:30</code>.",
-                         back=back)
+                         f"Saat ini {settings['daily_hour']:02}:{settings['daily_minute']:02} WIB.",
+                         [[button("Ubah jam", "input", "daily")]], back)
         if route == "kill":
             value = int(not settings["kill_switch"])
             return panel("⛔ Kill Switch", "Jeda pemeriksaan dan notifikasi Account Monitor." if value else "Lanjutkan Account Monitor.",
@@ -623,12 +722,320 @@ class AccountMonitorPanel:
              button(f"Jam laporan · {settings['daily_hour']:02}:{settings['daily_minute']:02} WIB", "time")],
             [button(f"Kill Switch · {yn(settings['kill_switch'])}", "kill")],
         ))
-        text = (f"Retensi {settings['retention_days']} hari • Pemeriksaan paralel {settings['concurrency']}\n"
-                f"Batas client terhubung {settings['max_clients']}\n"
-                "Untuk mengatur retensi 30–365 hari, kirim <code>/monitor_input retention 90</code>.\n"
-                "Untuk mengatur 1–4 pemeriksaan paralel, kirim <code>/monitor_input concurrency 2</code>.\n"
-                "Untuk mengatur batas client, kirim <code>/monitor_input clients 8</code>.")
-        return panel("⚙️ Pengaturan", text, rows, home)
+        rows.append([button("🔔 Kategori notifikasi", "notify"), button("◈ Batas & retensi", "limits")])
+        return panel("⚙️ Pengaturan", "Global mengatur jadwal otomatis. Pemeriksaan manual tetap tersedia saat Global OFF.", rows, home)
+
+    async def notification_page(self, route, args):
+        outcomes = {None: "Dalam antrean", "sent": "Terkirim", "failed": "Gagal", "retry": "Akan dicoba lagi",
+                    "queue_full": "Antrean penuh", "expired": "Kedaluwarsa", "uncertain": "Pengiriman belum terkonfirmasi", "sending": "Mengirim"}
+        if route == "notice":
+            item = await self.client.call("notification_detail", id=int(args[0]))
+            rows = []
+            if item["peer_id"]:
+                rows.append([button("Buka detail channel/grup", "peer", item["peer_id"])])
+            elif item["account_id"]:
+                rows.append([button("Buka detail akun", "account", item["account_id"])])
+            return panel("🔔 Detail notifikasi",
+                         f"{fmt_time(item['created_at'])} · {outcomes.get(item['outcome'], '—')}\n\n{escape(item['text'][:1600])}",
+                         rows, button("⬅️ Kembali", "notices", args[1], args[2]))
+        mode, page = args[0], int(args[1])
+        result = await self.client.call("notification_list", mode=mode, page=page)
+        rows = [[button(f"{CATEGORIES.get(row['category'], row['category'])} · {outcomes.get(row['outcome'], '—')}"[:62],
+                        "notice", row["id"], mode, page)] for row in result["rows"]]
+        rows += pagination("notices", (mode,), page, result["next"])
+        rows.append([button("Semua", "notices", "all", 0), button("Kegagalan", "notices", "failed", 0),
+                     button("⚙️ Pengaturan", "notify")])
+        return panel("🔔 Pusat notifikasi", "Belum ada notifikasi." if not result["rows"] else "", rows,
+                     button("⬅️ Account Monitor", "home"))
+
+    def view_state(self, key):
+        return self.selections.setdefault(key, {"query": None, "status": "all", "kind": "all", "role": "all",
+                                                "page": 0, "selected": set()})
+
+    async def selection_page(self, route, args):
+        scope = args[0]
+        account_id = int(args[1])
+        mode = args[2]
+        values = args[3:]
+        context_key = (scope, account_id, mode)
+        state_view = self.view_state(context_key)
+        selected = state_view["selected"]
+        accounts = scope == "a"
+        fields = {"query": state_view["query"]}
+        action = "accounts" if accounts else "select_peers"
+        if accounts:
+            fields["status"] = state_view["status"]
+            list_route = "picks"
+            back = button("⬅️ Account Monitor", "home")
+        else:
+            fields.update(id=account_id, mode=mode, kind=state_view["kind"], role=state_view["role"])
+            list_route = "picks"
+            back = button("⬅️ Channel & grup" if mode == "add" else "⬅️ Pilih akun",
+                          "peers" if mode == "add" else "accounts",
+                          *((account_id, 0) if mode == "add" else ("peers", 0)))
+        target = (scope, account_id, mode)
+        feedback = ""
+        if route == "picks" and values:
+            state_view["page"] = int(values[0])
+        if route == "pick":
+            item_id = int(values[0])
+            if item_id in selected:
+                selected.remove(item_id)
+            else:
+                selected.add(item_id)
+        if route == "pickclear":
+            selected.clear()
+        if route == "pickall":
+            data = await self.client.call(action, select_all=True, **fields)
+            available = list(dict.fromkeys([*sorted(selected), *data["ids"]]))
+            limit = data["limit"] if not accounts and mode == "add" else 120 if not accounts else 50
+            if len(available) > limit:
+                raise MonitorInput(f"Hasil filter melebihi {limit} item. Persempit pencarian untuk memilih semuanya.")
+            selected.update(available)
+        if route == "pickfilter":
+            name, value = values
+            options = {"status": ACCOUNT_FILTERS, "kind": PEER_TYPES, "role": PEER_ROLES}
+            if name not in options or value not in options[name]:
+                raise MonitorInput("Filter tidak tersedia.")
+            state_view.update({name: value, "page": 0})
+            fields[name] = value
+        if route == "pickfilters":
+            parts = ["status"] if accounts else ["kind", "role"]
+            options = {"status": ACCOUNT_FILTERS, "kind": PEER_TYPES, "role": PEER_ROLES}
+            rows = []
+            for name in parts:
+                found = list(options[name].items())
+                for offset in range(0, len(found), 2):
+                    rows.append([button(("✓ " if state_view[name] == key else "") + value,
+                                        "pickfilter", *target, name, key) for key, value in found[offset:offset+2]])
+            return panel("Filter", f"{len(selected)} pilihan tetap tersimpan.", rows, button("⬅️ Kembali", list_route, *target))
+        if route == "picktoggle":
+            if not selected:
+                raise MonitorInput("Centang akun terlebih dahulu.")
+            result = await self.client.call("batch_accounts", ids=sorted(selected), value=int(values[0]))
+            feedback = f"✅ Pengaturan {result['updated']} akun diperbarui.\n"
+            selected.clear()
+        if route == "picksave":
+            if not selected:
+                raise MonitorInput("Centang channel atau grup terlebih dahulu.")
+            result = await self.client.call("save_peers", id=account_id, ids=sorted(selected))
+            feedback = f"✅ {result['added']} item ditambahkan.\n"
+            selected.clear()
+        if route == "pickremove":
+            if not selected:
+                raise MonitorInput("Centang item terlebih dahulu.")
+            self.confirm_remove = (account_id, frozenset(selected))
+            return panel("🗑 Hapus dari pemantauan",
+                         f"Hapus {len(selected)} item beserta riwayat pemantauannya? Keanggotaan Telegram tetap aktif.",
+                         [[button("Ya, hapus dari monitor", "pickconfirm", *target)]],
+                         button("⬅️ Batal", list_route, *target))
+        if route == "pickconfirm":
+            confirmation = self.confirm_remove
+            if confirmation != (account_id, frozenset(selected)):
+                raise MonitorInput("Pilihan berubah. Ulangi konfirmasi.")
+            self.confirm_remove = None
+            result = await self.client.call("remove_peers", id=account_id, ids=sorted(selected))
+            feedback = f"✅ {result['removed']} item dihapus dari monitor.\n"
+            selected.clear()
+            state_view["page"] = 0
+        if route == "pickdiscover":
+            result = await self.client.call("discover", id=account_id)
+            if result["queued"]:
+                feedback = "⏳ Telegram sedang memuat daftar. Halaman akan diperbarui otomatis.\n"
+        page = state_view["page"]
+        result = await self.client.call(action, page=page, **fields)
+        if page and not result["rows"]:
+            page = state_view["page"] = 0
+            result = await self.client.call(action, page=0, **fields)
+        rows = []
+        for row in result["rows"]:
+            item_id = row["id"]
+            checked = "✓" if item_id in selected else "☐"
+            title = row["alias"] if accounts else row["title"]
+            info = state(row.get("display_status")) if accounts else (
+                "dipantau" if row.get("monitored") else state(row.get("role")))
+            label = f"{info} · {title}"[:59]
+            detail = button(label, "account" if accounts else "peer", item_id)
+            if accounts or mode == "saved":
+                rows.append([button(checked, "pick", *target, item_id), detail])
+            elif row.get("monitored"):
+                rows.append([button(f"✓ {label}", "picks", *target)])
+            else:
+                rows.append([button(f"{checked} {label}", "pick", *target, item_id)])
+        rows += pagination(list_route, target, page, result["next"])
+        rows.append([button("🔎 Cari", "input", "find", *target),
+                     button("◈ Filter", "pickfilters", *target)])
+        if state_view["query"]:
+            rows.append([button("Hapus pencarian", "picksearchclear", *target)])
+        if (result["rows"] or selected) and not (accounts and mode == "peers"):
+            rows.append([button("Pilih semua hasil", "pickall", *target),
+                         button("Batalkan semua", "pickclear", *target)])
+        if accounts and mode == "peers":
+            rows = [[button(row["alias"][:58], "peers", row["id"], 0)] for row in result["rows"]] + rows[len(result["rows"]):]
+        if accounts and mode == "account":
+            if selected:
+                rows.extend([[button(f"🔄 Periksa {len(selected)} akun", "runpick", *target)],
+                             [button("Monitor ON", "picktoggle", *target, 1),
+                              button("Monitor OFF", "picktoggle", *target, 0)]])
+            rows.append([button("➕ Tambah akun", "enroll")])
+        elif not accounts and mode == "add":
+            rows.append([button("🔄 Muat daftar Telegram", "pickdiscover", *target)])
+            if selected:
+                rows.append([button(f"Simpan {len(selected)} pilihan", "picksave", *target)])
+        elif not accounts:
+            if selected:
+                rows.append([button(f"Periksa {len(selected)}", "runpick", *target),
+                             button("Hapus pilihan", "pickremove", *target)])
+            rows.append([button("➕ Pilih dari Telegram", "picks", "p", account_id, "add")])
+        summary = " • ".join(str(x) for x in (
+            f"Halaman {page+1}", f"{len(selected)} dipilih",
+            f"cari «{escape(state_view['query'])}»" if state_view["query"] else None,
+            ACCOUNT_FILTERS.get(state_view["status"]) if accounts else
+                f"{PEER_TYPES[state_view['kind']]} / {PEER_ROLES[state_view['role']]}",
+        ) if x)
+        if not accounts:
+            summary += f"\nDipantau {result['saved']} dari batas {result['limit']}"
+            if mode == "add" and result["pending"]:
+                summary += "\n⏳ Menunggu daftar Telegram."
+                if result["flood_until"]:
+                    summary += f" Tertunda sampai {fmt_time(result['flood_until'])}."
+            elif mode == "add" and not result["available"]:
+                summary += "\nMuat daftar dari akun Telegram."
+        if not result["rows"] and (accounts or mode == "saved" or result["available"]):
+            summary += "\nTidak ada hasil yang cocok."
+        title = "👥 Kelola Akun" if accounts and mode == "account" else "👥 Pilih akun" if accounts else (
+            "➕ Pilih channel & grup" if mode == "add" else "📡 Channel & grup dipantau")
+        return panel(title, feedback + summary, rows, back)
+
+    async def run_page(self, args, data=None):
+        run, page = int(args[0]), int(args[1])
+        if data is None:
+            data = await self.client.call("run_status", id=run, page=page)
+        complete = data["success"] + data["failure"]
+        heading = "⏳ Pemeriksaan berlangsung" if data["pending"] else "✅ Pemeriksaan selesai"
+        if data.get("paused") and data["pending"]:
+            heading = "⏸ Pemeriksaan dijeda oleh Kill Switch"
+        text = (f"<b>{complete} / {data['total']} selesai</b>\n"
+                f"Berhasil {data['success']} · Gagal {data['failure']}\n"
+                f"Menunggu {data['pending'] - data['deferred']} · Tertunda {data['deferred']}")
+        lines = []
+        rows = []
+        for row in data["rows"]:
+            reason = CHECK_REASONS.get(row["detail"], state(row["detail"]))
+            if row["outcome"] is None:
+                flood = row["flood_until"]
+                reason = f"Tertunda sampai {fmt_time(flood)}" if flood else "Dalam antrean"
+            lines.append(f"<b>{escape(row['title'][:65])}</b>\n{escape(reason)}")
+        if data["rows"] and data["total"] == 1:
+            row = data["rows"][0]
+            rows.append([button("Buka detail", "account" if data["kind"] == "account" else "peer", row["target_id"])])
+        rows += pagination("run", (run,), page, data["next"])
+        if data["pending"]:
+            rows.append([button("🔄 Lanjutkan pembaruan", "run", run, page)])
+        return panel(heading, text + ("\n\n" + "\n\n".join(lines) if lines else ""), rows,
+                     button("⬅️ Kembali", "runback", run))
+
+    async def refresh_panel(self, query, route, args, version):
+        for _ in range(30):
+            await asyncio.sleep(4)
+            if self.view_version != version:
+                return
+            try:
+                if route == "run":
+                    result = await self.client.call("run_status", id=int(args[0]), page=int(args[1]))
+                    pending = result["pending"] and not result.get("paused")
+                elif route in {"picks", "pickdiscover"}:
+                    row = await self.client.call("account", id=int(args[1]))
+                    pending = row["discover"] and not row["flood_until"]
+                else:
+                    row = await self.client.call("account", id=int(args[0]))
+                    pending = row["spam_pending"] and not row["flood_until"]
+                if self.view_version != version:
+                    return
+                if route == "run" or not pending:
+                    if route == "run":
+                        text, markup = await self.run_page(args, result)
+                    else:
+                        text, markup = await self.render("picks" if route == "pickdiscover" else route, args)
+                    if self.view_version != version:
+                        return
+                    await self.edit(query, text, markup)
+                if not pending:
+                    return
+            except (MonitorUnavailable, MonitorInput, MonitorPaused, TelegramError):
+                return
+
+    def set_prompt(self, prompt, route, args, query):
+        self.prompt = (prompt.message_id, route, args, query, self.view_version, monotonic() + 300)
+
+    async def request_input(self, query, args):
+        field, *target = args
+        prompts = {
+            "find": "Balas dengan nama atau ID yang ingin dicari.",
+            "alias": "Balas dengan alias baru, maksimal 48 karakter.",
+            "qr": "Balas dengan alias untuk akun baru. Kode Telegram dan 2FA hanya di formulir aman.",
+            "interval": "Balas dengan interval dalam menit, 5–1440.",
+            "account_interval": "Balas dengan 5–1440 menit, atau 0 untuk mengikuti interval global.",
+            "retention": "Balas dengan jumlah hari penyimpanan, 30–365.",
+            "clients": "Balas dengan batas client, 1–12.",
+            "concurrency": "Balas dengan pemeriksaan paralel, 1–4.",
+            "peer_limit": "Balas dengan batas channel dan grup per akun, 10–120.",
+            "daily": "Balas dengan jam laporan. Gunakan format HH:MM WIB.",
+            "appeal": "Balas dengan waktu pengajuan berdasarkan informasi Telegram. Format YYYY-MM-DD HH:MM WIB.",
+        }
+        if field not in prompts:
+            raise MonitorInput("Formulir tidak tersedia.")
+        message = await query.message.reply_text(prompts[field], reply_markup=ForceReply())
+        self.set_prompt(message, field, target, query)
+
+    async def reply_input(self, update, context):
+        if not self.authorized(update) or not self.prompt:
+            return
+        _, field, args, query, version, expires = self.prompt
+        value = update.message.text.strip()
+        if self.view_version != version or monotonic() > expires:
+            self.prompt = None
+            return
+        try:
+            if field == "qr":
+                await self.start_qr(context.bot, alias=value)
+                self.prompt = None
+                for message_id in (update.message.message_id, update.message.reply_to_message.message_id):
+                    await self.delete_enrollment_message(context.bot, message_id)
+                return
+            if field == "find":
+                key = (args[0], int(args[1]), args[2])
+                if len(value) > 80 or not value:
+                    raise MonitorInput("Kata pencarian harus 1–80 karakter.")
+                self.view_state(key).update(query=value, page=0)
+                route, target = "picks", args
+            elif field in {"alias", "account_interval"}:
+                account_id = int(args[0])
+                fields = {"alias": value} if field == "alias" else {"value": int(value)}
+                await self.client.call(field, id=account_id, **fields)
+                route, target = "account", args
+            elif field == "appeal":
+                await self.client.call("appeal_update", id=int(args[0]), status="submitted", submitted_at=value)
+                route, target = "appeals", [args[0], "0"]
+            elif field == "daily":
+                hour, minute = map(int, value.split(":"))
+                await self.client.call("report_time", hour=hour, minute=minute)
+                route, target = "settings", []
+            else:
+                name = {"interval": "interval_minutes", "retention": "retention_days", "clients": "max_clients"}.get(field, field)
+                await self.client.call("setting", key=name, value=int(value))
+                route, target = "settings", []
+            text, markup = await self.render(route, target)
+            await self.edit(query, text, markup)
+        except (MonitorUnavailable, MonitorInput, MonitorPaused) as exc:
+            await update.message.reply_text(str(exc))
+            return
+        except (ValueError, TypeError):
+            await update.message.reply_text("Format belum sesuai. Balas lagi pada pesan permintaan input.")
+            return
+        self.prompt = None
+        for message_id in (update.message.message_id, update.message.reply_to_message.message_id):
+            await self.delete_enrollment_message(context.bot, message_id)
 
     def enrollment_url(self, token):
         if not isinstance(token, str) or not re.fullmatch(r"[A-Za-z0-9_-]{43}", token):
@@ -783,6 +1190,9 @@ class AccountMonitorPanel:
         self.task = asyncio.create_task(self._notifier(bot), name="account-monitor-notifications")
 
     async def stop(self):
+        if self.refresh_task and not self.refresh_task.done():
+            self.refresh_task.cancel()
+            await asyncio.gather(self.refresh_task, return_exceptions=True)
         if self.qr_runner is not None and not self.qr_runner.done():
             self.qr_runner.cancel()
             await asyncio.gather(self.qr_runner, return_exceptions=True)
@@ -792,10 +1202,11 @@ class AccountMonitorPanel:
             self.task = None
         await self.client.close()
 
-    async def send(self, bot, text):
+    async def send(self, bot, text, *, account_id=None, peer_id=None):
+        rows = [[button("Buka detail", "peer" if peer_id else "account", peer_id or account_id)]] if peer_id or account_id else []
         with self.scope("admin"):
             await bot.send_message(
-                self.owner, text, protect_content=True, disable_web_page_preview=True,
+                self.owner, text, reply_markup=InlineKeyboardMarkup(rows) if rows else None, protect_content=True, disable_web_page_preview=True,
                 read_timeout=4, write_timeout=2, connect_timeout=2, pool_timeout=1,
                 **self.background_options(bot),
             )
@@ -811,7 +1222,7 @@ class AccountMonitorPanel:
             outcome, delay = "sent", 0
             try:
                 async with asyncio.timeout(12):
-                    await self.send(bot, notice["text"])
+                    await self.send(bot, notice["text"], account_id=notice.get("account_id"), peer_id=notice.get("peer_id"))
             except RetryAfter as exc:
                 outcome, delay = "retry", min(3600, int(exc.retry_after) + 2)
             except (Forbidden, BadRequest):

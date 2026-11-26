@@ -4927,6 +4927,8 @@ async def post_init(application: Application):
     spawn_background(_post_init_warmup(application), name="post-init-warmup")
     await _load_premium_emoji(application.bot)
     spawn_background(_claim_free.reconciliation_loop(application.bot), name="claim-free-reconciliation")
+    if _account_monitor is not None:
+        _account_monitor.start(application.bot)
 
     spawn_background(_auto_backup_loop(), name="auto-backup-loop")
     spawn_background(_buyer_reminder_loop(_current_bot), name="buyer-reminder-loop")
@@ -4941,6 +4943,8 @@ async def post_init(application: Application):
 # =================== GRACEFUL SHUTDOWN ===================
 
 async def _stop_blast_before_shutdown(application):
+    if _account_monitor is not None:
+        await _account_monitor.stop()
     tasks = [task for task in list(_blast_tasks.values()) if not task.done()]
     for task in tasks:
         task.cancel()
@@ -4951,6 +4955,8 @@ async def _stop_blast_before_shutdown(application):
 async def post_shutdown(application: Application):
     global _http_session, _pool, _webhook_runner, _async_db_pool
     logger.info("[SHUTDOWN] Memulai graceful shutdown...")
+    if _account_monitor is not None:
+        await _account_monitor.stop()
 
     # Hentikan task yang memakai HTTP/DB sebelum resource ditutup.
     payment_tasks = [task for task in list(_payment_tasks.values()) if task and not task.done()]
@@ -9700,7 +9706,7 @@ async def admin_konfirmasi(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # =================== ADMIN: PANEL UTAMA ===================
 
-def build_admin_panel_keyboard(user_id: int = None):
+def build_admin_panel_keyboard(user_id: int = None, *, private_chat=False):
     rows = [
         [InlineKeyboardButton("🎁 Pengaturan Claim Free", callback_data="cf_admin")],
         [
@@ -9723,6 +9729,8 @@ def build_admin_panel_keyboard(user_id: int = None):
     ]
     if user_id and is_super_admin(user_id):
         rows.append([InlineKeyboardButton("👥 Kelola Admin", callback_data="admpanel_admins")])
+        if private_chat and _account_monitor is not None:
+            rows.append([InlineKeyboardButton("📡 Account Monitor", callback_data="am:home")])
     rows.append([InlineKeyboardButton("💎 Pengaturan Premium Emoji", callback_data="admpanel_emoji")])
     return InlineKeyboardMarkup(rows)
 
@@ -9737,7 +9745,7 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "========================\n\n"
         "Pilih menu yang ingin dibuka:",
         parse_mode="HTML",
-        reply_markup=build_admin_panel_keyboard(uid)
+        reply_markup=build_admin_panel_keyboard(uid, private_chat=update.effective_chat.type == "private")
     )
 
 @admin_callback
@@ -9751,7 +9759,7 @@ async def admpanel_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "========================\n\n"
         "Pilih menu yang ingin dibuka:",
         parse_mode="HTML",
-        reply_markup=build_admin_panel_keyboard(query.from_user.id)
+        reply_markup=build_admin_panel_keyboard(query.from_user.id, private_chat=update.effective_chat.type == "private")
     )
 
 @admin_callback
@@ -10874,7 +10882,10 @@ def _install_uvloop_if_available():
 
 # =================== MAIN ENTRYPOINT ===================
 
+from account_health_monitor import AccountMonitorPanel
 from claim_free import ClaimFree
+_account_monitor = AccountMonitorPanel.from_env(ADMIN_ID, emoji_scope, _fast_callback_ack, _telegram_background_options)
+
 _claim_free = ClaimFree(db_session_safe, run_db, is_admin, is_banned,
                         paid_access=lambda uid, chat: run_db(_check_join_request_sync, uid, str(chat)))
 
@@ -10920,6 +10931,9 @@ def main():
         builder = builder.concurrent_updates(BOT_CONCURRENT_UPDATES)
     app = builder.build()
     app.add_error_handler(global_error_handler)
+
+    if _account_monitor is not None:
+        _account_monitor.register(app)
 
     # User Commands
     app.add_handler(CommandHandler("start",   start))

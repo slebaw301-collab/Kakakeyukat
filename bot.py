@@ -37,16 +37,19 @@ try:
     import uvloop
 except ImportError:
     uvloop = None
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import RealDictCursor, execute_values
 from psycopg2.pool import ThreadedConnectionPool
 from io import BytesIO
 from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager, AsyncExitStack
 import telegram.error
 from premium_emoji import (
-    PremiumEmoji, PremiumEmojiBot, SETTING as PREMIUM_EMOJI_SETTING, input_custom_emoji,
+    PremiumEmoji, PremiumEmojiBot, SETTING as PREMIUM_EMOJI_SETTING, input_custom_emoji, preview_emoji,
 )
-from premium_emoji_slots import SETTINGS_PREFIX as EMOJI_SETTINGS_PREFIX, emoji_surface
+from premium_emoji_slots import (
+    BACKUP_SETTING as EMOJI_BACKUP_SETTING, SETTINGS_PREFIX as EMOJI_SETTINGS_PREFIX,
+    emoji_scope, emoji_surface, slot_migration,
+)
 from premium_emoji_manager import EmojiManager
 from telegram import (
     Update, BotCommand, BotCommandScopeChat, BotCommandScopeDefault,
@@ -294,7 +297,7 @@ TOKEN = os.environ.get("BOT_TOKEN")
 _ADMIN_ID_RAW = os.environ.get("ADMIN_ID", "")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 APP_ENV = os.environ.get("APP_ENV") or os.environ.get("ENV") or "development"
-BOT_RELEASE = "2026-11-08-hyper-store-catalog-history-v6"
+BOT_RELEASE = "2026-11-26-hyper-store-semantic-emoji"
 
 # AutoGoPay gateway: GoPay utama, ShopeePay merchant sebagai cadangan.
 AUTOGOPAY_API_KEY = (os.environ.get("AUTOGOPAY_API_KEY") or "").strip()
@@ -2290,6 +2293,7 @@ def _add_product_sync(paket_id, nama, emoji, deskripsi, harga, link=None, group_
 
 async def add_product(paket_id, nama, emoji, deskripsi, harga, link=None, group_chat_id=None):
     await run_db_admin(_add_product_sync, paket_id, nama, emoji, deskripsi, harga, link, group_chat_id)
+    _premium_emoji.product_glyphs[paket_id] = emoji
     _invalidate_products_cache()
 
 def _update_product_field_sync(paket_id, field, value):
@@ -2355,6 +2359,7 @@ async def _set_product_emoji(paket_id, fallback, choice):
         if not await run_db_admin(_product_emoji_sync, paket_id, fallback, choice):
             return False
         _premium_emoji.set_override(f'product/{paket_id}', choice)
+        _premium_emoji.product_glyphs[paket_id] = fallback
         _invalidate_products_cache()
         return True
 
@@ -2374,6 +2379,7 @@ async def delete_product(paket_id):
     async with _premium_emoji_config_lock:
         await run_db_admin(_delete_product_sync, paket_id)
         _premium_emoji.set_override(f'product/{paket_id}', None)
+        _premium_emoji.product_glyphs.pop(paket_id, None)
         _invalidate_products_cache()
 
 def make_paket_id(nama):
@@ -3812,7 +3818,8 @@ def admin_callback(handler):
                 except telegram.error.TelegramError:
                     pass
             return
-        return await handler(update, context, *args, **kwargs)
+        with emoji_scope('admin'):
+            return await handler(update, context, *args, **kwargs)
     return guarded
 
 
@@ -4490,6 +4497,7 @@ async def _send_single_cooldown_notice(update: Update, context: ContextTypes.DEF
         simpan_msg_user(context, user_id, msg.message_id)
         await hapus_msg_user_lama(context, user_id, keep_last=1)
 
+@emoji_surface('access')
 async def kirim_link_ke_buyer(context, user_id, paket, order_id, amount):
     group_link = await generate_group_link(context.bot, paket, order_id)
     link = group_link or (paket.get("link") or DEFAULT_LINK)
@@ -4823,34 +4831,82 @@ async def _post_init_warmup(application: Application):
             logger.debug(f"[POST_INIT] Monitoring dipulihkan: {order['order_id']}")
 
 
-def _read_emoji_overrides_sync():
-    with db_session_safe() as conn, conn.cursor() as cursor:
-        cursor.execute("SELECT key, value FROM settings WHERE key LIKE %s", (EMOJI_SETTINGS_PREFIX + '%',))
-        return {row['key'][len(EMOJI_SETTINGS_PREFIX):]: row['value'] for row in cursor.fetchall()}
+def _migrate_emoji_settings_sync():
+    # One transaction makes the original snapshot and materialized locations
+    # visible together. Raw legacy settings stay in place for rollback.
+    with db_session_safe() as conn, conn, conn.cursor() as cursor:
+        cursor.execute("SELECT pg_advisory_xact_lock(%s)", (620261126,))
+        cursor.execute(
+            "SELECT key, value FROM settings WHERE key LIKE %s OR key IN (%s, %s)",
+            (EMOJI_SETTINGS_PREFIX + '%', PREMIUM_EMOJI_SETTING, EMOJI_BACKUP_SETTING),
+        )
+        snapshot = {row['key']: row['value'] for row in cursor.fetchall()}
+        raw = {key[len(EMOJI_SETTINGS_PREFIX):]: value for key, value in snapshot.items()
+               if key.startswith(EMOJI_SETTINGS_PREFIX)}
+        cursor.execute("SELECT paket_id, emoji FROM products")
+        product_glyphs = {row['paket_id']: row['emoji'] for row in cursor.fetchall()}
+        if EMOJI_BACKUP_SETTING not in snapshot:
+            backup = {
+                'enabled': snapshot.get(PREMIUM_EMOJI_SETTING),
+                'settings': raw,
+                'product_glyphs': product_glyphs,
+            }
+            cursor.execute(
+                "INSERT INTO settings (key, value) VALUES (%s, %s)",
+                (EMOJI_BACKUP_SETTING, json.dumps(backup, ensure_ascii=False)),
+            )
+            migrated = dict(slot_migration(raw))
+            if migrated:
+                execute_values(
+                    cursor, "INSERT INTO settings (key, value) VALUES %s ON CONFLICT (key) DO NOTHING",
+                    [(EMOJI_SETTINGS_PREFIX + key, value) for key, value in migrated.items()],
+                )
+            raw = {**migrated, **raw}
+            logger.info('[PREMIUM EMOJI] Snapshot saved: legacy=%d product_custom=%d product_glyphs=%d locations=%d',
+                        len(backup['settings']), sum(key.startswith('product/') for key in backup['settings']),
+                        len(product_glyphs), len(migrated))
+        return snapshot.get(PREMIUM_EMOJI_SETTING) == '1', raw, product_glyphs
 
 
-async def _save_emoji_slot(key, choice):
+def _write_emoji_slots_sync(changes):
+    writes = []
+    deletes = []
+    for key, choice in changes.items():
+        full_key = EMOJI_SETTINGS_PREFIX + key
+        if choice is None and not key.startswith('special/'):
+            deletes.append(full_key)
+        else:
+            writes.append((full_key, json.dumps(choice, ensure_ascii=False)))
+    with db_session_safe() as conn, conn, conn.cursor() as cursor:
+        if writes:
+            execute_values(
+                cursor,
+                """INSERT INTO settings (key, value) VALUES %s
+                   ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value""",
+                writes,
+            )
+        if deletes:
+            cursor.execute("DELETE FROM settings WHERE key=ANY(%s)", (deletes,))
+
+
+async def _save_emoji_slot(key, choice, clear=(), *, revision=None):
     async with _premium_emoji_config_lock:
-        await set_setting(EMOJI_SETTINGS_PREFIX + key,
-                          json.dumps(choice, ensure_ascii=False) if choice is not None else None)
-        _premium_emoji.set_override(key, choice)
+        if revision is not None and revision != _premium_emoji.revision:
+            raise ValueError('Pengaturan emoji sudah berubah.')
+        changes = {key: choice, **dict.fromkeys(clear)}
+        await run_db_admin(_write_emoji_slots_sync, changes)
+        for changed_key, new_value in changes.items():
+            _premium_emoji.set_override(changed_key, new_value)
 
 
 async def _load_premium_emoji(bot):
     async with _premium_emoji_config_lock:
-        try:
-            enabled = await get_setting(PREMIUM_EMOJI_SETTING, '0') == '1'
-        except Exception as exc:
-            logger.warning('[PREMIUM EMOJI] Could not load setting: %s', type(exc).__name__)
-        else:
-            _premium_emoji.set_enabled(enabled)
-            logger.info('[PREMIUM EMOJI] Setting loaded: %s', 'ON' if enabled else 'OFF')
-        try:
-            _premium_emoji.load_overrides(await run_db_admin(_read_emoji_overrides_sync))
-        except Exception as exc:
-            logger.warning('[PREMIUM EMOJI] Could not load manual selections: %s', type(exc).__name__)
-        else:
-            logger.info('[PREMIUM EMOJI] Manual selections loaded: %d', len(_premium_emoji.overrides))
+        enabled, choices, product_glyphs = await run_db_admin(_migrate_emoji_settings_sync)
+        _premium_emoji.product_glyphs = product_glyphs
+        _premium_emoji.load_overrides(choices)
+        _premium_emoji.set_enabled(enabled)
+        logger.info('[PREMIUM EMOJI] Semantic settings ready: enabled=%s selections=%d',
+                    enabled, len(_premium_emoji.overrides))
     await _premium_emoji.validate(bot)
 
 
@@ -4869,7 +4925,7 @@ async def post_init(application: Application):
     # tidak lagi menahan update pertama setelah bot hidup.
     await asyncio.gather(get_http_session(), init_async_db_pool())
     spawn_background(_post_init_warmup(application), name="post-init-warmup")
-    spawn_background(_load_premium_emoji(application.bot), name="premium-emoji-warmup")
+    await _load_premium_emoji(application.bot)
     spawn_background(_claim_free.reconciliation_loop(application.bot), name="claim-free-reconciliation")
 
     spawn_background(_auto_backup_loop(), name="auto-backup-loop")
@@ -5071,6 +5127,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         trace.finish()
 
 
+@emoji_surface('admin')
 async def cmd_emojiid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Tampilkan custom_emoji_id dari emoji pada command atau pesan yang dibalas."""
     if not await is_admin(update.effective_user.id, context):
@@ -6642,7 +6699,7 @@ async def _auto_deliver_pending_prereq_orders(bot, user_id: int, user_name: str,
 # =================== ADMIN: KIRIM LINK PREREQ MANUAL ===================
 
 @admin_callback
-@emoji_surface('requirements')
+@emoji_surface('admin_other')
 async def admin_kirim_link_prereq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await _fast_callback_ack(query)
@@ -6670,16 +6727,17 @@ async def admin_kirim_link_prereq(update: Update, context: ContextTypes.DEFAULT_
 
     kirim_berhasil = False
     try:
-        msg = await context.bot.send_message(
-            chat_id=user_id,
-            text=_build_buyer_access_text(
-                paket, order.get('harga_dibayar') or paket.get('harga', 0),
-                group_link, link, title="🔓 <b>AKSES PRODUK TERBUKA</b>"
-            ),
-            parse_mode="HTML",
-            reply_markup=_build_buyer_access_keyboard(group_link, link),
-            protect_content=True,
-        )
+        with emoji_scope('buyer_manual_access'):
+            msg = await context.bot.send_message(
+                chat_id=user_id,
+                text=_build_buyer_access_text(
+                    paket, order.get('harga_dibayar') or paket.get('harga', 0),
+                    group_link, link, title="🔓 <b>AKSES PRODUK TERBUKA</b>"
+                ),
+                parse_mode="HTML",
+                reply_markup=_build_buyer_access_keyboard(group_link, link),
+                protect_content=True,
+            )
         kirim_berhasil = True
     except Exception as e:
         delivery_error = e
@@ -7083,6 +7141,20 @@ async def pd_req_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await produk_detail(update, context, paket_id=paket_id)
 
+@emoji_surface('manager')
+async def _show_product_emoji(send, chat, paket_id, fallback, *, text, reply_markup):
+    choice = (_premium_emoji.overrides.get(f'product/{paket_id}')
+              or _premium_emoji.default_choice(fallback))
+    if chat and chat.type == 'private' and choice:
+        text += f"\n\nPreview: {esc(preview_emoji(choice, fallback))}"
+        token = _premium_emoji.preview_target.set(chat.id)
+        try:
+            return await send(text, parse_mode="HTML", reply_markup=reply_markup)
+        finally:
+            _premium_emoji.preview_target.reset(token)
+    return await send(text, parse_mode="HTML", reply_markup=reply_markup)
+
+
 @admin_callback
 @emoji_surface('admin_products')
 async def produk_edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7125,16 +7197,21 @@ async def produk_edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop('awaiting_custom_emoji', None)
     context.user_data['editing_product'] = {'paket_id': paket_id, 'field': field}
 
-    await query.edit_message_text(
-        f"<b>✍️ Edit {field.upper()} - {esc(product_badge(p, p['emoji']))} {esc(p['nama'])}</b>\n"
+    edit_text = (
+        f"<b>✍️ Edit {field.upper()} - {esc(p['emoji'])} {esc(p['nama'])}</b>\n"
         f"========================\n\n"
         f"Nilai saat ini: <code>{esc(str(p.get(field) or '-'))}</code>\n\n"
-        f"<i>Kirim {esc(label_map.get(field, field))} baru sekarang:</i>",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⬅️ Batal", callback_data=f"pd_detail_{paket_id}")]
-        ])
+        f"<i>Kirim {esc(label_map.get(field, field))} baru sekarang:</i>"
     )
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ Batal", callback_data=f"pd_detail_{paket_id}")]
+    ])
+    if field == 'emoji':
+        await _show_product_emoji(query.edit_message_text, update.effective_chat, paket_id,
+                                  p['emoji'], text=edit_text, reply_markup=markup)
+    else:
+        await query.edit_message_text(edit_text, parse_mode="HTML", reply_markup=markup)
+
 
 @admin_callback
 @emoji_surface('admin_products')
@@ -7297,6 +7374,7 @@ async def _build_pending_orders_text_and_keyboard(page: int = 0, back_callback: 
     keyboard.append([styled_button("⬅️ Kembali", style="primary", callback_data=back_callback)])
     return text, keyboard
 
+@emoji_surface('admin')
 async def cmd_aktif(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update.message.from_user.id, context):
         return
@@ -7373,18 +7451,19 @@ async def admin_cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await set_admin_msg_id(order_id, msg_id)
 
     try:
-        await context.bot.send_message(
-            chat_id=target_user_id,
-            text=(
-                "<b>❌ PESANAN DIBATALKAN</b>\n"
-                "========================\n\n"
-                "Pesanan kamu telah dibatalkan oleh admin.\n\n"
-                f"⏳ Kamu bisa membuat order baru dalam <b>{cooldown_sisa} menit</b>.\n\n"
-                "Hubungi admin jika ada pertanyaan.\n"
-                "Ketik /start untuk membuat pesanan baru."
-            ),
-            parse_mode="HTML"
-        )
+        with emoji_scope('buyer_admin_notice'):
+            await context.bot.send_message(
+                chat_id=target_user_id,
+                text=(
+                    "<b>❌ PESANAN DIBATALKAN</b>\n"
+                    "========================\n\n"
+                    "Pesanan kamu telah dibatalkan oleh admin.\n\n"
+                    f"⏳ Kamu bisa membuat order baru dalam <b>{cooldown_sisa} menit</b>.\n\n"
+                    "Hubungi admin jika ada pertanyaan.\n"
+                    "Ketik /start untuk membuat pesanan baru."
+                ),
+                parse_mode="HTML"
+            )
     except Exception as e:
         logger.debug(f"Gagal kirim notif pembatalan admin ke buyer: {e}")
 
@@ -7627,6 +7706,7 @@ def _build_stats_text(s: dict, now: datetime) -> str:
     ]
     return "\n".join(l for l in lines if l is not None)
 
+@emoji_surface('admin')
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update.message.from_user.id, context):
         return
@@ -7730,6 +7810,7 @@ async def _generate_json_export():
     )
     return payload_text, len(products), len(orders), len(banned)
 
+@emoji_surface('admin')
 async def _kirim_backup(bot):
     ts = now_wib().strftime('%Y%m%d_%H%M%S')
     zip_name = f"backup_{ts}.zip"
@@ -7802,12 +7883,14 @@ async def _kirim_backup(bot):
         except Exception as ex:
             logger.error(f"Gagal kirim pesan kegagalan backup ke admin: {ex}")
 
+@emoji_surface('admin')
 async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update.message.from_user.id, context):
         return
     await update.message.reply_text("⏳ Membuat backup database...")
     await _kirim_backup(context.bot)
 
+@emoji_surface('admin')
 async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update.message.from_user.id, context):
         return
@@ -7834,6 +7917,7 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Gagal export: {esc(str(e))}", parse_mode="HTML")
 
+@emoji_surface('admin')
 async def cmd_import_json(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update.message.from_user.id, context):
         return
@@ -7982,6 +8066,7 @@ def _import_json_data_sync(data: dict):
 
     return ok_p, fail_p, ok_o, fail_o, ok_b, fail_b, ok_t, fail_t, ok_s, fail_s, ok_a, fail_a
 
+@emoji_surface('admin')
 async def handle_json_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update.message.from_user.id, context):
         return
@@ -8300,6 +8385,7 @@ async def _buyer_reminder_loop(bot):
             logger.error(f"[REMINDER] Error di reminder loop: {e}")
             await asyncio.sleep(3600)
 
+@emoji_surface('admin')
 async def _auto_backup_loop():
     while True:
         try:
@@ -8619,7 +8705,7 @@ def _blast_panel(job):
     return text, InlineKeyboardMarkup(keyboard)
 
 
-@emoji_surface('broadcast')
+@emoji_surface('blast_admin')
 async def _blast_publish(bot, job, force_new=False, destination=None):
     text, keyboard = _blast_panel(job)
     chat_id = destination or job['admin_id']
@@ -8811,7 +8897,7 @@ async def _blast_admin_allowed(update,context):
 
 
 @admin_callback
-@emoji_surface('broadcast')
+@emoji_surface('blast_admin')
 async def cmd_blast_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _blast_admin_allowed(update,context):
         return
@@ -8825,7 +8911,7 @@ async def cmd_blast_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _blast_publish(context.bot,job,force_new=True,destination=update.effective_user.id)
 
 
-@emoji_surface('broadcast')
+@emoji_surface('blast_admin')
 async def cmd_blast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _blast_admin_allowed(update,context):
         return
@@ -8845,6 +8931,7 @@ async def cmd_blast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @admin_callback
+@emoji_surface('admin')
 async def blast_batal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _blast_admin_allowed(update,context):
         return
@@ -8853,7 +8940,7 @@ async def blast_batal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.edit_message_text('✅ Draft blast dibatalkan. Blast yang sudah berjalan dapat dikontrol lewat /blast_status.')
 
 
-@emoji_surface('broadcast')
+@emoji_surface('blast_admin')
 async def _blast_preview(update,context,text):
     # Validate the actual message with Telegram in admin chat only; never probe recipients.
     if not await _blast_admin_allowed(update,context):
@@ -8876,7 +8963,7 @@ async def _blast_preview(update,context,text):
 
 
 @admin_callback
-@emoji_surface('broadcast')
+@emoji_surface('blast_admin')
 async def blast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _blast_admin_allowed(update,context):
         return
@@ -8898,7 +8985,7 @@ async def blast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @admin_callback
-@emoji_surface('broadcast')
+@emoji_surface('blast_admin')
 async def blast_control(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _blast_admin_allowed(update,context):
         return
@@ -8924,6 +9011,7 @@ async def blast_control(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @admin_callback
+@emoji_surface('admin')
 async def blast_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Old buttons have no job identity: never let one cancel an unrelated new blast.
     if not await _blast_admin_allowed(update,context):
@@ -8934,6 +9022,7 @@ async def blast_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # =================== GENERAL MESSAGE HANDLER ===================
 
+@emoji_surface('admin')
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await _emoji_manager.text_input(update, context):
         return
@@ -9379,13 +9468,18 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             field_label = "Link Preview" if field == 'preview_url' else field.capitalize()
-            await update.message.reply_text(
-                f"✅ <b>{esc(field_label)}</b> berhasil diupdate!\nNilai baru: <code>{esc(str(value) if value else '(kosong)')}</code>",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("⬅️ Kembali ke Panel", callback_data="admpanel_back")
-                ]])
+            saved_text = (
+                f"✅ <b>{esc(field_label)}</b> berhasil diupdate!\n"
+                f"Nilai baru: <code>{esc(str(value) if value else '(kosong)')}</code>"
             )
+            markup = InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Kembali ke Panel", callback_data="admpanel_back")
+            ]])
+            if field == 'emoji':
+                await _show_product_emoji(update.message.reply_text, update.message.chat,
+                                          paket_id, value, text=saved_text, reply_markup=markup)
+            else:
+                await update.message.reply_text(saved_text, parse_mode="HTML", reply_markup=markup)
             p = await get_product(paket_id)
             if p:
                 await _send_produk_menu(context, chat_id=user_id)
@@ -9393,6 +9487,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # =================== ADMIN: LINK ===================
 
+@emoji_surface('admin')
 async def cmd_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update.message.from_user.id, context):
         return
@@ -9583,21 +9678,22 @@ async def admin_konfirmasi(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Kembali ke Panel", callback_data="admpanel_back")]])
         )
-        msg = await context.bot.send_message(
-            chat_id=user_id,
-            text=(
-                "<b>❌ PESANAN DITOLAK</b>\n"
-                "========================\n\n"
-                "Maaf, pesanan Anda tidak dapat diproses.\n\n"
-                "Kemungkinan penyebab:\n"
-                "- Pembayaran tidak valid\n"
-                "- Bukti transfer tidak sesuai\n"
-                "- Produk tidak tersedia\n\n"
-                f"⏳ Kamu bisa membuat order baru dalam <b>{COOLDOWN_MENIT} menit</b>.\n\n"
-                "Ketik /start untuk mencoba lagi atau hubungi admin."
-            ),
-            parse_mode="HTML"
-        )
+        with emoji_scope('buyer_admin_notice'):
+            msg = await context.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    "<b>❌ PESANAN DITOLAK</b>\n"
+                    "========================\n\n"
+                    "Maaf, pesanan Anda tidak dapat diproses.\n\n"
+                    "Kemungkinan penyebab:\n"
+                    "- Pembayaran tidak valid\n"
+                    "- Bukti transfer tidak sesuai\n"
+                    "- Produk tidak tersedia\n\n"
+                    f"⏳ Kamu bisa membuat order baru dalam <b>{COOLDOWN_MENIT} menit</b>.\n\n"
+                    "Ketik /start untuk mencoba lagi atau hubungi admin."
+                ),
+                parse_mode="HTML"
+            )
         simpan_msg_user(context, user_id, msg.message_id)
         await hapus_msg_user_lama(context, user_id, keep_last=2)
         await hapus_admin_msg(context, user_id)
@@ -10189,15 +10285,16 @@ async def kick_do_kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ban_user(target_id, "Dikick dari grup oleh admin")
 
     try:
-        await context.bot.send_message(
-            chat_id=target_id,
-            text=(
-                "🚫 <b>Akses Dinonaktifkan</b>\n\n"
-                "Akses kamu ke <b>Hyper Family Store</b> telah dinonaktifkan oleh admin.\n\n"
-                "<i>Jika merasa ini kesalahan, hubungi admin untuk informasi lebih lanjut.</i>"
-            ),
-            parse_mode="HTML"
-        )
+        with emoji_scope('buyer_admin_notice'):
+            await context.bot.send_message(
+                chat_id=target_id,
+                text=(
+                    "🚫 <b>Akses Dinonaktifkan</b>\n\n"
+                    "Akses kamu ke <b>Hyper Family Store</b> telah dinonaktifkan oleh admin.\n\n"
+                    "<i>Jika merasa ini kesalahan, hubungi admin untuk informasi lebih lanjut.</i>"
+                ),
+                parse_mode="HTML"
+            )
     except Exception as e:
         logger.debug(f"Gagal mengirim notif pencabutan akses ke user {target_id}: {e}")
 
@@ -10567,6 +10664,7 @@ async def admpanel_setting_group_link(update: Update, context: ContextTypes.DEFA
 
 # =================== ADMIN: BAN / UNBAN COMMANDS ===================
 
+@emoji_surface('admin')
 async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update.message.from_user.id, context):
         return
@@ -10594,6 +10692,7 @@ async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML"
     )
 
+@emoji_surface('admin')
 async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update.message.from_user.id, context):
         return
@@ -10615,6 +10714,7 @@ async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML"
     )
 
+@emoji_surface('admin')
 async def cmd_daftar_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update.message.from_user.id, context):
         return
@@ -10627,6 +10727,7 @@ async def cmd_daftar_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += f"- ID: <code>{b['user_id']}</code> | Alasan: {esc(b['reason'] or '-')}\n"
     await update.message.reply_text(text, parse_mode="HTML")
 
+@emoji_surface('admin')
 async def cmd_cari(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update.message.from_user.id, context):
         return

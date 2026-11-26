@@ -6,7 +6,6 @@ from copy import copy
 from contextvars import ContextVar
 from functools import lru_cache
 from html import escape
-import json
 import logging
 import re
 from time import monotonic
@@ -17,7 +16,10 @@ from telegram.error import BadRequest, Forbidden, TelegramError
 from telegram.ext import ExtBot
 
 from premium_emoji_catalog import EMOJI_CATALOG
-from premium_emoji_slots import button_role, glyph_key, surface
+from premium_emoji_slots import (
+    PLAIN_SURFACES, PRODUCT_LOCATIONS, button_location, button_role, glyph_key, surface,
+    decode_choice, legacy_screen, text_location,
+)
 
 logger = logging.getLogger(__name__)
 SETTING = 'premium_emoji_enabled'
@@ -47,6 +49,10 @@ _RENDER_SYMBOL = re.compile(_MARKER_PATTERN + '|' + _SYMBOL.pattern)
 
 def mark_emoji(key, original):
     return f'{_MARKER_PREFIX}{key.encode().hex()}\ue001{original}\ue002'
+
+
+def preview_emoji(choice, fallback):
+    return mark_emoji(f'preview/{choice[0]}', choice[1]) if choice else fallback
 
 
 def _marked_key(match):
@@ -107,8 +113,12 @@ class PremiumEmoji:
         self.ids = {}
         self.tags = {}
         self.overrides = {}
+        self.suppressed = set()
+        self.badge_configured = False
+        self.product_glyphs = {}
         self.chats = OrderedDict()
         self.blocked = {}
+        self.rejected_ids = OrderedDict()
         self.preview_target = ContextVar('premium_emoji_preview', default=None)
         self.preview_verified_at = None
         self.validation_lock = asyncio.Lock()
@@ -146,36 +156,97 @@ class PremiumEmoji:
 
     def load_overrides(self, values):
         overrides = {}
+        suppressed = set()
         for key, value in values.items():
-            try:
-                emoji_id, alt = json.loads(value)
-                if not re.fullmatch(r'[0-9]{1,20}', emoji_id) or not isinstance(alt, str) or not alt:
-                    continue
-            except (ValueError, TypeError):
+            if key.startswith('special/') and value == 'null':
+                suppressed.add(key)
                 continue
-            overrides[key] = (emoji_id, alt, _emoji_tag(emoji_id, alt))
+            choice = decode_choice(value)
+            if choice:
+                emoji_id, alt = choice
+                overrides[key] = (emoji_id, alt, _emoji_tag(emoji_id, alt))
         self.overrides = overrides
+        self.suppressed = suppressed
+        self._update_badge_configured()
         self.revision += 1
 
     def set_override(self, key, value):
+        self.suppressed.discard(key)
         if value is None:
             self.overrides.pop(key, None)
+            if key.startswith('special/'):
+                self.suppressed.add(key)
         else:
             emoji_id, alt = value
             self.overrides[key] = (emoji_id, alt, _emoji_tag(emoji_id, alt))
+        self._update_badge_configured()
         self.revision += 1
 
     def manual(self, screen, field, symbol):
-        if not self.overrides or screen in ('preview', 'manager'):
+        if not self.overrides or screen in ('preview', 'manager') or not symbol:
             return None
-        return (self.overrides.get(glyph_key(screen, field, symbol))
+        return (self.overrides.get(glyph_key(legacy_screen(screen), field, symbol))
                 or self.overrides.get(glyph_key('global', field, symbol)))
 
+    def special_choice(self, location, *legacy):
+        if location.key in self.suppressed:
+            return None
+        exact = self.overrides.get(location.key)
+        if exact:
+            return exact
+        return next((self.overrides[key] for key in legacy if key in self.overrides), None)
+
+    def choice_at(self, location, *legacy):
+        return (self.special_choice(location, *legacy)
+                or self.overrides.get(f'role/{location.role}'))
+
+    def badge_legacy(self, location):
+        # A product's fallback glyph may differ from the catalog badge. Keep
+        # each existing glyph-specific selection until this placement is reset.
+        if location.key in self.suppressed:
+            return ()
+        screen, field = legacy_screen(location.screen), location.field
+        results = {}
+        for original in dict.fromkeys(self.product_glyphs.values()):
+            if not original:
+                continue
+            symbol = _base(original)
+            if field == 'button':
+                label = f'{original} Produk'
+                icon = self.button_cache(label) or self.button_cache(label, True)
+                if not icon:
+                    continue
+                symbol = icon[1]
+            elif symbol not in EMOJI_CATALOG:
+                continue
+            if choice := self.manual(screen, field, symbol):
+                results[choice[0]] = choice
+        return tuple(results.values())
+
+    def default_choice(self, glyph):
+        glyph = _base(glyph)
+        return EMOJI_CATALOG.get(glyph)
+
+    def marked_preview(self, match):
+        key = _marked_key(match)
+        if key.startswith('preview/'):
+            emoji_id = key[8:]
+            alt = match['original']
+            return emoji_id, alt, _emoji_tag(emoji_id, alt)
+        return None
+
     def mark_product(self, product_id, original):
-        if not self.enabled or not product_id or not self.overrides:
+        if not self.enabled or not product_id or surface.get() in PLAIN_SURFACES:
             return original
         key = f'product/{product_id}'
-        return mark_emoji(key, str(original)) if key in self.overrides else original
+        if key in self.overrides or self.badge_configured:
+            return mark_emoji(key, str(original))
+        return original
+
+    def _update_badge_configured(self):
+        self.badge_configured = ('role/package' in self.overrides or any(
+            key.startswith('special/') and key.endswith('/package/badge') for key in self.overrides
+        ))
 
     @staticmethod
     def clean_markup(markup):
@@ -249,6 +320,23 @@ class PremiumEmoji:
         if chat_type == 'private':
             self.preview_verified_at = None
 
+    def blocked_ids(self, chat_type, feature, preview):
+        if preview or not self.rejected_ids:
+            return ()
+        now = monotonic()
+        return {emoji_id for (scope, field, emoji_id), until in self.rejected_ids.items()
+                if scope == chat_type and field == feature and until > now}
+
+    def reject_ids(self, chat_type, feature, ids):
+        until = monotonic() + COOLDOWN
+        for emoji_id in ids:
+            key = chat_type, feature, emoji_id
+            self.rejected_ids[key] = until
+            self.rejected_ids.move_to_end(key)
+        while len(self.rejected_ids) > 128:
+            self.rejected_ids.popitem(last=False)
+        self.revision += 1
+
     def record_preview(self, verified):
         self.preview_verified_at = monotonic() if verified else None
         if verified:
@@ -260,19 +348,38 @@ class PremiumEmoji:
         return (self.preview_verified_at is not None
                 and monotonic() - self.preview_verified_at < PREVIEW_VALIDITY)
 
-    def _format_html(self, text, screen):
+    def _format_html(self, text, screen, blocked):
         """Replace visible emoji while preserving Telegram HTML and its attributes."""
         ids = Counter()
         parts = []
         skipped = []
         position = 0
 
-        def replace(match):
+        def replace(match, start):
             marked = match['slot']
             original = match['original'] if marked else match[0]
             symbol = _base(original)
-            picked = (self.overrides.get(_marked_key(match)) if marked
-                      else self.manual(screen, 'text', symbol))
+            if screen == 'manager':
+                picked = self.marked_preview(match) if marked else None
+                if not picked:
+                    return original
+            elif marked:
+                key = _marked_key(match)
+                picked = self.overrides.get(key)
+                if not picked and key.startswith('product/'):
+                    location = PRODUCT_LOCATIONS.get((screen, 'text'))
+                    if location and symbol:
+                        picked = self.choice_at(location, glyph_key(legacy_screen(screen), 'text', symbol),
+                                                glyph_key('global', 'text', symbol))
+                    else:
+                        picked = self.manual(screen, 'text', symbol)
+            elif self.overrides or self.suppressed:
+                following = start + match.end()
+                location = text_location(screen, symbol, text, following)
+                picked = (self.choice_at(location, *location.legacy_keys) if location
+                          else self.manual(screen, 'text', symbol))
+            else:
+                picked = None
             if picked:
                 emoji_id, _, tag = picked
             else:
@@ -280,21 +387,24 @@ class PremiumEmoji:
                 if tag is None:
                     return original
                 emoji_id = self.ids[symbol]
+            if emoji_id in blocked:
+                return original
             ids[emoji_id] += 1
             return tag
 
-        def visible(segment):
+        def visible(segment, start):
             position = 0
             pieces = []
             for url in _BARE_URL.finditer(segment):
-                pieces.extend((_RENDER_SYMBOL.sub(replace, segment[position:url.start()]), url[0]))
+                piece = _RENDER_SYMBOL.sub(lambda m: replace(m, start + position), segment[position:url.start()])
+                pieces.extend((piece, url[0]))
                 position = url.end()
-            pieces.append(_RENDER_SYMBOL.sub(replace, segment[position:]))
+            pieces.append(_RENDER_SYMBOL.sub(lambda m: replace(m, start + position), segment[position:]))
             return ''.join(pieces)
 
         for tag in _HTML_TAG.finditer(text):
             segment = text[position:tag.start()]
-            parts.append(segment if skipped else visible(segment))
+            parts.append(segment if skipped else visible(segment, position))
             parts.append(tag[0])
             name = tag[2].lower()
             if name in _SKIP_TAGS:
@@ -304,15 +414,15 @@ class PremiumEmoji:
                     skipped.pop()
             position = tag.end()
         tail = text[position:]
-        parts.append(tail if skipped else visible(tail))
+        parts.append(tail if skipped else visible(tail, position))
         return _plain_emoji(''.join(parts)), ids
 
-    def render_text(self, text, parse_mode, screen='other'):
+    def render_text(self, text, parse_mode, screen='other', blocked=()):
         if not text or (_MARKER_PREFIX not in text and not _SYMBOL.search(text)):
             return text, None
         if parse_mode and parse_mode.upper() != 'HTML':
             return text, None
-        value, ids = self._format_html(text if parse_mode else escape(text, quote=False), screen)
+        value, ids = self._format_html(text if parse_mode else escape(text, quote=False), screen, blocked)
         return (value, ids) if ids else (text, None)
 
     def _button_icon(self, label, product_fallback=False):
@@ -332,7 +442,7 @@ class PremiumEmoji:
                 return remaining, _base(match[0]), emoji_id
         return None
 
-    def render_markup(self, markup, plain=None, screen='other'):
+    def render_markup(self, markup, plain=None, screen='other', blocked=()):
         icons = {}
         if not isinstance(markup, InlineKeyboardMarkup):
             return markup, icons
@@ -342,32 +452,48 @@ class PremiumEmoji:
         for row_index, row in enumerate(markup.inline_keyboard):
             for column, button in enumerate(row):
                 marked = _MARKER.search(button.text) if _MARKER_PREFIX in button.text else None
-                exact = self.overrides.get(_marked_key(marked)) if marked else None
+                marked_key = _marked_key(marked) if marked else ''
                 label = plain.inline_keyboard[row_index][column].text
+                if screen == 'manager':
+                    exact = self.marked_preview(marked) if marked else None
+                    if not exact:
+                        continue
+                else:
+                    exact = self.overrides.get(marked_key) if marked else None
                 if exact:
                     # Keep the rest of the label when replacing a marked badge.
                     before, after = button.text[:marked.start()], button.text[marked.end():]
                     label = _plain_emoji(before + after.removeprefix(' '))
                     emoji_id = exact[0]
                 else:
-                    key, role_glyph = button_role(screen, button, row_index) if self.overrides else (None, None)
-                    picked = self.overrides.get(key)
-                    if button.api_kwargs.get('icon_custom_emoji_id') and not picked:
-                        continue
+                    key, role_glyph = button_role(screen, button, row_index)
                     icon = self.button_cache(label)
                     callback = button.callback_data
-                    if icon is None and isinstance(callback, str) and callback.startswith(_PRODUCT_CALLBACKS):
+                    product = isinstance(callback, str) and callback.startswith(_PRODUCT_CALLBACKS)
+                    if icon is None and product:
                         icon = self.button_cache(label, True)
-                    if icon:
-                        label, symbol, emoji_id = icon
-                        picked = picked or self.manual(screen, 'button', symbol)
-                    elif picked and role_glyph:
-                        emoji_id = picked[0]
+                    bare_label, symbol, emoji_id = icon or (label, role_glyph, None)
+                    location = (PRODUCT_LOCATIONS.get((screen, 'button')) if product else
+                                button_location(screen, bare_label, symbol, row_index, button, key))
+                    if location and product:
+                        picked = self.choice_at(location, glyph_key(legacy_screen(screen), 'button', symbol),
+                                                glyph_key('global', 'button', symbol)) if symbol else None
+                    elif location:
+                        picked = self.choice_at(location, *location.legacy_keys)
+                        # A custom group label can use a different Unicode glyph.
+                        if location.role == 'group' and symbol != location.glyph:
+                            legacy_choice = self.overrides.get(key) or (self.manual(screen, 'button', symbol) if symbol else None)
+                            picked = self.special_choice(location) or legacy_choice or self.overrides.get('role/group')
                     else:
+                        picked = self.overrides.get(key) or (self.manual(screen, 'button', symbol) if symbol else None)
+                    if button.api_kwargs.get('icon_custom_emoji_id') and not picked:
                         continue
+                    if not icon and not picked:
+                        continue
+                    label = bare_label
                     if picked:
                         emoji_id = picked[0]
-                if not label or not emoji_id:
+                if not label or not emoji_id or emoji_id in blocked:
                     continue
                 if rows is None:
                     rows = plain.to_dict()['inline_keyboard']
@@ -385,12 +511,14 @@ class PremiumEmoji:
         if field and (preview or not self._block(chat_type, field)):
             entity_field = 'entities' if field == 'text' else 'caption_entities'
             if not data.get(entity_field):
-                text, ids = self.render_text(data.get(field), data.get('parse_mode'), screen)
+                text, ids = self.render_text(data.get(field), data.get('parse_mode'), screen,
+                                             self.blocked_ids(chat_type, field, preview))
                 if ids:
                     changed.update({field: text, 'parse_mode': 'HTML'})
                     expected[field] = ids
         if 'reply_markup' in data and (preview or not self._block(chat_type, 'buttons')):
-            markup, icons = self.render_markup(data['reply_markup'], (original or data).get('reply_markup'), screen)
+            markup, icons = self.render_markup(data['reply_markup'], (original or data).get('reply_markup'), screen,
+                                               self.blocked_ids(chat_type, 'buttons', preview))
             if icons:
                 changed['reply_markup'] = markup
                 expected['buttons'] = icons
@@ -398,19 +526,19 @@ class PremiumEmoji:
 
     @staticmethod
     def missing_features(result, expected):
-        missing = []
+        missing = {}
         for field, expected_values in expected.items():
             if field == 'buttons':
                 rows = (result.get('reply_markup') or {}).get('inline_keyboard', [])
-                if any(row >= len(rows) or col >= len(rows[row])
-                       or rows[row][col].get('icon_custom_emoji_id') != emoji_id
-                       for (row, col), emoji_id in expected_values.items()):
-                    missing.append(field)
+                rejected = {emoji_id for (row, col), emoji_id in expected_values.items()
+                            if row >= len(rows) or col >= len(rows[row])
+                            or rows[row][col].get('icon_custom_emoji_id') != emoji_id}
             else:
                 entities = result.get('entities' if field == 'text' else 'caption_entities') or []
                 actual_ids = Counter(e.get('custom_emoji_id') for e in entities if e.get('type') == 'custom_emoji')
-                if expected_values - actual_ids:
-                    missing.append(field)
+                rejected = set(expected_values - actual_ids)
+            if rejected:
+                missing[field] = rejected
         return missing
 
 
@@ -431,16 +559,18 @@ class PremiumEmojiBot(ExtBot):
         if endpoint not in _TEXT_FIELDS and endpoint != 'getChat':
             return await send(endpoint, data, **timeouts)
         original = engine.original_payload(data, _TEXT_FIELDS.get(endpoint))
-        if (not engine.ready and not engine.overrides) or (not engine.enabled and preview_target is None):
+        if preview_target is None and (not engine.enabled or (not engine.ready and not engine.overrides)):
             return await send(endpoint, original, **timeouts)
         chat_id = engine.chat_id(data.get('chat_id'))
         chat_type = engine.chat_type(chat_id)
         preview = preview_target is not None and preview_target == chat_id
+        if endpoint in _TEXT_FIELDS and surface.get() in PLAIN_SURFACES and not preview:
+            return await send(endpoint, original, **timeouts)
         if (endpoint in _TEXT_FIELDS and chat_type in _SUPPORTED_CHATS
-                and (engine.enabled or preview)):
+                and (preview or (engine.enabled and surface.get() != 'manager'))):
             changed, expected = engine.prepare(endpoint, data, chat_type, preview, original)
             if changed:
-                return await self._post_emoji(send, endpoint, original, changed, expected, chat_type, timeouts)
+                return await self._post_emoji(send, endpoint, data, original, changed, expected, chat_type, preview, timeouts)
 
         result = await send(endpoint, original, **timeouts)
         if (chat_id is None or chat_id < 0) and isinstance(result, dict):
@@ -448,7 +578,7 @@ class PremiumEmojiBot(ExtBot):
             engine.remember_chat(chat.get('id'), chat.get('type'))
         return result
 
-    async def _post_emoji(self, send, endpoint, data, changed, expected, chat_type, timeouts):
+    async def _post_emoji(self, send, endpoint, source, data, changed, expected, chat_type, preview, timeouts):
         engine = self.premium_emoji
         enhanced = {**data, **changed}
         try:
@@ -460,7 +590,15 @@ class PremiumEmojiBot(ExtBot):
             bad_button = 'buttons' in expected and 'button_type_invalid' in description.lower()
             if not (bad_button or _REJECTION.search(description)):
                 raise
-            engine.fallback(chat_type, expected)
+            if not preview:
+                named = set(re.findall(r'(?<!\d)\d{8,20}(?!\d)', description))
+                for feature, values in expected.items():
+                    candidate_ids = set(values.values() if feature == 'buttons' else values)
+                    failed = candidate_ids & named
+                    if failed or len(candidate_ids) == 1:
+                        engine.reject_ids(chat_type, feature, failed or candidate_ids)
+                    elif not named:
+                        engine.fallback(chat_type, (feature,))
             return await send(endpoint, data, **timeouts)
 
         if not isinstance(result, dict) or not result.get('message_id'):
@@ -470,19 +608,29 @@ class PremiumEmojiBot(ExtBot):
             return result
         # Some permissions cause Telegram to accept a message but strip emoji.
         # Restore the original presentation in place without resending it.
-        engine.fallback(chat_type, missing)
+        repaired = data
+        if not preview:
+            for feature, rejected in missing.items():
+                feature_values = expected[feature]
+                ids = set(feature_values.values() if feature == 'buttons' else feature_values)
+                if rejected == ids and len(ids) > 1:
+                    engine.fallback(chat_type, (feature,))
+                else:
+                    engine.reject_ids(chat_type, feature, rejected)
+            replacement, _ = engine.prepare(endpoint, source, chat_type, False, data)
+            repaired = {**data, **replacement}
         field = _TEXT_FIELDS[endpoint]
         edit = {'chat_id': data['chat_id'], 'message_id': result['message_id']}
         edit_endpoint = 'editMessageReplyMarkup'
-        markup_source = data if 'buttons' in missing else enhanced
+        markup_source = repaired if 'buttons' in missing else enhanced
         if 'reply_markup' in markup_source:
             edit['reply_markup'] = markup_source['reply_markup']
         if field in missing:
             edit_endpoint = 'editMessageText' if field == 'text' else 'editMessageCaption'
-            edit[field] = data[field]
+            edit[field] = repaired[field]
             for key in ('parse_mode', 'disable_web_page_preview', 'link_preview_options'):
-                if key in data:
-                    edit[key] = data[key]
+                if key in repaired:
+                    edit[key] = repaired[key]
         try:
             async with asyncio.timeout(1.5):
                 edited = await send(edit_endpoint, edit, **timeouts)

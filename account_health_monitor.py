@@ -5,6 +5,7 @@ import hmac
 import json
 import logging
 import os
+import re
 from datetime import datetime, timezone
 from html import escape
 from time import monotonic, time
@@ -304,12 +305,21 @@ class AccountMonitorPanel:
             return panel("👥 Pilih akun", "Belum ada akun terdaftar." if not result["rows"] else "", rows, home)
 
         if route == "enroll":
-            command = "python -m monitor enroll --alias &quot;Akun utama&quot;" if arg is None else (
+            fields = {"id": int(arg)} if arg is not None else {}
+            ssh = "python -m monitor enroll --alias &quot;Akun utama&quot;" if arg is None else (
                 f"python -m monitor enroll --replace {int(arg)} --alias &quot;Akun yang sama&quot;")
-            return panel("🔐 Hubungkan akun Telegram",
-                         f"Jalankan di terminal SSH service Account Monitor.\n\n<code>{command}</code>\n\n"
-                         "Di Telegram resmi, buka Pengaturan → Perangkat → Hubungkan Perangkat Desktop. "
-                         "Scan QR yang muncul. Masukkan password 2FA hanya di terminal jika diminta.",
+            rows = []
+            try:
+                ticket = await call("enroll_ticket", **fields)
+                token = ticket.get("token", "")
+                if not isinstance(token, str) or not re.fullmatch(r"[A-Za-z0-9_-]{43}", token):
+                    raise MonitorUnavailable(UNAVAILABLE)
+                origin = self.client.url.removesuffix("/v1/admin")
+                rows = [[Button("Buka autentikasi aman", url=f"{origin}/auth#ticket={token}")]]
+                text = "Pilih login nomor telepon atau QR. Tautan privat berlaku 2 menit dan sekali pakai."
+            except (MonitorUnavailable, MonitorInput, MonitorPaused):
+                text = "Autentikasi web belum tersedia. Gunakan Railway SSH atau coba lagi."
+            return panel("🔐 Hubungkan akun Telegram", f"{text}\n\nCadangan lewat Railway SSH\n<code>{ssh}</code>", rows,
                          back=button("⬅️ Kelola Akun", "accounts", "account", 0))
 
         if route in {"account", "checkone", "toggle", "remove", "confirmremove", "alias", "spam"}:

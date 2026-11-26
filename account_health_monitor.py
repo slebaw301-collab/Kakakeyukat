@@ -3,6 +3,7 @@ import base64
 import hashlib
 import hmac
 import json
+from io import BytesIO
 import logging
 import os
 import re
@@ -13,6 +14,7 @@ from urllib.parse import urlsplit
 from uuid import uuid4
 
 import aiohttp
+from telegram import InputMediaPhoto
 from telegram import InlineKeyboardButton as Button, InlineKeyboardMarkup
 from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
 from telegram.ext import CallbackQueryHandler, CommandHandler
@@ -218,6 +220,9 @@ class AccountMonitorPanel:
         self.background_options = background_options
         self.task = None
         self.active_notice = None
+        self.qr_flow = None
+        self.qr_runner = None
+        self.qr_start_lock = asyncio.Lock()
         self.offline_count = 0
         self.offline_announced = False
         self.notify_system = False
@@ -250,6 +255,24 @@ class AccountMonitorPanel:
             return
         await self.ack(query)
         route, *args = query.data[len(PREFIX):].split(":")
+        if route == "qr_generate":
+            try:
+                fields = {"id": int(args[0])} if args else {"alias": "Akun Telegram"}
+                await self.start_qr(context.bot, **fields)
+            except (MonitorInput, MonitorPaused, MonitorUnavailable) as exc:
+                await query.message.reply_text(str(exc))
+            except (ValueError, IndexError):
+                await query.message.reply_text("Pilih akun lagi dari Panel Admin.")
+            return
+        if route == "qr_cancel":
+            if args and re.fullmatch(r"[A-Za-z0-9_-]{43}", args[0]):
+                try:
+                    await self.client.call("enroll_qr_cancel", flow=args[0])
+                    if args[0] != self.qr_flow and query.message:
+                        await self.delete_enrollment_message(context.bot, query.message.message_id)
+                except (MonitorInput, MonitorPaused, MonitorUnavailable) as exc:
+                    await query.message.reply_text(str(exc))
+            return
         try:
             text, markup = await self.render(route, args)
         except (MonitorUnavailable, MonitorInput, MonitorPaused) as exc:
@@ -305,22 +328,24 @@ class AccountMonitorPanel:
             return panel("👥 Pilih akun", "Belum ada akun terdaftar." if not result["rows"] else "", rows, home)
 
         if route == "enroll":
-            fields = {"id": int(arg)} if arg is not None else {}
-            ssh = "python -m monitor enroll --alias &quot;Akun utama&quot;" if arg is None else (
-                f"python -m monitor enroll --replace {int(arg)} --alias &quot;Akun yang sama&quot;")
-            rows = []
-            try:
-                ticket = await call("enroll_ticket", **fields)
-                token = ticket.get("token", "")
-                if not isinstance(token, str) or not re.fullmatch(r"[A-Za-z0-9_-]{43}", token):
-                    raise MonitorUnavailable(UNAVAILABLE)
-                origin = self.client.url.removesuffix("/v1/admin")
-                rows = [[Button("Buka autentikasi aman", url=f"{origin}/auth#ticket={token}")]]
-                text = "Pilih login nomor telepon atau QR. Tautan privat berlaku 2 menit dan sekali pakai."
-            except (MonitorUnavailable, MonitorInput, MonitorPaused):
-                text = "Autentikasi web belum tersedia. Gunakan Railway SSH atau coba lagi."
-            return panel("🔐 Hubungkan akun Telegram", f"{text}\n\nCadangan lewat Railway SSH\n<code>{ssh}</code>", rows,
+            suffix = (int(arg),) if arg is not None else ()
+            return panel("🔐 Hubungkan akun Telegram", "Pilih metode login.",
+                         [[button("📱 Nomor telepon", "enroll_phone", *suffix)],
+                          [button("📷 QR Code", "qr_generate" if suffix else "enroll_qr", *suffix)]],
                          back=button("⬅️ Kelola Akun", "accounts", "account", 0))
+
+        if route == "enroll_phone":
+            fields = {"id": int(arg)} if arg is not None else {}
+            ticket = await call("enroll_ticket", **fields)
+            return panel("🔐 Login nomor telepon", "Masukkan nomor, kode, dan 2FA bila diminta di halaman aman.",
+                         [[Button("Buka input aman", url=self.enrollment_url(ticket["token"]))]],
+                         back=button("⬅️ Kembali", "enroll", *((int(arg),) if arg is not None else ())))
+
+        if route == "enroll_qr":
+            return panel("📷 Login QR Code",
+                         "Untuk memilih alias, kirim <code>/monitor_input qr Alias akun</code>. "
+                         "QR akan muncul di chat ini dan diperbarui otomatis.",
+                         [[button("Tampilkan QR · Akun Telegram", "qr_generate")]], back=button("⬅️ Kembali", "enroll"))
 
         if route in {"account", "checkone", "toggle", "remove", "confirmremove", "alias", "spam"}:
             return await self.account_page(route, args)
@@ -605,6 +630,111 @@ class AccountMonitorPanel:
                 "Untuk mengatur batas client, kirim <code>/monitor_input clients 8</code>.")
         return panel("⚙️ Pengaturan", text, rows, home)
 
+    def enrollment_url(self, token):
+        if not isinstance(token, str) or not re.fullmatch(r"[A-Za-z0-9_-]{43}", token):
+            raise MonitorUnavailable(UNAVAILABLE)
+        return self.client.url.removesuffix("/v1/admin") + "/auth#ticket=" + token
+
+    async def start_qr(self, bot, **fields):
+        async with self.qr_start_lock:
+            if self.qr_runner is not None and not self.qr_runner.done():
+                raise MonitorInput("Selesaikan atau batalkan QR yang masih aktif.")
+            result = await self.client.call("enroll_qr_start", **fields)
+            key = result.get("flow")
+            if not isinstance(key, str) or not re.fullmatch(r"[A-Za-z0-9_-]{43}", key):
+                raise MonitorUnavailable(UNAVAILABLE)
+            self.qr_flow = key
+            self.qr_runner = asyncio.create_task(self.watch_enrollment(bot, key))
+
+    async def watch_enrollment(self, bot, key):
+        photo_id = prompt_id = None
+        revision = 0
+        last_seconds = None
+        retry_count = 0
+        deadline = monotonic() + 370
+        cancel = button("Batalkan login", "qr_cancel", key)
+        markup = InlineKeyboardMarkup([[cancel]])
+        caption = ("Pindai lewat Telegram → Pengaturan → Perangkat → Hubungkan Perangkat Desktop. "
+                   "QR diperbarui otomatis.")
+        final = "Sesi QR berakhir. Mulai lagi dari Panel Admin."
+        terminal = False
+        try:
+            while monotonic() < deadline:
+                try:
+                    reply = await self.client.call("enroll_qr_status", flow=key, revision=revision)
+                    retry_count = 0
+                except MonitorUnavailable:
+                    retry_count += 1
+                    if retry_count >= 3:
+                        break
+                    await asyncio.sleep(3)
+                    continue
+                phase = reply.get("phase")
+                if phase in {"done", "failed", "cancelled"}:
+                    terminal = True
+                    final = "✅ Akun tersimpan." if phase == "done" else reply.get("message") or final
+                    break
+                if phase == "qr" and reply.get("image"):
+                    photo = BytesIO(base64.b64decode(reply["image"], validate=True))
+                    photo.name = "qr.png"
+                    text = f"{caption}\n\nMasa berlaku QR {reply['qr_seconds']} detik."
+                    if photo_id is None:
+                        message = await bot.send_photo(self.owner, photo, caption=text, reply_markup=markup,
+                                                       protect_content=True, **self.background_options(bot))
+                        photo_id = message.message_id
+                    else:
+                        await bot.edit_message_media(chat_id=self.owner, message_id=photo_id,
+                                                     media=InputMediaPhoto(photo, caption=text), reply_markup=markup,
+                                                     **self.background_options(bot))
+                    revision = reply["qr_revision"]
+                    last_seconds = reply["qr_seconds"]
+                elif phase == "qr" and photo_id is not None:
+                    seconds = reply["qr_seconds"]
+                    if last_seconds is None or last_seconds - seconds >= 6:
+                        await bot.edit_message_caption(
+                            chat_id=self.owner, message_id=photo_id,
+                            caption=f"{caption}\n\nMasa berlaku QR {seconds} detik.",
+                            reply_markup=markup, **self.background_options(bot),
+                        )
+                        last_seconds = seconds
+                if phase == "password":
+                    if photo_id is not None:
+                        await self.delete_enrollment_message(bot, photo_id)
+                        photo_id = None
+                    if prompt_id is None and reply.get("password_ticket"):
+                        secure = Button("Buka input 2FA aman", url=self.enrollment_url(reply["password_ticket"]))
+                        notice = await bot.send_message(
+                            self.owner, "Telegram meminta password 2FA. Buka formulir aman untuk menyelesaikan login.",
+                            protect_content=True, reply_markup=InlineKeyboardMarkup([[secure], [cancel]]),
+                            **self.background_options(bot),
+                        )
+                        prompt_id = notice.message_id
+                await asyncio.sleep(3)
+        except (MonitorInput, MonitorPaused, MonitorUnavailable, TelegramError, KeyError, ValueError, TypeError) as exc:
+            logger.warning("QR login berhenti (%s).", type(exc).__name__)
+        finally:
+            for message_id in (photo_id, prompt_id):
+                await self.delete_enrollment_message(bot, message_id)
+            if not terminal:
+                try:
+                    await self.client.call("enroll_qr_cancel", flow=key)
+                except (MonitorInput, MonitorPaused, MonitorUnavailable):
+                    pass
+            self.qr_flow = None
+        try:
+            await bot.send_message(self.owner, final, protect_content=True,
+                                   reply_markup=InlineKeyboardMarkup([[button("Kelola Akun", "accounts", "account", 0)]]),
+                                   **self.background_options(bot))
+        except TelegramError:
+            pass
+
+    async def delete_enrollment_message(self, bot, message_id):
+        if message_id is not None:
+            try:
+                await bot.delete_message(self.owner, message_id, **self.background_options(bot))
+            except TelegramError:
+                pass
+
     async def message(self, update, context):
         if not self.authorized(update):
             return
@@ -613,6 +743,9 @@ class AccountMonitorPanel:
             if len(parts) != 3:
                 raise MonitorInput("Buka menu Account Monitor untuk melihat format perintah.")
             action, values = parts[1:]
+            if action == "qr":
+                await self.start_qr(context.bot, alias=values.strip())
+                return
             if action in {"alias", "spam", "appeal"}:
                 item, value = values.split(maxsplit=1)
                 account_id = int(item)
@@ -650,6 +783,9 @@ class AccountMonitorPanel:
         self.task = asyncio.create_task(self._notifier(bot), name="account-monitor-notifications")
 
     async def stop(self):
+        if self.qr_runner is not None and not self.qr_runner.done():
+            self.qr_runner.cancel()
+            await asyncio.gather(self.qr_runner, return_exceptions=True)
         if self.task is not None:
             self.task.cancel()
             await asyncio.gather(self.task, return_exceptions=True)

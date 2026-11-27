@@ -192,3 +192,48 @@ class BlastDestinationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["chat_id"],-1001234567890)
         self.assertEqual(kwargs["reply_markup"].inline_keyboard[0][0].api_kwargs["style"],"success")
         bot.send_message.assert_not_awaited()
+
+class BlastPickerTests(unittest.TestCase):
+    def test_pages_are_sorted_and_bounded(self):
+        from blast_payload import picker_page
+        rows=[{"id":-i,"title":f"Chat {i:02d}"} for i in range(20,0,-1)]
+        page,index,pages=picker_page(rows,0)
+        self.assertEqual((len(page),index,pages),(8,0,3))
+        self.assertEqual(page[0]["id"],-1)
+        page,index,pages=picker_page(rows,99)
+        self.assertEqual((len(page),index,pages),(4,2,3))
+        self.assertEqual(picker_page([],0),([],0,1))
+
+    def test_toggle_multiple_pages_reset_all_and_stale(self):
+        from blast_payload import picker_select
+        available=set(range(-10,0))
+        selected=picker_select([],available,"toggle",-1)
+        selected=picker_select(selected,available,"toggle",-10)
+        self.assertEqual(selected,{-1,-10})
+        self.assertEqual(picker_select(selected,available,"toggle",-1),{-10})
+        self.assertEqual(picker_select(selected,available,"all"),available)
+        self.assertEqual(picker_select(selected,available,"reset"),set())
+        with self.assertRaises(ValueError):
+            picker_select(selected,available,"toggle",-11)
+
+    def test_limit_is_not_silently_truncated(self):
+        from blast_payload import picker_select
+        available=set(range(-11,0))
+        with self.assertRaises(ValueError):
+            picker_select([],available,"all")
+        with self.assertRaises(ValueError):
+            picker_select(set(range(-10,0)),available,"toggle",-11)
+
+    def test_membership_permission_changes(self):
+        from blast_payload import destination_from_membership
+        chat=SimpleNamespace(id=-1001234567890,type="channel",title="Example")
+        member=SimpleNamespace(status="administrator",can_post_messages=True)
+        self.assertEqual(destination_from_membership(chat,member)["id"],chat.id)
+        for invalid in (SimpleNamespace(status="left"),SimpleNamespace(status="member"),
+                        SimpleNamespace(status="administrator",can_post_messages=False)):
+            with self.assertRaises(ValueError):
+                destination_from_membership(chat,invalid)
+
+    def test_callback_length_with_maximum_id(self):
+        token="a"*32
+        self.assertLessEqual(len(f"bp|{token}|toggle|-9999999999999999".encode()),64)

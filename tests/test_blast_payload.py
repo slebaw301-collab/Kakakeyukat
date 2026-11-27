@@ -1,6 +1,11 @@
 import unittest
 from unittest.mock import AsyncMock
-from blast_payload import parse_buttons, button_lines, build_markup, send_blast_payload
+from types import SimpleNamespace
+import json
+from telegram import MessageEntity
+from telegram.error import BadRequest, Forbidden, TimedOut
+from blast_payload import (parse_buttons, button_lines, build_markup, send_blast_payload,
+                           capture_blast_body, custom_emoji_count)
 
 class BlastButtonsTests(unittest.TestCase):
     def test_roundtrip_and_order(self):
@@ -50,3 +55,84 @@ class BlastDeliveryTests(unittest.IsolatedAsyncioTestCase):
         bot=AsyncMock()
         await send_blast_payload(bot,42,"hello",{"buttons":parse_buttons("One | https://example.com\nTwo | https://example.org"),"columns":2})
         self.assertEqual(len(bot.send_message.await_args.kwargs["reply_markup"].inline_keyboard[0]),2)
+
+class BlastNativeEmojiTests(unittest.IsolatedAsyncioTestCase):
+    def native(self):
+        # Leading whitespace and astral Unicode make trimming/code-point offsets wrong.
+        raw = " 😀✨ text"
+        entities = [MessageEntity("custom_emoji", 1, 2, custom_emoji_id="1234567890"),
+                    MessageEntity("custom_emoji", 3, 1, custom_emoji_id="9876543210"),
+                    MessageEntity("bold", 5, 4)]
+        return raw, entities
+
+    async def test_native_text_utf16_and_restart(self):
+        raw, entities = self.native()
+        payload = {"kind": "text", "buttons": parse_buttons("Open | https://example.com | hijau")}
+        captured = capture_blast_body(SimpleNamespace(text=raw, entities=entities), payload, raw.strip())
+        self.assertEqual(captured, raw)
+        restored = json.loads(json.dumps(payload))
+        self.assertEqual(custom_emoji_count(restored["entities"]), 2)
+        bot = AsyncMock()
+        await send_blast_payload(bot, 42, captured, restored)
+        kwargs = bot.send_message.await_args.kwargs
+        self.assertEqual(kwargs["text"], raw)
+        self.assertIsNone(kwargs["parse_mode"])
+        self.assertEqual([e.to_dict() for e in kwargs["entities"]], [e.to_dict() for e in entities])
+        self.assertEqual(kwargs["reply_markup"].inline_keyboard[0][0].api_kwargs["style"], "success")
+
+    async def test_native_caption_photo_and_video(self):
+        raw, entities = self.native()
+        entities.append(MessageEntity("text_link", 5, 4, url="https://example.com"))
+        for kind in ("photo", "video"):
+            payload = dict(kind=kind, file_id="saved")
+            captured = capture_blast_body(SimpleNamespace(caption=raw, caption_entities=entities), payload)
+            bot = AsyncMock()
+            await send_blast_payload(bot, 42, captured, payload)
+            kwargs = getattr(bot, "send_" + kind).await_args.kwargs
+            self.assertEqual(kwargs["caption"], raw)
+            self.assertEqual([e.to_dict() for e in kwargs["caption_entities"]], [e.to_dict() for e in entities])
+            self.assertIsNone(kwargs["parse_mode"])
+
+    async def test_rejected_custom_emoji_falls_back_once_preserving_format(self):
+        raw, entities = self.native()
+        payload = dict(kind="text")
+        capture_blast_body(SimpleNamespace(text=raw, entities=entities), payload)
+        bot = AsyncMock()
+        bot.send_message.side_effect = [BadRequest("CUSTOM_EMOJI_INVALID"), "sent"]
+        self.assertEqual(await send_blast_payload(bot, 42, raw, payload), "sent")
+        self.assertEqual(bot.send_message.await_count, 2)
+        first, second = bot.send_message.await_args_list
+        self.assertEqual(custom_emoji_count(first.kwargs["entities"]), 2)
+        self.assertEqual([e.type for e in second.kwargs["entities"]], ["bold"])
+        self.assertEqual(second.kwargs["text"], raw)
+        self.assertEqual(custom_emoji_count(payload["entities"]), 2)
+
+    async def test_no_retry_for_uncertain_or_unrelated_errors(self):
+        raw, entities = self.native()
+        payload = dict(kind="text")
+        capture_blast_body(SimpleNamespace(text=raw, entities=entities), payload)
+        for exc in (TimedOut(), Forbidden("bot was blocked"), BadRequest("chat not found")):
+            bot = AsyncMock()
+            bot.send_message.side_effect = exc
+            with self.assertRaises(type(exc)):
+                await send_blast_payload(bot, 42, raw, payload)
+            self.assertEqual(bot.send_message.await_count, 1)
+
+    async def test_retype_clears_previous_offsets_and_preserves_html(self):
+        raw, entities = self.native()
+        payload = dict(kind="text")
+        capture_blast_body(SimpleNamespace(text=raw, entities=entities), payload)
+        body = capture_blast_body(SimpleNamespace(text="<b>New</b>", entities=[]), payload, "<b>New</b>")
+        self.assertNotIn("entities", payload)
+        bot = AsyncMock()
+        await send_blast_payload(bot, 42, body, payload)
+        bot.send_message.assert_awaited_once_with(chat_id=42, text="<b>New</b>", parse_mode="HTML")
+
+    async def test_format_only_no_premium(self):
+        raw = "link"
+        payload = dict(kind="text")
+        capture_blast_body(SimpleNamespace(text=raw, entities=[MessageEntity("text_link", 0, 4, url="https://example.org")]), payload, raw)
+        bot=AsyncMock()
+        await send_blast_payload(bot, 42, raw, payload)
+        self.assertEqual(bot.send_message.await_args.kwargs["entities"][0].url, "https://example.org")
+        self.assertEqual(bot.send_message.await_count, 1)

@@ -123,3 +123,55 @@ async def send_blast_payload(bot, chat_id, body, payload=None, **options):
             kwargs[field] = [MessageEntity.de_json(entity, None) for entity in entities
                              if entity["type"] != "custom_emoji"]
             return await send(**kwargs)
+
+MAX_DESTINATIONS = 10
+
+def parse_destinations(text):
+    """Accept explicit chat IDs or public usernames; never derive a send target from a link."""
+    entries = text.split()
+    if not 1 <= len(entries) <= MAX_DESTINATIONS:
+        raise ValueError("Masukkan 1–10 ID atau @username grup/channel.")
+    targets = []
+    for entry in entries:
+        if re.fullmatch(r"-[1-9][0-9]{0,15}", entry):
+            target = int(entry)
+        elif re.fullmatch(r"@[A-Za-z0-9_]{5,32}", entry):
+            target = entry.lower()
+        else:
+            raise ValueError("Gunakan ID negatif (contoh -1001234567890) atau @username publik.")
+        if target not in targets:
+            targets.append(target)
+    return targets
+
+async def resolve_destinations(bot, text):
+    """Validate that every selected chat is a group/channel and the bot is an admin."""
+    destinations = {}
+    for target in parse_destinations(text):
+        chat = await bot.get_chat(target)
+        if chat.type not in ("group", "supergroup", "channel") or chat.id >= 0:
+            raise ValueError("Tujuan harus grup atau channel, bukan chat pribadi.")
+        member = await bot.get_chat_member(chat.id, bot.id)
+        if member.status not in ("administrator", "creator"):
+            raise ValueError(f"Bot harus menjadi admin di {chat.title or chat.id}.")
+        if chat.type == "channel" and member.status != "creator" and not getattr(member, "can_post_messages", False):
+            raise ValueError(f"Bot belum memiliki izin posting di {chat.title or chat.id}.")
+        destinations[chat.id] = {"id": chat.id, "title": chat.title or str(chat.id), "type": chat.type}
+    return list(destinations.values())
+
+def blast_audience(payload):
+    """Old jobs default to buyer-only. Explicit modes must never silently fall back."""
+    payload = payload or {}
+    mode = payload.get("audience", "buyers")
+    if mode not in ("buyers", "chats", "both"):
+        raise ValueError("Mode tujuan Blast tidak valid.")
+    chats = []
+    if mode != "buyers":
+        for dest in payload.get("destinations", []):
+            uid = dest["id"]
+            if type(uid) is not int or uid >= 0:
+                raise ValueError("ID tujuan harus negatif.")
+            if uid not in chats:
+                chats.append(uid)
+        if not 1 <= len(chats) <= MAX_DESTINATIONS:
+            raise ValueError("Pilih 1–10 tujuan grup/channel.")
+    return mode != "chats", chats

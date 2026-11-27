@@ -9147,7 +9147,7 @@ async def blast_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @emoji_surface('admin')
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg=update.message
-    if msg and (msg.photo or msg.video) and not msg.forward_date:
+    if msg and (getattr(msg, 'photo', None) or getattr(msg, 'video', None)) and not getattr(msg, 'forward_date', None):
         if (context.user_data.get('blast_state') or {}).get('step') not in ('typing','buttons'):
             return
     if await _emoji_manager.text_input(update, context):

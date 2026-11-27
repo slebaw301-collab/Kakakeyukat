@@ -136,3 +136,59 @@ class BlastNativeEmojiTests(unittest.IsolatedAsyncioTestCase):
         await send_blast_payload(bot, 42, raw, payload)
         self.assertEqual(bot.send_message.await_args.kwargs["entities"][0].url, "https://example.org")
         self.assertEqual(bot.send_message.await_count, 1)
+
+class BlastDestinationTests(unittest.IsolatedAsyncioTestCase):
+    def test_audience_modes_and_legacy(self):
+        from blast_payload import blast_audience
+        dest = [{"id": -1001234567890}, {"id": -1001234567890}, {"id": -42}]
+        self.assertEqual(blast_audience(None), (True, []))
+        self.assertEqual(blast_audience({"audience":"buyers","destinations":dest}), (True, []))
+        self.assertEqual(blast_audience({"audience":"chats","destinations":dest}), (False, [-1001234567890,-42]))
+        self.assertEqual(blast_audience({"audience":"both","destinations":dest}), (True, [-1001234567890,-42]))
+        for payload in ({"audience":"chats"}, {"audience":"unknown"}, {"audience":"both","destinations":[{"id":42}]}):
+            with self.assertRaises(ValueError):
+                blast_audience(payload)
+
+    def test_parse_targets(self):
+        from blast_payload import parse_destinations
+        self.assertEqual(parse_destinations("@Example -1001234567890\n@example"), ["@example",-1001234567890])
+        for raw in ("", "12345", "https://t.me/example", "@a", "-1 "*11):
+            with self.assertRaises(ValueError):
+                parse_destinations(raw)
+
+    async def test_validation_resolves_and_deduplicates_without_posting(self):
+        from blast_payload import resolve_destinations
+        bot = AsyncMock()
+        bot.id = 42
+        bot.get_chat.return_value = SimpleNamespace(id=-1001234567890,type="channel",title="Example")
+        bot.get_chat_member.return_value = SimpleNamespace(status="administrator",can_post_messages=True)
+        result = await resolve_destinations(bot, "@example -1001234567890")
+        self.assertEqual(result,[{"id":-1001234567890,"title":"Example","type":"channel"}])
+        bot.send_message.assert_not_awaited()
+        bot.send_photo.assert_not_awaited()
+        bot.send_video.assert_not_awaited()
+
+    async def test_reject_private_nonadmin_and_no_post_permission(self):
+        from blast_payload import resolve_destinations
+        bot = AsyncMock()
+        bot.id = 42
+        for chat,member in (
+            (SimpleNamespace(id=12,type="private",title=None), SimpleNamespace(status="administrator")),
+            (SimpleNamespace(id=-12,type="supergroup",title="Group"), SimpleNamespace(status="member")),
+            (SimpleNamespace(id=-12,type="channel",title="Channel"), SimpleNamespace(status="administrator",can_post_messages=False)),
+        ):
+            bot.get_chat.return_value = chat
+            bot.get_chat_member.return_value = member
+            with self.assertRaises(ValueError):
+                await resolve_destinations(bot,"@example")
+        bot.send_message.assert_not_awaited()
+
+    async def test_direct_channel_delivery_keeps_media_and_buttons(self):
+        bot = AsyncMock()
+        payload = {"kind":"photo","file_id":"saved","audience":"chats","destinations":[{"id":-1001234567890}],
+                   "buttons":parse_buttons("Open | https://example.com | hijau")}
+        await send_blast_payload(bot,-1001234567890,"Caption",payload)
+        kwargs=bot.send_photo.await_args.kwargs
+        self.assertEqual(kwargs["chat_id"],-1001234567890)
+        self.assertEqual(kwargs["reply_markup"].inline_keyboard[0][0].api_kwargs["style"],"success")
+        bot.send_message.assert_not_awaited()

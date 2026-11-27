@@ -51,7 +51,7 @@ from premium_emoji_slots import (
     emoji_scope, emoji_surface, slot_migration,
 )
 from premium_emoji_manager import EmojiManager
-from blast_payload import parse_buttons, button_lines, send_blast_payload
+from blast_payload import parse_buttons, button_lines, send_blast_payload, capture_blast_body, custom_emoji_count
 from telegram import (
     Update, BotCommand, BotCommandScopeChat, BotCommandScopeDefault,
     InlineKeyboardButton as TelegramInlineKeyboardButton, InlineKeyboardMarkup, MessageEntity
@@ -8976,7 +8976,7 @@ async def cmd_blast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     context.user_data['blast_state']={'step':'typing'}
     await update.effective_message.reply_text(
-        '📢 <b>BROADCAST PESAN</b>\n\nKirim teks, satu foto, atau satu video dengan caption opsional. Mendukung HTML.\nTombol URL dapat ditambahkan setelah preview.\n'
+        '📢 <b>BROADCAST PESAN</b>\n\nKirim teks, satu foto, atau satu video dengan caption opsional. Mendukung HTML atau format asli Telegram (termasuk emoji Premium).\nTombol URL dapat ditambahkan setelah preview.\n'
         'Penerima: semua user unik yang pernah membuat order, kecuali yang diban admin.\n\n'
         'Pesan akan ditampilkan untuk preview sebelum dikirim.',parse_mode='HTML',
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('❌ Batal',callback_data='blast_batal')]]))
@@ -9005,7 +9005,7 @@ async def _blast_preview(update,context,text,payload=None):
         return
     context.user_data['blast_state']={'step':'edit','text':text,'payload':payload}
     try:
-        await send_blast_payload(context.bot, update.effective_user.id, text, payload)
+        preview_message=await send_blast_payload(context.bot, update.effective_user.id, text, payload)
     except telegram.error.BadRequest:
         await update.effective_message.reply_text('⚠️ Preview gagal: periksa HTML, media, URL atau custom emoji.',
             reply_markup=InlineKeyboardMarkup([
@@ -9017,8 +9017,11 @@ async def _blast_preview(update,context,text,payload=None):
     context.user_data['blast_state']={'step':'preview','text':text,'payload':payload,'nonce':nonce}
     count=len(payload['buttons'])
     cols=payload['columns']
+    expected=custom_emoji_count(payload.get('entities'))
+    actual=custom_emoji_count(getattr(preview_message,'entities' if payload.get('kind','text')=='text' else 'caption_entities',None))
+    emoji_note=('\n⚠️ Telegram tidak mempertahankan semua emoji Premium pada preview. Emoji yang ditolak dapat tampil sebagai emoji standar.' if expected and actual<expected else '')
     await update.effective_message.reply_text(
-        f'📋 Preview di atas. Tombol: {count}/10 • Layout: {cols} kolom.\nKirim ke seluruh target blast?',
+        f'📋 Preview di atas. Tombol: {count}/10 • Layout: {cols} kolom.{emoji_note}\nKirim ke seluruh target blast?',
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton('🔗 Atur Tombol',callback_data=f'blast_buttons|{nonce}')],
             [InlineKeyboardButton('1 Kolom',callback_data=f'blast_layout|1|{nonce}'),
@@ -9213,7 +9216,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elif not text:
                 await msg.reply_text('❌ Kirim teks, foto atau video.')
                 return
-            body=(msg.caption or '') if payload['kind']!='text' else text
+            body=capture_blast_body(msg,payload,text)
             await _blast_preview(update, context, body, payload)
             return
 

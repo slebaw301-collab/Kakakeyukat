@@ -51,6 +51,7 @@ from premium_emoji_slots import (
     emoji_scope, emoji_surface, slot_migration,
 )
 from premium_emoji_manager import EmojiManager
+from blast_payload import parse_buttons, button_lines, send_blast_payload
 from telegram import (
     Update, BotCommand, BotCommandScopeChat, BotCommandScopeDefault,
     InlineKeyboardButton as TelegramInlineKeyboardButton, InlineKeyboardMarkup, MessageEntity
@@ -156,7 +157,7 @@ def get_user_state(context) -> str:
     if ud.get('awaiting_add_admin'):
         return UserStateManager.AWAITING_ADD_ADMIN
     bs = ud.get('blast_state', {})
-    if bs.get('step') == 'typing':
+    if bs.get('step') in ('typing', 'buttons'):
         return UserStateManager.BLAST_TYPING
     if bs.get('step') == 'preview':
         return UserStateManager.BLAST_PREVIEW
@@ -8519,6 +8520,7 @@ def _blast_schema_sync():
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )""")
+        c.execute("ALTER TABLE broadcast_jobs ADD COLUMN IF NOT EXISTS payload JSONB")
         c.execute("""CREATE UNIQUE INDEX IF NOT EXISTS broadcast_one_active
             ON broadcast_jobs ((1)) WHERE status IN ('running','paused','cancelling')""")
         c.execute("""CREATE TABLE IF NOT EXISTS broadcast_recipients (
@@ -8581,7 +8583,7 @@ def _blast_snapshot_sync(job_id=None):
         return job
 
 
-def _blast_create_sync(admin_id, body, nonce):
+def _blast_create_sync(admin_id, body, nonce, payload=None):
     with _blast_transaction() as c:
         c.execute('SELECT pg_advisory_xact_lock(72419031)')
         c.execute('SELECT id FROM broadcast_jobs WHERE nonce=%s', (nonce,))
@@ -8592,8 +8594,8 @@ def _blast_create_sync(admin_id, body, nonce):
         active = c.fetchone()
         if active:
             return active['id'], False
-        c.execute("INSERT INTO broadcast_jobs(admin_id,body,nonce) VALUES (%s,%s,%s) RETURNING id",
-                  (admin_id, body, nonce))
+        c.execute("INSERT INTO broadcast_jobs(admin_id,body,nonce,payload) VALUES (%s,%s,%s,%s::jsonb) RETURNING id",
+                  (admin_id, body, nonce, json.dumps(payload) if payload else None))
         job_id = c.fetchone()['id']
         # Frozen, unique audience. No reachability probe; keep the original all-order audience.
         c.execute("""INSERT INTO broadcast_recipients(job_id,user_id)
@@ -8804,7 +8806,7 @@ def _blast_send_options(bot):
 
 
 @emoji_surface('broadcast')
-async def _blast_worker_inner(bot, job_id, token, body, state, pacer):
+async def _blast_worker_inner(bot, job_id, token, body, state, pacer, payload=None):
     while not state['stop']:
         if not await pacer.wait(state):
             return
@@ -8815,8 +8817,7 @@ async def _blast_worker_inner(bot, job_id, token, body, state, pacer):
         uid = row['user_id']
         status, error, message_id, delay = 'uncertain', None, None, 0
         try:
-            msg = await asyncio.wait_for(bot.send_message(chat_id=uid,text=body,
-                parse_mode='HTML',**_blast_send_options(bot)),timeout=BLAST_SEND_TIMEOUT)
+            msg = await asyncio.wait_for(send_blast_payload(bot, uid, body, payload, **_blast_send_options(bot)),timeout=BLAST_SEND_TIMEOUT)
             status, message_id = 'sent', msg.message_id
         except telegram.error.RetryAfter as exc:
             delay = exc.retry_after.total_seconds() if isinstance(exc.retry_after,timedelta) else float(exc.retry_after)
@@ -8846,9 +8847,9 @@ async def _blast_worker_inner(bot, job_id, token, body, state, pacer):
             state['network_errors'] = 0
 
 
-async def _blast_worker(bot, job_id, token, body, state, pacer):
+async def _blast_worker(bot, job_id, token, body, state, pacer, payload=None):
     try:
-        await _blast_worker_inner(bot, job_id, token, body, state, pacer)
+        await _blast_worker_inner(bot, job_id, token, body, state, pacer, payload)
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -8870,7 +8871,7 @@ async def _run_broadcast(bot, job_id, token):
             baseline=sum(counts.get(s,0) for s in ('sent','failed','skipped','uncertain')))
         pacer = _BlastPacer()
         pacer.blocked_until = _time.monotonic()+float(job.get('wait_seconds') or 0)
-        workers = [asyncio.create_task(_blast_worker(bot,job_id,token,job['body'],state,pacer))
+        workers = [asyncio.create_task(_blast_worker(bot,job_id,token,job['body'],state,pacer,job.get('payload')))
                    for _ in range(BLAST_WORKERS)]
         next_report=0
         while True:
@@ -8975,7 +8976,7 @@ async def cmd_blast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     context.user_data['blast_state']={'step':'typing'}
     await update.effective_message.reply_text(
-        '📢 <b>BROADCAST PESAN</b>\n\nKirim teks yang mau di-blast. Mendukung HTML.\n'
+        '📢 <b>BROADCAST PESAN</b>\n\nKirim teks, satu foto, atau satu video dengan caption opsional. Mendukung HTML.\nTombol URL dapat ditambahkan setelah preview.\n'
         'Penerima: semua user unik yang pernah membuat order, kecuali yang diban admin.\n\n'
         'Pesan akan ditampilkan untuk preview sebelum dikirim.',parse_mode='HTML',
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('❌ Batal',callback_data='blast_batal')]]))
@@ -8991,26 +8992,96 @@ async def blast_batal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.edit_message_text('✅ Draft blast dibatalkan. Blast yang sudah berjalan dapat dikontrol lewat /blast_status.')
 
 
-@emoji_surface('blast_admin')
-async def _blast_preview(update,context,text):
-    # Validate the actual message with Telegram in admin chat only; never probe recipients.
+@emoji_surface('broadcast')
+async def _blast_preview(update,context,text,payload=None):
     if not await _blast_admin_allowed(update,context):
         return
-    if len(text)>4096:
-        await update.effective_message.reply_text('⚠️ Pesan terlalu panjang. Maksimal 4096 karakter, termasuk kode HTML pada editor ini.')
+    payload = dict(payload or {'kind':'text'})
+    payload.setdefault('buttons', [])
+    payload.setdefault('columns', 1)
+    limit = 4096 if payload.get('kind','text') == 'text' else 1024
+    if len(text)>limit or (payload.get('kind','text') == 'text' and not text.strip()):
+        await update.effective_message.reply_text(f'⚠️ Pesan kosong atau terlalu panjang. Maksimal {limit} karakter termasuk HTML.')
         return
+    context.user_data['blast_state']={'step':'edit','text':text,'payload':payload}
     try:
-        await update.effective_message.reply_text(text,parse_mode='HTML')
+        await send_blast_payload(context.bot, update.effective_user.id, text, payload)
     except telegram.error.BadRequest:
-        await update.effective_message.reply_text('⚠️ Format HTML tidak valid atau pesan terlalu panjang. Perbaiki lalu kirim lagi.')
+        await update.effective_message.reply_text('⚠️ Preview gagal: periksa HTML, media, URL atau custom emoji.',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton('✍️ Ubah Pesan',callback_data='blast_retype')],
+                [InlineKeyboardButton('🔗 Ubah Tombol',callback_data='blast_edit_buttons')],
+                [InlineKeyboardButton('❌ Batalkan',callback_data='blast_batal')]]))
         return
     nonce=uuid.uuid4().hex
-    context.user_data['blast_state']={'step':'preview','text':text,'nonce':nonce}
-    await update.effective_message.reply_text('📋 Pesan di atas adalah preview. Kirim ke seluruh target blast?',
+    context.user_data['blast_state']={'step':'preview','text':text,'payload':payload,'nonce':nonce}
+    count=len(payload['buttons'])
+    cols=payload['columns']
+    await update.effective_message.reply_text(
+        f'📋 Preview di atas. Tombol: {count}/10 • Layout: {cols} kolom.\nKirim ke seluruh target blast?',
         reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton('🔗 Atur Tombol',callback_data=f'blast_buttons|{nonce}')],
+            [InlineKeyboardButton('1 Kolom',callback_data=f'blast_layout|1|{nonce}'),
+             InlineKeyboardButton('2 Kolom',callback_data=f'blast_layout|2|{nonce}')],
             [InlineKeyboardButton('✅ Kirim Sekarang',callback_data=f'blast_confirm|{nonce}'),
              InlineKeyboardButton('✍️ Ubah Pesan',callback_data='blast_retype')],
             [InlineKeyboardButton('❌ Batalkan',callback_data='blast_batal')]]))
+
+
+@admin_callback
+async def blast_buttons(update,context):
+    if not await _blast_admin_allowed(update,context):
+        return
+    query=update.callback_query
+    draft=context.user_data.get('blast_state') or {}
+    action, _, nonce=query.data.partition('|')
+    if action=='blast_edit_buttons':
+        valid=draft.get('step')=='edit'
+    else:
+        valid=draft.get('step')=='preview' and nonce==draft.get('nonce')
+    if not valid:
+        await _callback_feedback(query,context,'Draft sudah tidak aktif. Buka /blast.')
+        return
+    await _fast_callback_ack(query)
+    draft['step']='buttons'
+    draft.pop('nonce',None)
+    current=button_lines(draft.get('payload',{}).get('buttons',[]))
+    await query.message.reply_text(
+        '🔗 ATUR TOMBOL BLAST\n\nKirim daftar tombol, satu per baris (maks. 10).\n'
+        'Format: Nama | URL | warna | ID emoji Premium\n'
+        'Warna dan ID emoji opsional. Warna: default, biru, hijau, merah.\n'
+        'Contoh:\nHubungi Admin | https://t.me/admin | biru\n'
+        'Untuk tambah, edit, hapus, atau ubah urutan, kirim kembali daftar lengkap.\n'
+        'Kirim - untuk menghapus semua tombol.\n\nDaftar saat ini:\n'+(current or '(kosong)'),
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ Preview',callback_data='blast_buttons_back'),
+            InlineKeyboardButton('❌ Batalkan',callback_data='blast_batal')]]))
+
+
+@admin_callback
+async def blast_buttons_back(update,context):
+    if not await _blast_admin_allowed(update,context):
+        return
+    draft=context.user_data.get('blast_state') or {}
+    if draft.get('step')!='buttons':
+        await _callback_feedback(update.callback_query,context,'Editor tidak aktif.')
+        return
+    await _fast_callback_ack(update.callback_query)
+    await _blast_preview(update,context,draft['text'],draft['payload'])
+
+
+@admin_callback
+async def blast_layout(update,context):
+    if not await _blast_admin_allowed(update,context):
+        return
+    query=update.callback_query
+    draft=context.user_data.get('blast_state') or {}
+    _,cols,nonce=query.data.split('|')
+    if draft.get('step')!='preview' or nonce!=draft.get('nonce'):
+        await _callback_feedback(query,context,'Preview sudah tidak aktif.')
+        return
+    await _fast_callback_ack(query)
+    payload=dict(draft['payload'],columns=int(cols))
+    await _blast_preview(update,context,draft['text'],payload)
 
 
 @admin_callback
@@ -9026,7 +9097,7 @@ async def blast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _callback_feedback(query,context,'Preview sudah tidak aktif. Buka /blast atau /blast_status.')
         return
     await _ensure_blast_schema()
-    job_id,created=await run_db_admin(_blast_create_sync,query.from_user.id,draft['text'],nonce)
+    job_id,created=await run_db_admin(_blast_create_sync,query.from_user.id,draft['text'],nonce,draft.get('payload'))
     context.user_data.pop('blast_state',None)
     job=await run_db_admin(_blast_snapshot_sync,job_id)
     # Save the initial panel before starting the reporter to avoid duplicate status bubbles.
@@ -9075,6 +9146,10 @@ async def blast_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @emoji_surface('admin')
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg=update.message
+    if msg and (getattr(msg, 'photo', None) or getattr(msg, 'video', None)) and not getattr(msg, 'forward_date', None):
+        if (context.user_data.get('blast_state') or {}).get('step') not in ('typing','buttons'):
+            return
     if await _emoji_manager.text_input(update, context):
         return
     if await _claim_free.text_input(update, context):
@@ -9114,11 +9189,32 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         blast_state = context.user_data.get('blast_state')
-        if blast_state and blast_state.get('step') == 'typing':
-            if not text:
-                await update.message.reply_text("❌ Pesan tidak boleh kosong.")
+        if blast_state and blast_state.get('step') == 'buttons':
+            try:
+                buttons = parse_buttons(text)
+            except ValueError as exc:
+                await update.message.reply_text(str(exc))
                 return
-            await _blast_preview(update, context, text)
+            payload=dict(blast_state['payload'],buttons=buttons)
+            await _blast_preview(update,context,blast_state['text'],payload)
+            return
+        if blast_state and blast_state.get('step') == 'typing':
+            msg=update.message
+            if msg.media_group_id:
+                await msg.reply_text('⚠️ Album belum didukung. Kirim satu foto atau video.')
+                return
+            payload=dict(blast_state.get('payload') or {})
+            payload.pop('file_id',None)
+            payload['kind']='text'
+            if msg.photo:
+                payload.update(kind='photo',file_id=msg.photo[-1].file_id)
+            elif msg.video:
+                payload.update(kind='video',file_id=msg.video.file_id)
+            elif not text:
+                await msg.reply_text('❌ Kirim teks, foto atau video.')
+                return
+            body=(msg.caption or '') if payload['kind']!='text' else text
+            await _blast_preview(update, context, body, payload)
             return
 
         if context.user_data.get('awaiting_cari'):
@@ -9934,9 +10030,13 @@ async def blast_retype(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _blast_admin_allowed(update, context):
         return
     await _fast_callback_ack(update.callback_query)
-    context.user_data['blast_state'] = {'step': 'typing'}
+    draft=context.user_data.get('blast_state') or {}
+    if draft.get('step') not in ('preview','edit','buttons','typing'):
+        await _callback_feedback(update.callback_query,context,'Draft sudah tidak aktif.')
+        return
+    context.user_data['blast_state'] = {'step': 'typing','payload':draft.get('payload',{})}
     await update.callback_query.edit_message_text(
-        '✍️ Kirim teks blast yang baru. Akan ada preview sebelum pengiriman.',
+        '✍️ Kirim teks, foto atau video yang baru. Tombol yang sudah diatur tetap tersimpan.',
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton('❌ Batal', callback_data='blast_batal')
         ]])
@@ -11255,6 +11355,9 @@ def main():
     app.add_handler(CallbackQueryHandler(blast_confirm, pattern=r"^blast_confirm(?:\|[a-f0-9]{32})?$"))
     app.add_handler(CallbackQueryHandler(blast_stop,    pattern="^blast_stop$"))
     app.add_handler(CallbackQueryHandler(blast_retype,  pattern="^blast_retype$"))
+    app.add_handler(CallbackQueryHandler(blast_buttons, pattern=r"^blast_buttons\|[a-f0-9]{32}$|^blast_edit_buttons$"))
+    app.add_handler(CallbackQueryHandler(blast_buttons_back, pattern="^blast_buttons_back$"))
+    app.add_handler(CallbackQueryHandler(blast_layout, pattern=r"^blast_layout\|[12]\|[a-f0-9]{32}$"))
 
     # Auto-Approve Join Request Handler
     app.add_handler(ChatJoinRequestHandler(handle_join_request))
@@ -11269,7 +11372,7 @@ def main():
 
     # General Fallback Message Handler
     app.add_handler(MessageHandler(
-        (filters.TEXT | filters.FORWARDED) & ~filters.COMMAND & filters.ChatType.PRIVATE,
+        (filters.TEXT | filters.FORWARDED | filters.PHOTO | filters.VIDEO) & ~filters.COMMAND & filters.ChatType.PRIVATE,
         message_handler
     ))
 

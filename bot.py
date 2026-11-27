@@ -51,7 +51,7 @@ from premium_emoji_slots import (
     emoji_scope, emoji_surface, slot_migration,
 )
 from premium_emoji_manager import EmojiManager
-from blast_payload import parse_buttons, button_lines, send_blast_payload, capture_blast_body, custom_emoji_count, blast_audience, resolve_destinations
+from blast_payload import parse_buttons, button_lines, send_blast_payload, capture_blast_body, custom_emoji_count, blast_audience, resolve_destinations, resolve_destination, destination_from_membership, picker_page, picker_select, MAX_DESTINATIONS
 from telegram import (
     Update, BotCommand, BotCommandScopeChat, BotCommandScopeDefault,
     InlineKeyboardButton as TelegramInlineKeyboardButton, InlineKeyboardMarkup, MessageEntity
@@ -8521,6 +8521,10 @@ def _blast_schema_sync():
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )""")
         c.execute("ALTER TABLE broadcast_jobs ADD COLUMN IF NOT EXISTS payload JSONB")
+        c.execute("""CREATE TABLE IF NOT EXISTS broadcast_destinations (
+            chat_id BIGINT PRIMARY KEY, title TEXT NOT NULL, chat_type TEXT NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""")
         c.execute("""CREATE UNIQUE INDEX IF NOT EXISTS broadcast_one_active
             ON broadcast_jobs ((1)) WHERE status IN ('running','paused','cancelling')""")
         c.execute("""CREATE TABLE IF NOT EXISTS broadcast_recipients (
@@ -8544,6 +8548,58 @@ async def _ensure_blast_schema():
         if not _blast_schema_ready:
             await run_db_admin(_blast_schema_sync)
             _blast_schema_ready = True
+
+
+def _blast_registry_sync(destinations=(), remove_id=None):
+    with _blast_transaction() as c:
+        if remove_id is not None:
+            c.execute("DELETE FROM broadcast_destinations WHERE chat_id=%s", (remove_id,))
+        for dest in destinations:
+            c.execute("""INSERT INTO broadcast_destinations(chat_id,title,chat_type)
+                VALUES (%s,%s,%s) ON CONFLICT(chat_id) DO UPDATE
+                SET title=EXCLUDED.title,chat_type=EXCLUDED.chat_type,updated_at=NOW()""",
+                (dest['id'],dest['title'],dest['type']))
+        c.execute("SELECT chat_id AS id,title,chat_type AS type FROM broadcast_destinations")
+        return [dict(row) for row in c.fetchall()]
+
+
+async def _blast_membership_changed(update,context):
+    change=update.my_chat_member
+    if not change or change.chat.type not in ('group','supergroup','channel'):
+        return
+    await _ensure_blast_schema()
+    try:
+        dest=destination_from_membership(change.chat,change.new_chat_member)
+    except ValueError:
+        await run_db_admin(_blast_registry_sync,(),change.chat.id)
+    else:
+        await run_db_admin(_blast_registry_sync,[dest])
+
+
+async def _blast_refresh_registry(bot):
+    await _ensure_blast_schema()
+    registered, managed, products, notif, testi = await asyncio.gather(
+        run_db_admin(_blast_registry_sync),get_managed_groups(),get_all_products(),
+        get_setting('notif_channel_id'),get_setting('testimoni_channel_id'))
+    candidates=set()
+    for raw in [d['id'] for d in registered]+list(managed)+[p.get('group_chat_id') for p in products]+[notif,testi]:
+        try:
+            uid=int(raw)
+        except (ValueError,TypeError):
+            continue
+        if uid<0:
+            candidates.add(uid)
+    semaphore=asyncio.Semaphore(5)
+    async def check(uid):
+        async with semaphore:
+            try:
+                return await resolve_destination(bot,uid)
+            except (ValueError,telegram.error.TelegramError):
+                return None
+    valid=[d for d in await asyncio.gather(*(check(uid) for uid in sorted(candidates))) if d]
+    if valid:
+        await run_db_admin(_blast_registry_sync,valid)
+    return valid
 
 
 def _blast_recover_locked(c, job):
@@ -9089,7 +9145,7 @@ async def blast_audience_choice(update,context):
     query=update.callback_query
     draft=context.user_data.get('blast_state') or {}
     _,mode,nonce=query.data.split('|')
-    if draft.get('step') not in ('target_menu','target_input') or nonce!=draft.get('nonce'):
+    if draft.get('step') not in ('target_menu','target_input','target_picker') or nonce!=draft.get('nonce'):
         await _callback_feedback(query,context,'Editor tujuan sudah tidak aktif.')
         return
     await _fast_callback_ack(query)
@@ -9101,16 +9157,112 @@ async def blast_audience_choice(update,context):
         payload.update(audience='buyers',destinations=[])
         await _blast_preview(update,context,draft['text'],payload)
         return
-    draft.update(step='target_input',target_mode=mode)
-    await query.message.reply_text(
-        '📣 Kirim ID grup/channel (contoh -1001234567890) atau @username publik.\n'
-        'Bisa pilih hingga 10 tujuan sekaligus, pisahkan dengan spasi atau baris baru.\n'
-        'Bot harus menjadi admin; channel memerlukan izin posting.\n'
-        'Tidak ada pesan yang dikirim saat validasi.',
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton('⬅️ Kembali ke Preview',callback_data=f'blast_audience|back|{nonce}')],
-            [InlineKeyboardButton('❌ Batalkan',callback_data='blast_batal')]
-        ]))
+    draft.update(step='target_picker',target_mode=mode,picker_page=0,
+                 picker_selected=[d['id'] for d in payload.get('destinations',[])])
+    draft['picker_chats']=await _blast_refresh_registry(context.bot)
+    if context.user_data.get('blast_state') is not draft or draft.get('step')!='target_picker':
+        return
+    await _blast_picker_render(query.message,draft)
+
+
+async def _blast_picker_render(message,draft,edit=False,note=''):
+    nonce=draft['nonce']
+    available={d['id'] for d in draft['picker_chats']}
+    selected=set(draft.get('picker_selected',[])) & available
+    draft['picker_selected']=sorted(selected)
+    rows,page,pages=picker_page(draft['picker_chats'],draft.get('picker_page',0))
+    draft['picker_page']=page
+    def button(label,action,arg=''):
+        return InlineKeyboardButton(label,callback_data=f'bp|{nonce}|{action}|{arg}')
+    keyboard=[[button(('✅ ' if d['id'] in selected else '⬜ ')+('📣 ' if d['type']=='channel' else '👥 ')+d['title'][:55],
+                       'toggle',d['id'])] for d in rows]
+    if pages>1:
+        nav=[]
+        if page>0:
+            nav.append(button('◀️ Sebelumnya','page',page-1))
+        if page+1<pages:
+            nav.append(button('Berikutnya ▶️','page',page+1))
+        keyboard.append(nav)
+    keyboard.extend([
+        [button('Pilih Semua','all'),button('Reset Pilihan','reset')],
+        [button('🔄 Refresh Daftar','refresh'),button('➕ Tambah Manual','manual')],
+        [button(f'✅ Lanjutkan ({len(selected)})','done')],
+        [button('⬅️ Kembali','back'),InlineKeyboardButton('❌ Batalkan',callback_data='blast_batal')]
+    ])
+    body=f'📣 PILIH CHANNEL / GRUP\n\nDipilih: {len(selected)}/{MAX_DESTINATIONS} • Halaman {page+1}/{pages}\nPilih tujuan dengan menekan tombol.'
+    if not rows:
+        body+='\n\nBelum ada tujuan valid. Jadikan bot admin atau gunakan Tambah Manual.'
+    if note:
+        body+='\n\n⚠️ '+note
+    markup=InlineKeyboardMarkup(keyboard)
+    if edit:
+        try:
+            await message.edit_text(body,reply_markup=markup,parse_mode=None)
+        except telegram.error.BadRequest as exc:
+            if 'message is not modified' not in str(exc).lower():
+                raise
+    else:
+        await message.reply_text(body,reply_markup=markup,parse_mode=None)
+
+
+@admin_callback
+@emoji_surface('blast_admin')
+async def blast_picker(update,context):
+    if not await _blast_admin_allowed(update,context):
+        return
+    query=update.callback_query
+    draft=context.user_data.get('blast_state') or {}
+    _,nonce,action,arg=query.data.split('|')
+    if draft.get('step') not in ('target_picker','target_input') or nonce!=draft.get('nonce'):
+        await _callback_feedback(query,context,'Editor tujuan sudah tidak aktif.')
+        return
+    if draft.get('step')=='target_input' and action!='return':
+        await _callback_feedback(query,context,'Selesaikan input manual dahulu.')
+        return
+    await _fast_callback_ack(query)
+    if action=='back':
+        await _blast_preview(update,context,draft['text'],draft['payload'])
+        return
+    if action=='manual':
+        draft['step']='target_input'
+        await query.message.reply_text(
+            '➕ Kirim ID negatif grup/channel atau @username publik (maks. 10). Tujuan valid disimpan dan ditambahkan ke pilihan.',
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ Kembali ke Daftar',callback_data=f'bp|{nonce}|return|')]]))
+        return
+    if action=='return':
+        draft['step']='target_picker'
+        await _blast_picker_render(query.message,draft)
+        return
+    note=''
+    if action=='refresh':
+        draft['picker_chats']=await _blast_refresh_registry(context.bot)
+    elif action=='page':
+        draft['picker_page']=int(arg)
+    elif action in ('toggle','all','reset'):
+        try:
+            selected=picker_select(draft['picker_selected'],[d['id'] for d in draft['picker_chats']],action,
+                                   int(arg) if action=='toggle' else None)
+            draft['picker_selected']=sorted(selected)
+        except ValueError as exc:
+            note=str(exc)
+    elif action=='done':
+        selected=draft['picker_selected']
+        if not selected:
+            note='Pilih minimal satu tujuan.'
+        else:
+            try:
+                destinations=await resolve_destinations(context.bot,' '.join(map(str,selected)))
+            except (ValueError,telegram.error.TelegramError):
+                note='Izin atau akses salah satu tujuan berubah. Refresh daftar dan pilih ulang.'
+            else:
+                if context.user_data.get('blast_state') is not draft or draft.get('step')!='target_picker':
+                    return
+                await run_db_admin(_blast_registry_sync,destinations)
+                payload=dict(draft['payload'],audience=draft['target_mode'],destinations=destinations)
+                await _blast_preview(update,context,draft['text'],payload)
+                return
+    if context.user_data.get('blast_state') is draft and draft.get('step')=='target_picker':
+        await _blast_picker_render(query.message,draft,edit=True,note=note)
 
 
 @admin_callback
@@ -9287,8 +9439,16 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             if context.user_data.get('blast_state') is not blast_state or blast_state.get('step')!='target_input':
                 return
-            payload=dict(blast_state['payload'],audience=blast_state['target_mode'],destinations=destinations)
-            await _blast_preview(update,context,blast_state['text'],payload)
+            await run_db_admin(_blast_registry_sync,destinations)
+            available={d['id']:d for d in blast_state.get('picker_chats',[])}
+            available.update({d['id']:d for d in destinations})
+            selected=set(blast_state.get('picker_selected',[])) | {d['id'] for d in destinations}
+            note=''
+            if len(selected)>MAX_DESTINATIONS:
+                selected=set(blast_state.get('picker_selected',[]))
+                note='Tujuan tersimpan, tetapi pilihan melebihi batas 10. Pilih manual dari daftar.'
+            blast_state.update(step='target_picker',picker_chats=list(available.values()),picker_selected=sorted(selected))
+            await _blast_picker_render(update.message,blast_state,note=note)
             return
         if blast_state and blast_state.get('step') == 'buttons':
             try:
@@ -11461,6 +11621,8 @@ def main():
     app.add_handler(CallbackQueryHandler(blast_layout, pattern=r"^blast_layout\|[12]\|[a-f0-9]{32}$"))
     app.add_handler(CallbackQueryHandler(blast_target, pattern=r"^blast_target\|[a-f0-9]{32}$"))
     app.add_handler(CallbackQueryHandler(blast_audience_choice, pattern=r"^blast_audience\|(buyers|chats|both|back)\|[a-f0-9]{32}$"))
+    app.add_handler(CallbackQueryHandler(blast_picker, pattern=r"^bp\|[a-f0-9]{32}\|(?:toggle|all|reset|page|refresh|manual|return|done|back)\|-?\d*$"))
+    app.add_handler(ChatMemberHandler(_blast_membership_changed, ChatMemberHandler.MY_CHAT_MEMBER))
 
     # Auto-Approve Join Request Handler
     app.add_handler(ChatJoinRequestHandler(handle_join_request))
@@ -11483,7 +11645,7 @@ def main():
         f"Bot Hyper Family Store berjalan | concurrent={BOT_CONCURRENT_UPDATES} | "
         f"telegram_pool={TELEGRAM_CONNECTION_POOL_SIZE} | db_pool={DB_POOL_MAX}"
     )
-    app.run_polling(allowed_updates=["message", "callback_query", "chat_join_request", "chat_member"])
+    app.run_polling(allowed_updates=["message", "callback_query", "chat_join_request", "chat_member", "my_chat_member"])
 
 if __name__ == "__main__":
     _install_uvloop_if_available()

@@ -55,6 +55,7 @@ from telegram import (
     Update, BotCommand, BotCommandScopeChat, BotCommandScopeDefault,
     InlineKeyboardButton as TelegramInlineKeyboardButton, InlineKeyboardMarkup, MessageEntity
 )
+from telegram.constants import InlineKeyboardMarkupLimit
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, ChatJoinRequestHandler, ChatMemberHandler, filters, ContextTypes
@@ -2170,6 +2171,15 @@ _products_cache_generation = 0
 _buyer_products_view = None
 _settings_cache_versions: dict = {}
 _PRODUCT_PREVIEW_PREFIX = 'product_preview:'
+_CATALOG_DEFAULT_PAGE_SIZE = 8
+_CATALOG_ALL_LIMIT = InlineKeyboardMarkupLimit.TOTAL_BUTTON_NUMBER - 1
+# Reserve space for Next, Previous, and the settings exit on preview pages.
+_CATALOG_PAGE_LIMIT = InlineKeyboardMarkupLimit.TOTAL_BUTTON_NUMBER - 3
+_CATALOG_SETTING_DEFAULTS = {
+    'catalog_mode': 'all',
+    'catalog_page_size': str(_CATALOG_DEFAULT_PAGE_SIZE),
+    'catalog_columns': '1',
+}
 _PRODUCTS_WITH_PREVIEW_SQL = f"""
     SELECT p.*, s.value AS preview_url
     FROM products p
@@ -2243,8 +2253,7 @@ def _invalidate_products_cache():
     _buyer_products_view = None
 
 
-async def _get_buyer_products_page(page, page_size=8):
-    """Use the same TTL/invalidation as products; copy only the visible page."""
+async def _get_active_buyer_products():
     global _buyer_products_view
     snapshot = _products_cache
     if snapshot is None or _time.monotonic() >= snapshot[1]:
@@ -2255,9 +2264,15 @@ async def _get_buyer_products_page(page, page_size=8):
     if snapshot is not None and _time.monotonic() < snapshot[1]:
         if _buyer_products_view is None or _buyer_products_view[0] is not snapshot:
             _buyer_products_view = (snapshot, tuple(p for p in snapshot[0] if p.get('aktif', True)))
-        active = _buyer_products_view[1]
-    else:
-        active = tuple(p for p in products if p.get('aktif', True))
+        return _buyer_products_view[1]
+    return tuple(p for p in products if p.get('aktif', True))
+
+
+async def _get_buyer_products_page(page, page_size=_CATALOG_DEFAULT_PAGE_SIZE):
+    """Use the same TTL/invalidation as products; copy only the visible page."""
+    active = await _get_active_buyer_products()
+    if page_size is None:
+        page_size = _CATALOG_ALL_LIMIT if len(active) <= _CATALOG_ALL_LIMIT else _CATALOG_DEFAULT_PAGE_SIZE
     pages = max(1, (len(active) + page_size - 1) // page_size)
     page = max(0, min(page, pages - 1))
     shown = [dict(p) for p in active[page * page_size:(page + 1) * page_size]]
@@ -3558,6 +3573,23 @@ async def set_setting(key, value):
     async with _setting_lock(key):
         await run_db_admin(_set_setting_sync, key, value)
         _settings_cache_del(key)
+
+
+def _parse_catalog_page_size(value):
+    if re.fullmatch(r'[0-9]{1,2}', value):
+        size = int(value)
+        if 1 <= size <= _CATALOG_PAGE_LIMIT:
+            return size
+    return None
+
+
+async def _get_catalog_settings():
+    settings = await get_settings(_CATALOG_SETTING_DEFAULTS)
+    pagination = settings['catalog_mode'] == 'pagination'
+    size = _parse_catalog_page_size(settings['catalog_page_size']) or _CATALOG_DEFAULT_PAGE_SIZE
+    columns = 2 if settings['catalog_columns'] == '2' else 1
+    return pagination, size, columns
+
 
 # =================== COOLDOWN DB + IN-MEMORY CACHE ===================
 COOLDOWN_MENIT = 5
@@ -5205,6 +5237,36 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
     )
 
+async def _buyer_catalog_parts(page, *, preview=False):
+    pagination, size, columns = await _get_catalog_settings()
+    page, pages, shown = await _get_buyer_products_page(page, size if pagination else None)
+    text = "📦 <b>DAFTAR PAKET</b>\n\nSilakan pilih paket yang tersedia di bawah ini."
+    buttons = []
+    for product in shown:
+        callback = f"pilih_{product['paket_id']}|{page}"
+        if preview:
+            # Keep the product-button prefix so the buyer emoji rules also apply here.
+            callback = 'pilih_|preview'
+        elif len(callback.encode('utf-8')) > 64:
+            callback = f"pilih_{product['paket_id']}"
+        buttons.append(styled_button(
+            f"{product_badge(product, product.get('emoji') or '📦')} {str(product.get('nama') or 'Produk')[:50]}",
+            callback_data=callback))
+    keyboard = [buttons[index:index + columns] for index in range(0, len(buttons), columns)]
+    if not shown:
+        text = "📦 <b>DAFTAR PAKET</b>\n\nBelum ada paket yang tersedia."
+    if pages > 1:
+        text += f"\n\nHalaman {page + 1}/{pages}"
+    route = 'admpanel_catalog|preview' if preview else 'buy'
+    if page + 1 < pages:
+        keyboard.append([styled_button("Berikutnya ➡️", callback_data=f"{route}|{page + 1}", style="primary")])
+    if preview and page:
+        keyboard.append([styled_button("⬅️ Sebelumnya", callback_data=f"{route}|{page - 1}")])
+    back = 'admpanel_catalog|close' if preview else (f"buy|{page - 1}" if page else "back_to_menu")
+    keyboard.append([styled_button("⬅️ Kembali", callback_data=back)])
+    return page, text, InlineKeyboardMarkup(keyboard)
+
+
 @emoji_surface('catalog')
 async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -5213,26 +5275,9 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         page = max(0, min(100000, int(query.data.split('|', 1)[1]))) if '|' in query.data else 0
     except ValueError:
         page = 0
-    page, pages, shown = await _get_buyer_products_page(page)
+    page, text, markup = await _buyer_catalog_parts(page)
     context.user_data['_buyer_package_page'] = page
-    text = "📦 <b>DAFTAR PAKET</b>\n\nSilakan pilih paket yang tersedia di bawah ini."
-    keyboard = []
-    for product in shown:
-        callback = f"pilih_{product['paket_id']}|{page}"
-        if len(callback.encode('utf-8')) > 64:
-            callback = f"pilih_{product['paket_id']}"
-        keyboard.append([styled_button(
-            f"{product_badge(product, product.get('emoji') or '📦')} {str(product.get('nama') or 'Produk')[:50]}",
-            callback_data=callback)])
-    if not shown:
-        text = "📦 <b>DAFTAR PAKET</b>\n\nBelum ada paket yang tersedia."
-    if pages > 1:
-        text += f"\n\nHalaman {page + 1}/{pages}"
-    if page + 1 < pages:
-        keyboard.append([styled_button("Berikutnya ➡️", callback_data=f"buy|{page + 1}", style="primary")])
-    back = f"buy|{page - 1}" if page else "back_to_menu"
-    keyboard.append([styled_button("⬅️ Kembali", callback_data=back)])
-    await _render_buyer_menu(query, text, InlineKeyboardMarkup(keyboard))
+    await _render_buyer_menu(query, text, markup)
 
 @emoji_surface('product')
 async def pilih_paket(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -9050,6 +9095,24 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if await is_admin(user_id, context):
 
+        catalog_prompt = context.user_data.get('awaiting_catalog_page_size')
+        if catalog_prompt is not None:
+            size = _parse_catalog_page_size(text)
+            if size is None:
+                await update.message.reply_text(f"❌ Masukkan angka bulat dari 1 sampai {_CATALOG_PAGE_LIMIT}.")
+                return
+            await set_setting('catalog_page_size', size)
+            context.user_data.pop('awaiting_catalog_page_size', None)
+            panel_text, markup = await _catalog_settings_panel()
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=update.effective_chat.id, message_id=catalog_prompt, text=panel_text,
+                    parse_mode="HTML", reply_markup=markup,
+                )
+            except telegram.error.BadRequest:
+                await update.message.reply_text(panel_text, parse_mode="HTML", reply_markup=markup)
+            return
+
         blast_state = context.user_data.get('blast_state')
         if blast_state and blast_state.get('step') == 'typing':
             if not text:
@@ -10494,9 +10557,125 @@ async def admpanel_setting(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("✏️ Nama Tombol Grup", callback_data="admpanel_setting_group_name"),
             InlineKeyboardButton("🔗 Link Tombol Grup", callback_data="admpanel_setting_group_link"),
         ],
+        [InlineKeyboardButton("📦 Pengaturan Katalog", callback_data="admpanel_catalog")],
         [styled_button("⬅️ Kembali", style="primary", callback_data="admpanel_back")],
     ])
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+
+async def _catalog_settings_panel():
+    pagination, size, columns = await _get_catalog_settings()
+    total = len(await _get_active_buyer_products())
+    mode = "Pagination" if pagination else "Semua Produk"
+    size_status = "" if pagination else " <i>(tersimpan untuk Pagination)</i>"
+    fallback = ""
+    if not pagination and total > _CATALOG_ALL_LIMIT:
+        fallback = f"\n\n<i>Katalog memakai {_CATALOG_DEFAULT_PAGE_SIZE} produk per halaman karena batas Telegram.</i>"
+    text = (
+        "<b>📦 PENGATURAN KATALOG</b>\n"
+        "========================\n\n"
+        f"Mode tampilan: <b>{mode}</b>\n"
+        f"Produk per halaman: <b>{size}</b>{size_status}\n"
+        f"Layout: <b>{columns} Kolom</b>\n"
+        f"Total produk aktif: <b>{total}</b>{fallback}"
+    )
+    return text, InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚙️ Ubah Mode Tampilan", callback_data="admpanel_catalog|mode")],
+        [InlineKeyboardButton("🔢 Produk per Halaman", callback_data="admpanel_catalog|size")],
+        [InlineKeyboardButton("📐 Ubah Layout", callback_data="admpanel_catalog|layout")],
+        [InlineKeyboardButton("👀 Preview Katalog", callback_data="admpanel_catalog|preview")],
+        [InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_setting")],
+    ])
+
+
+@admin_callback
+@emoji_surface('admin_settings')
+async def admpanel_catalog(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    _, _, selection = query.data.partition('|')
+    field, _, value = selection.partition('|')
+    context.user_data.pop('awaiting_catalog_page_size', None)
+    back = [InlineKeyboardButton("⬅️ Kembali", callback_data="admpanel_catalog")]
+
+    if field == 'size':
+        pagination, size, _ = await _get_catalog_settings()
+        if not pagination:
+            await query.answer("Aktifkan mode Pagination untuk mengubah jumlah produk per halaman.", show_alert=True)
+            return
+        if update.effective_chat.type != 'private':
+            await query.answer("Buka pengaturan ini di chat pribadi bot.", show_alert=True)
+            return
+        await query.answer()
+        await query.edit_message_text(
+            "<b>🔢 PRODUK PER HALAMAN</b>\n"
+            "========================\n\n"
+            f"Jumlah saat ini: <b>{size}</b>\n"
+            f"Kirim angka bulat dari <b>1 sampai {_CATALOG_PAGE_LIMIT}</b>.",
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup([back]),
+        )
+        clear_user_state(context)
+        context.user_data['awaiting_catalog_page_size'] = query.message.message_id
+        return
+
+    await query.answer()
+    if field == 'mode' and not value:
+        text = "<b>⚙️ MODE TAMPILAN KATALOG</b>"
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Semua Produk", callback_data="admpanel_catalog|mode|all")],
+            [InlineKeyboardButton("Pagination", callback_data="admpanel_catalog|mode|pagination")],
+            back,
+        ])
+    elif field == 'layout' and not value:
+        text = "<b>📐 LAYOUT KATALOG</b>"
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("1 Kolom", callback_data="admpanel_catalog|layout|1")],
+            [InlineKeyboardButton("2 Kolom", callback_data="admpanel_catalog|layout|2")],
+            back,
+        ])
+    else:
+        if field == 'mode':
+            await set_setting('catalog_mode', value)
+        elif field == 'layout':
+            await set_setting('catalog_columns', value)
+        text, markup = await _catalog_settings_panel()
+    try:
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+    except telegram.error.BadRequest as exc:
+        if 'message is not modified' not in str(exc).lower():
+            raise
+
+
+@admin_callback
+@emoji_surface('catalog')
+async def admpanel_catalog_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query.data == 'pilih_|preview':
+        await query.answer("Ini pratinjau katalog.")
+        return
+    await query.answer()
+    parts = query.data.split('|')
+    if parts[1] == 'close':
+        await query.delete_message()
+        return
+
+    page = int(parts[2]) if len(parts) == 3 else 0
+    _, text, markup = await _buyer_catalog_parts(page, preview=True)
+    if len(parts) == 3:
+        await _render_buyer_menu(query, text, markup)
+        return
+
+    # Reuse the buyer's photo without registering this preview as a buyer menu.
+    photo = _MENU_PHOTO_FILE_ID or await get_setting(_MENU_PHOTO_SETTING, '')
+    options = dict(chat_id=query.message.chat_id, caption=text, parse_mode="HTML", reply_markup=markup)
+    if photo:
+        try:
+            await context.bot.send_photo(photo=photo, **options)
+            return
+        except telegram.error.BadRequest as exc:
+            if not _invalid_menu_photo_id(exc):
+                raise
+    await context.bot.send_photo(photo=BytesIO(base64.b64decode(_MENU_PHOTO_BASE64)), **options)
+
 
 @admin_callback
 @emoji_surface('admin_settings')
@@ -10965,6 +11144,8 @@ def main():
     app.add_handler(CallbackQueryHandler(buyer_history, pattern="^buyer_history$"))
     app.add_handler(CallbackQueryHandler(buyer_description, pattern="^buyer_desc_"))
     app.add_handler(CallbackQueryHandler(buy_callback,         pattern=r"^buy(?:\|\d+)?$"))
+    app.add_handler(CallbackQueryHandler(admpanel_catalog_preview,
+                                        pattern=r"^(?:admpanel_catalog\|(?:preview(?:\|[0-9]+)?|close)|pilih_\|preview)$"))
     app.add_handler(CallbackQueryHandler(pilih_paket,          pattern="^pilih_"))
     app.add_handler(CallbackQueryHandler(confirm_buy_handler,  pattern="^confirm_buy_"))
     app.add_handler(CallbackQueryHandler(prereq_buy_handler,   pattern="^prereq_buy_"))
@@ -11048,6 +11229,8 @@ def main():
     app.add_handler(CallbackQueryHandler(admpanel_custom_emoji, pattern=r"^cem(?:\|[a-z0-9_|-]+)?$"))
     app.add_handler(CallbackQueryHandler(admpanel_emoji, pattern=r"^admpanel_emoji(?:\|(on|off|preview))?$"))
     app.add_handler(CallbackQueryHandler(admpanel_setting,              pattern="^admpanel_setting$"))
+    app.add_handler(CallbackQueryHandler(admpanel_catalog,
+                                        pattern=r"^admpanel_catalog(?:\|(?:mode(?:\|all|\|pagination)?|layout(?:\|[12])?|size))?$"))
     app.add_handler(CallbackQueryHandler(admpanel_setting_channel_set,  pattern="^admpanel_setting_channel_set$"))
     app.add_handler(CallbackQueryHandler(admpanel_setting_channel_off,  pattern="^admpanel_setting_channel_off$"))
     app.add_handler(CallbackQueryHandler(admpanel_setting_testich_set,  pattern="^admpanel_setting_testich_set$"))

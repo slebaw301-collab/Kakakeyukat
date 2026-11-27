@@ -147,16 +147,49 @@ async def resolve_destinations(bot, text):
     """Validate that every selected chat is a group/channel and the bot is an admin."""
     destinations = {}
     for target in parse_destinations(text):
-        chat = await bot.get_chat(target)
-        if chat.type not in ("group", "supergroup", "channel") or chat.id >= 0:
-            raise ValueError("Tujuan harus grup atau channel, bukan chat pribadi.")
-        member = await bot.get_chat_member(chat.id, bot.id)
-        if member.status not in ("administrator", "creator"):
-            raise ValueError(f"Bot harus menjadi admin di {chat.title or chat.id}.")
-        if chat.type == "channel" and member.status != "creator" and not getattr(member, "can_post_messages", False):
-            raise ValueError(f"Bot belum memiliki izin posting di {chat.title or chat.id}.")
-        destinations[chat.id] = {"id": chat.id, "title": chat.title or str(chat.id), "type": chat.type}
+        dest = await resolve_destination(bot, target)
+        destinations[dest["id"]] = dest
     return list(destinations.values())
+
+def destination_from_membership(chat, member):
+    if chat.type not in ("group", "supergroup", "channel") or chat.id >= 0:
+        raise ValueError("Tujuan harus grup atau channel, bukan chat pribadi.")
+    if member.status not in ("administrator", "creator"):
+        raise ValueError(f"Bot harus menjadi admin di {chat.title or chat.id}.")
+    if chat.type == "channel" and member.status != "creator" and not getattr(member, "can_post_messages", False):
+        raise ValueError(f"Bot belum memiliki izin posting di {chat.title or chat.id}.")
+    return {"id": chat.id, "title": chat.title or str(chat.id), "type": chat.type}
+
+async def resolve_destination(bot, target):
+    chat = await bot.get_chat(target)
+    if chat.type not in ("group", "supergroup", "channel") or chat.id >= 0:
+        raise ValueError("Tujuan harus grup atau channel, bukan chat pribadi.")
+    member = await bot.get_chat_member(chat.id, bot.id)
+    return destination_from_membership(chat, member)
+
+PICKER_PAGE_SIZE = 8
+
+def picker_page(destinations, page):
+    ordered = sorted(destinations, key=lambda d: (d["title"].casefold(), d["id"]))
+    pages = max(1, (len(ordered) + PICKER_PAGE_SIZE - 1) // PICKER_PAGE_SIZE)
+    page = min(max(0, page), pages - 1)
+    return ordered[page * PICKER_PAGE_SIZE:(page + 1) * PICKER_PAGE_SIZE], page, pages
+
+def picker_select(selected, available, action, chat_id=None):
+    """Selection is explicit, capped, and never silently truncated."""
+    available = set(available)
+    selected = set(selected) & available
+    if action == "reset":
+        return set()
+    if action == "all":
+        result = available
+    elif action == "toggle" and chat_id in available:
+        result = selected ^ {chat_id}
+    else:
+        raise ValueError("Tujuan tidak tersedia. Refresh daftar.")
+    if len(result) > MAX_DESTINATIONS:
+        raise ValueError("Maksimal 10 tujuan per Blast.")
+    return result
 
 def blast_audience(payload):
     """Old jobs default to buyer-only. Explicit modes must never silently fall back."""

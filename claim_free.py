@@ -129,7 +129,10 @@ class ClaimFree:
                     if action == 'save_backup':
                         chat, link, version = args
                         c.execute('UPDATE claim_free_config SET backup_chat=%s,backup_link=%s,backup_required=TRUE,enabled=FALSE,version=version+1 WHERE id=1 AND version=%s RETURNING id', (chat, link, version))
-                        return bool(c.fetchone())
+                        saved = bool(c.fetchone())
+                        if saved:
+                            c.execute('DELETE FROM claim_free_backup_requests WHERE chat_id<>%s', (chat,))
+                        return saved
                     if action == 'toggle_backup':
                         required, version = args
                         c.execute('UPDATE claim_free_config SET backup_required=%s,enabled=FALSE,version=version+1 WHERE id=1 AND version=%s RETURNING id', (required, version))
@@ -137,7 +140,10 @@ class ClaimFree:
                     if action == 'toggle_backup_mode':
                         requested, version = args
                         c.execute('UPDATE claim_free_config SET backup_join_request=%s,enabled=FALSE,version=version+1 WHERE id=1 AND version=%s RETURNING id', (requested, version))
-                        return bool(c.fetchone())
+                        saved = bool(c.fetchone())
+                        if saved:
+                            c.execute('DELETE FROM claim_free_backup_requests')
+                        return saved
                     if action == 'backup_request':
                         chat, uid, event_at, requested = args
                         c.execute('''INSERT INTO claim_free_backup_requests(chat_id,user_id,event_at,requested)
@@ -500,9 +506,11 @@ class ClaimFree:
             return
         was_member = member_ok(event.old_chat_member)
         is_member = member_ok(event.new_chat_member)
+        if was_member == is_member and event.new_chat_member.status != 'kicked':
+            return
         try:
             cfg = await self.config()
-            if cfg.get('backup_chat') == event.chat.id and (
+            if cfg.get('backup_join_request') and cfg.get('backup_chat') == event.chat.id and (
                 was_member != is_member or event.new_chat_member.status == 'kicked'
             ):
                 # Clear request evidence on observed admission, departure or ban, even with auto-kick off.

@@ -124,7 +124,7 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         self.ctx.bot.create_chat_invite_link.assert_awaited_once()
 
     async def test_admin_callback_denied(self):
-        for data in ('cf_admin', 'cf_testi', 'cf_free', 'cf_stats', 'cf_toggle', 'cf_cancel', 'cf_backup', 'cf_backup_toggle', 'cf_kick_toggle'):
+        for data in ('cf_admin', 'cf_testi', 'cf_free', 'cf_stats', 'cf_toggle', 'cf_cancel', 'cf_backup', 'cf_backup_toggle', 'cf_backup_mode', 'cf_kick_toggle'):
             self.u.callback_query.data = data
             await self.f.callback(self.u, self.ctx)
         self.f.config.assert_not_awaited()
@@ -312,6 +312,66 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         self.u.callback_query.data = 'cf_backup_toggle'
         await self.f.callback(self.u, self.ctx)
         self.f.call.assert_awaited_once_with('toggle_backup', False, 1)
+
+    def enable_request_mode(self, backup_status='left', proof=True, testi_status='member'):
+        self.enable_backup()
+        self.cfg['backup_join_request'] = True
+        def member(chat, uid):
+            if uid == 99:
+                return NS(status='administrator', can_invite_users=True)
+            return NS(status=backup_status if chat == -10044 else testi_status)
+        self.ctx.bot.get_chat_member.side_effect = member
+        self.f.call.side_effect = lambda action, *args: {
+            'reserve': True, 'finish': True, 'latest': None,
+            'has_backup_request': proof,
+        }.get(action)
+
+    async def test_request_proof_allows_claim(self):
+        self.enable_request_mode()
+        await self.f.verify(self.u, self.ctx)
+        self.assertEqual(self.text(), SUCCESS)
+        self.f.call.assert_any_await('has_backup_request', -10044, 123)
+
+    async def test_missing_request_proof_blocks_claim(self):
+        self.enable_request_mode(proof=False)
+        await self.f.verify(self.u, self.ctx)
+        self.ctx.bot.create_chat_invite_link.assert_not_awaited()
+
+    async def test_request_does_not_bypass_testimonial_or_ban(self):
+        for status, testi in [('kicked', 'member'), ('left', 'left')]:
+            self.enable_request_mode(backup_status=status, testi_status=testi)
+            await self.f.verify(self.u, self.ctx)
+        self.ctx.bot.create_chat_invite_link.assert_not_awaited()
+
+    async def test_request_mode_existing_backup_member_passes(self):
+        self.enable_request_mode(backup_status='member', proof=False)
+        await self.f.verify(self.u, self.ctx)
+        self.assertEqual(self.text(), SUCCESS)
+
+    async def test_backup_request_is_recorded_without_approval_or_decline(self):
+        self.enable_request_mode()
+        date = datetime.now(timezone.utc)
+        req = NS(chat=NS(id=-10044), from_user=NS(id=123), date=date,
+                 invite_link=None, approve=AsyncMock(), decline=AsyncMock())
+        self.u.chat_join_request = req
+        self.assertTrue(await self.f.join_request(self.u, self.ctx))
+        self.f.call.assert_any_await('backup_request', -10044, 123, date, True)
+        req.approve.assert_not_awaited()
+        req.decline.assert_not_awaited()
+
+    async def test_request_mode_unrelated_chat_not_intercepted(self):
+        self.enable_request_mode()
+        self.u.chat_join_request = NS(chat=NS(id=-10055), invite_link=NS(name='Paid product'))
+        self.assertFalse(await self.f.join_request(self.u, self.ctx))
+
+    async def test_request_evidence_cleared_on_observed_membership_change(self):
+        self.enable_request_mode()
+        date = datetime.now(timezone.utc)
+        self.u.chat_member = NS(chat=NS(id=-10044), date=date,
+            old_chat_member=NS(status='member'),
+            new_chat_member=NS(status='left', user=NS(id=123)))
+        await self.f.membership_changed(self.u, self.ctx)
+        self.f.call.assert_any_await('backup_request', -10044, 123, date, False)
 
     async def test_paid_invite_not_intercepted(self):
         self.u.chat_join_request = NS(invite_link=NS(name='Paid product'))

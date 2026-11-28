@@ -53,6 +53,12 @@ ALTER TABLE claim_free_config ADD COLUMN IF NOT EXISTS backup_chat BIGINT;
 ALTER TABLE claim_free_config ADD COLUMN IF NOT EXISTS backup_link TEXT;
 ALTER TABLE claim_free_config ADD COLUMN IF NOT EXISTS backup_required BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE claim_free_config ADD COLUMN IF NOT EXISTS auto_kick BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE claim_free_config ADD COLUMN IF NOT EXISTS backup_join_request BOOLEAN NOT NULL DEFAULT FALSE;
+CREATE TABLE IF NOT EXISTS claim_free_backup_requests (
+ chat_id BIGINT NOT NULL, user_id BIGINT NOT NULL,
+ event_at TIMESTAMPTZ NOT NULL, requested BOOLEAN NOT NULL,
+ PRIMARY KEY(chat_id,user_id)
+);
 INSERT INTO claim_free_config(id) VALUES(1) ON CONFLICT DO NOTHING;
 CREATE TABLE IF NOT EXISTS claim_free_claims (
  user_id BIGINT PRIMARY KEY, claimed_at TIMESTAMPTZ,
@@ -123,11 +129,33 @@ class ClaimFree:
                     if action == 'save_backup':
                         chat, link, version = args
                         c.execute('UPDATE claim_free_config SET backup_chat=%s,backup_link=%s,backup_required=TRUE,enabled=FALSE,version=version+1 WHERE id=1 AND version=%s RETURNING id', (chat, link, version))
-                        return bool(c.fetchone())
+                        saved = bool(c.fetchone())
+                        if saved:
+                            c.execute('DELETE FROM claim_free_backup_requests WHERE chat_id<>%s', (chat,))
+                        return saved
                     if action == 'toggle_backup':
                         required, version = args
                         c.execute('UPDATE claim_free_config SET backup_required=%s,enabled=FALSE,version=version+1 WHERE id=1 AND version=%s RETURNING id', (required, version))
                         return bool(c.fetchone())
+                    if action == 'toggle_backup_mode':
+                        requested, version = args
+                        c.execute('UPDATE claim_free_config SET backup_join_request=%s,enabled=FALSE,version=version+1 WHERE id=1 AND version=%s RETURNING id', (requested, version))
+                        saved = bool(c.fetchone())
+                        if saved:
+                            c.execute('DELETE FROM claim_free_backup_requests')
+                        return saved
+                    if action == 'backup_request':
+                        chat, uid, event_at, requested = args
+                        c.execute('''INSERT INTO claim_free_backup_requests(chat_id,user_id,event_at,requested)
+                            VALUES(%s,%s,%s,%s) ON CONFLICT(chat_id,user_id) DO UPDATE
+                            SET event_at=EXCLUDED.event_at,requested=EXCLUDED.requested
+                            WHERE claim_free_backup_requests.event_at<EXCLUDED.event_at
+                            OR (claim_free_backup_requests.event_at=EXCLUDED.event_at
+                                AND NOT EXCLUDED.requested)''', (chat, uid, event_at, requested))
+                    if action == 'has_backup_request':
+                        c.execute('SELECT requested FROM claim_free_backup_requests WHERE chat_id=%s AND user_id=%s', args)
+                        row = c.fetchone()
+                        return bool(row and row['requested'])
                     if action == 'toggle':
                         enabled, version = args
                         c.execute('UPDATE claim_free_config SET enabled=%s,version=version+1 WHERE id=1 AND version=%s RETURNING id', (enabled, version))
@@ -226,6 +254,10 @@ class ClaimFree:
         if cfg['backup_chat'] in (cfg['testi_chat'], cfg['free_chat']):
             raise ValueError('Tujuan Backup harus berbeda dari Testimoni dan Free.')
         await self.validate_chat(bot, cfg['backup_chat'], cfg['backup_link'])
+        if cfg.get('backup_join_request'):
+            me = await bot.get_chat_member(cfg['backup_chat'], bot.id)
+            if me.status != 'creator' and not (me.status == 'administrator' and getattr(me, 'can_invite_users', False)):
+                raise ValueError('Mode Join Request memerlukan izin Undang Pengguna untuk bot di Backup.')
 
     async def validate_chat(self, bot, chat_id, link=None, free=False):
         chat, me = await asyncio.gather(bot.get_chat(chat_id), bot.get_chat_member(chat_id, bot.id))
@@ -255,6 +287,11 @@ class ClaimFree:
     def intro(self, cfg):
         if not cfg.get('backup_required'):
             return INTRO
+        if cfg.get('backup_join_request'):
+            return (INTRO.replace('✅ Bergabung ke Grup/Channel Testimoni Hyper Store.',
+                                  '✅ Bergabung ke Grup/Channel Testimoni Hyper Store.\n✅ Ajukan permintaan bergabung ke Grup/Channel Backup Hyper Store (tidak perlu menunggu persetujuan).')
+                         .replace('1. Tekan tombol <b>Gabung Testimoni</b>.\n2. Bergabung ke grup/channel tersebut.',
+                                  '1. Bergabung ke Testimoni.\n2. Tekan <b>Gabung Backup</b> dan ajukan permintaan masuk.'))
         return (INTRO.replace('✅ Bergabung ke Grup/Channel Testimoni Hyper Store.',
                               '✅ Bergabung ke Grup/Channel Testimoni Hyper Store.\n✅ Bergabung ke Grup/Channel Backup Hyper Store.')
                      .replace('1. Tekan tombol <b>Gabung Testimoni</b>.\n2. Bergabung ke grup/channel tersebut.',
@@ -263,6 +300,10 @@ class ClaimFree:
     def failed(self, cfg):
         if not cfg.get('backup_required'):
             return FAILED
+        if cfg.get('backup_join_request'):
+            return (FAILED.replace('Kamu belum bergabung ke Grup/Channel Testimoni Hyper Store.',
+                                   'Pastikan sudah bergabung ke Testimoni dan sudah menjadi member atau mengajukan permintaan bergabung ke Backup.')
+                          .replace('Silakan bergabung terlebih dahulu,', 'Jika permintaan lama belum terdeteksi, batalkan dan ajukan kembali,'))
         return FAILED.replace('Kamu belum bergabung ke Grup/Channel Testimoni Hyper Store.',
                               'Kamu belum memenuhi semua syarat. Pastikan sudah bergabung ke Grup/Channel Testimoni dan Backup Hyper Store.')
 
@@ -272,8 +313,22 @@ class ClaimFree:
         if cfg.get('backup_required'):
             if not cfg.get('backup_chat') or not cfg.get('backup_link'):
                 return False
+            if cfg.get('backup_join_request'):
+                return await self.verified_backup_request(bot, cfg['backup_chat'], uid)
             return await self.verified_member(bot, cfg['backup_chat'], uid)
         return True
+
+    async def verified_backup_request(self, bot, chat, uid):
+        me, member = await asyncio.gather(bot.get_chat_member(chat, bot.id), bot.get_chat_member(chat, uid))
+        if me.status != 'creator' and not (me.status == 'administrator' and getattr(me, 'can_invite_users', False)):
+            raise ValueError('Bot memerlukan izin Undang Pengguna di Backup.')
+        if member_ok(member):
+            return True
+        # This is evidence of a received request, not a live Telegram pending-list query.
+        # Never use request evidence to override a ban or other non-left status.
+        if member.status != 'left':
+            return False
+        return await self.call('has_backup_request', chat, uid)
 
     async def reply(self, update, text, markup=None):
         # Dedicated messages; never edits the normal catalog or purchased access.
@@ -344,7 +399,19 @@ class ClaimFree:
 
     async def join_request(self, update, context):
         req = update.chat_join_request
-        invite = req.invite_link if req else None
+        if not req:
+            return False
+        cfg = await self.config()
+        if cfg.get('backup_join_request') and cfg.get('backup_chat') == req.chat.id:
+            # Keep backup requests pending; the host's paid handler would otherwise decline them.
+            # Capture direct/public requests too (invite_link is optional).
+            try:
+                async with self.locks[req.from_user.id % len(self.locks)]:
+                    await self.call('backup_request', req.chat.id, req.from_user.id, req.date, True)
+            except Exception as exc:
+                log.warning('[CLAIM FREE] backup request recording failed: %s', type(exc).__name__)
+            return True
+        invite = req.invite_link
         if not invite:
             return False
         # Only feature-owned links are intercepted; existing paid handler is untouched.
@@ -435,11 +502,20 @@ class ClaimFree:
 
     async def membership_changed(self, update, context):
         event = update.chat_member
-        if not event or not member_ok(event.old_chat_member) or member_ok(event.new_chat_member):
+        if not event:
+            return
+        was_member = member_ok(event.old_chat_member)
+        is_member = member_ok(event.new_chat_member)
+        if was_member == is_member and event.new_chat_member.status != 'kicked':
             return
         try:
             cfg = await self.config()
-            if not self.kick_active(cfg):
+            if cfg.get('backup_join_request') and cfg.get('backup_chat') == event.chat.id and (
+                was_member != is_member or event.new_chat_member.status == 'kicked'
+            ):
+                # Clear request evidence on observed admission, departure or ban, even with auto-kick off.
+                await self.call('backup_request', event.chat.id, event.new_chat_member.user.id, event.date, False)
+            if not was_member or is_member or not self.kick_active(cfg):
                 return
             required = {cfg['testi_chat']}
             if cfg.get('backup_required'):
@@ -516,6 +592,14 @@ class ClaimFree:
                         await self.validate_backup(context.bot, cfg)
                     if not await self.call('toggle_backup', required, cfg['version']):
                         raise ValueError('Konfigurasi berubah. Silakan ulangi.')
+            if q.data == 'cf_backup_mode':
+                async with self.config_lock:
+                    cfg = await self.config()
+                    requested = not cfg.get('backup_join_request', False)
+                    if requested:
+                        await self.validate_backup(context.bot, dict(cfg, backup_join_request=True))
+                    if not await self.call('toggle_backup_mode', requested, cfg['version']):
+                        raise ValueError('Konfigurasi berubah. Silakan ulangi.')
             if q.data == 'cf_kick_toggle':
                 async with self.config_lock:
                     cfg = await self.config()
@@ -546,14 +630,16 @@ class ClaimFree:
                 f"Link: {html.escape(cfg['testi_link'] or 'Belum diatur')}\n\n"
                 f"🔰 Backup (grup/channel): <code>{cfg.get('backup_chat') or 'Belum diatur'}</code>\n"
                 f"Link: {html.escape(cfg.get('backup_link') or 'Belum diatur')}\n"
-                f"Syarat Backup: {'✅ Aktif' if cfg.get('backup_required') else '🔴 Nonaktif'}\n\n"
+                f"Syarat Backup: {'✅ Aktif' if cfg.get('backup_required') else '🔴 Nonaktif'}\n"
+                f"Metode Backup: {'Join Request / Member' if cfg.get('backup_join_request') else 'Wajib Member'}\n\n"
                 f"🎁 Free (grup/channel): <code>{cfg['free_chat'] or 'Belum diatur'}</code>\n"
                 f"Auto-kick: {'✅ Aktif' if cfg.get('auto_kick') and cfg['enabled'] else '⏸ Dijeda (Claim nonaktif)' if cfg.get('auto_kick') else '🔴 Nonaktif'}\n\n"
-                'Perubahan grup otomatis menonaktifkan fitur. Validasi ulang sebelum mengaktifkan.')
+                'Perubahan grup/metode otomatis menonaktifkan fitur. Validasi ulang sebelum mengaktifkan.')
         await self.reply(update, text, Markup([
             [Button('📢 Atur Testimoni (Grup/Channel)', callback_data='cf_testi')],
             [Button('🔰 Atur Backup (Grup/Channel)', callback_data='cf_backup')],
             [Button('🔘 Nonaktifkan Syarat Backup' if cfg.get('backup_required') else '🔘 Aktifkan Syarat Backup', callback_data='cf_backup_toggle')],
+            [Button('🔄 Gunakan Wajib Member' if cfg.get('backup_join_request') else '🔄 Gunakan Join Request', callback_data='cf_backup_mode')],
             [Button('🎁 Atur Free (Grup/Channel)', callback_data='cf_free')],
             [Button('🔘 Nonaktifkan Auto-kick' if cfg.get('auto_kick') else '🔘 Aktifkan Auto-kick', callback_data='cf_kick_toggle')],
             [Button('📊 Statistik Claim', callback_data='cf_stats')],

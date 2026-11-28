@@ -11626,7 +11626,7 @@ def main():
 
     # Auto-Approve Join Request Handler
     app.add_handler(ChatJoinRequestHandler(handle_join_request))
-    app.add_handler(CallbackQueryHandler(_claim_free.callback, pattern=r"^cf_(?:admin|testi|free|stats|toggle|verify|cancel|backup|backup_toggle|kick_toggle)$"))
+    app.add_handler(CallbackQueryHandler(_claim_free.callback, pattern=r"^cf_(?:admin|testi|free|stats|toggle|verify|cancel|backup|backup_toggle|backup_mode|kick_toggle)$"))
     app.add_handler(ChatMemberHandler(_claim_free.membership_changed, ChatMemberHandler.CHAT_MEMBER))
 
     # Backup & Import Document Handlers
